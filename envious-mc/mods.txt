@@ -1,0 +1,236 @@
+# ============================================================================
+# EnviousLabs Modded MC Pack — Forge 1.20.1
+# ============================================================================
+# Format:
+#   slug                 → Auto (Modrinth first, CurseForge fallback)
+#   mr:slug              → Modrinth only
+#   cf:slug              → CurseForge only
+#   url:https://...jar   → Direct URL download
+#   !slug                → Pinned version (skipped during updates)
+#   # this is a comment
+# ============================================================================
+
+# === Core Tech ===============================================================
+mekanism
+mekanism-generators
+mekanism-tools
+ae2                              # Applied Energistics 2
+applied-mekanistics              # AE2 <-> Mekanism bridge
+enderio                          # Conduits, machines, capacitors
+create                           # Rotational power & automation
+createaddition                   # Create: Crafts & Additions (RF bridge)
+iron-chests                      # Upgraded storage chests
+storagedrawers                   # Compact item storage
+
+# === Create Addons ===========================================================
+create-big-cannons               # Artillery addon
+create-central-kitchen           # Farmer's Delight integration
+create-connected                 # Connected textures for Create
+create-deco                      # Decorative Create blocks
+create-dreams-and-desires        # Extra Create components
+create-enchantment-industry      # Enchantment automation
+create-steam-n-rails             # Train expansion
+create-trading-floor             # Villager trading automation
+copycats                         # Create Copycats+
+extended-cogwheels               # More cogwheel types
+bellsandwhistles                 # Create decorative addon
+slice-and-dice                   # Create + Farmer's Delight cutting
+
+# === Core Magic ==============================================================
+ars-nouveau                      # Spell crafting & automation
+botania                          # Natural magic & mana
+eidolonrepraised                 # Dark magic & alchemy
+
+# === Adventure & Dimension ===================================================
+aether                           # The Aether dimension
+the-twilight-forest              # Twilight Forest dimension
+ice-and-fire-dragons             # Dragons, mythical creatures
+when-dungeons-arise              # Massive structure generation
+
+# === Mobs & Creatures ========================================================
+alexs-mobs                       # 80+ unique mobs
+goblin-traders                   # Wandering goblin merchants
+guard-villagers                  # Villagers that fight back
+productivebees                   # Bee breeding & automation
+what-are-they-up-to              # Villager activity display
+
+# === Tools & Gear =============================================================
+tinkers-construct                # Modular tool crafting
+curios                           # Accessory/trinket slots
+sophisticated-backpacks          # Upgradeable backpacks
+artifacts                        # Unique baubles & trinkets
+relics                           # Relic items with abilities
+cuffed                           # Handcuffs & restraints
+immersive-aircraft               # Flyable planes & airships
+explorers-compass                # Find structures
+natures-compass                  # Find biomes
+
+# === Weapons ==================================================================
+justenoughguns                   # Guns mod
+
+# === Food & Farming ===========================================================
+farmers-delight                  # Cooking & farming overhaul
+farmers-delight-compat           # FD cross-mod compat
+aquaculture                      # Expanded fishing
+aquaculture-delight              # Aquaculture + FD bridge
+cultural-delights                # Cultural food expansion
+oceans-delight                   # Ocean food addon
+miners-delight-plus              # Mining food addon
+vintage-delight                  # Vintage-themed food
+delightful-creators-forge        # Create + FD bridge
+easy-villagers                   # Compact villager farms
+botany-pots                      # Pot-based crop growing
+garnished-botany-pots            # Garnished + Botany Pots bridge
+
+# === World Gen ================================================================
+biomes-o-plenty                  # Biome diversity
+yungs-api                        # YUNG's shared lib
+yungs-better-dungeons
+yungs-better-end-island
+yungs-better-jungle-temples
+yungs-better-mineshafts
+yungs-better-nether-fortresses
+yungs-better-ocean-monuments
+yungs-better-strongholds
+yungs-better-witch-huts
+yungs-bridges
+yungs-cave-biomes
+yungs-extras
+yung-structures-addon-for-loot-integrations
+loot-integrations                # Loot table integration
+shrines                          # Shrine structures
+haunted-harvest                  # Halloween-themed crops/decor
+
+# === Building & Decoration ====================================================
+decorative-blocks                # Extra building blocks
+supplementaries                  # Decorative & functional blocks
+amendments                       # Supplementaries companion
+domum-ornamentum                 # Custom block patterns
+structurize                      # Structure placement tools
+exposure                         # Photography mod
+
+# === Tweaks & Overhauls =======================================================
+apotheosis                       # Enchanting/spawner/loot overhaul
+quark                            # Vanilla+ QoL overhaul
+crafttweaker                     # Recipe customization
+kubejs                           # Scripting & customization
+polymorph                        # Recipe conflict resolver
+carry-on                         # Pick up blocks/entities
+sit                              # Sit on stairs/slabs
+comforts                         # Sleeping bags & hammocks
+comfortable-campfires            # Better campfire mechanics
+multi-piston                     # Multi-block pistons
+torchmaster                      # Mega torches (mob-proof areas)
+oreexcavator                     # Vein mining
+tree-harvester                   # Chop full trees
+rotten-flesh-to-leather-by-tia   # QoL recipe
+netherportalfix                  # Portal linking fix
+lootr                            # Per-player loot chests
+corpse                           # Death graves with inventory
+toast-control                    # Suppress toast popups
+
+# === Combat & Loot ============================================================
+attributefix                     # Attribute cap removal
+
+# === Waystones & Navigation ===================================================
+waystones                        # Teleportation network
+
+# === Minimap & HUD ============================================================
+xaeros-minimap                   # Xaero's Minimap
+xaeros-world-map                 # Xaero's World Map
+xaero-zoomout                    # Zoom out addon
+ping-wheel                       # Multiplayer ping system
+appleskin                        # Food saturation overlay
+wthit                            # Block info tooltip (WAILA successor)
+
+# === Information & Guides =====================================================
+jei                              # Just Enough Items
+just-enough-resources-jer        # JEI resource drops addon
+better-advancements              # Better advancement screen
+patchouli                        # In-game guidebooks
+guideme                          # AE2 guidebook
+
+# === FTB Suite ================================================================
+ftb-essentials                   # /home, /tpa, /back
+ftb-library-forge                # FTB shared lib
+ftb-ranks-forge                  # Permission ranks
+ftb-teams-forge                  # Team management
+ftbchunks                        # Chunk claiming & minimap
+
+# === Claims & Protection ======================================================
+open-parties-and-claims          # Party system & chunk claims
+
+# === Performance & Optimization ===============================================
+spark                            # Profiler — essential for modded
+embeddium                        # Sodium port for Forge (client)
+oculus                           # Iris shaders port (client)
+ferrite-core                     # Memory optimization
+modernfix                        # General perf fixes
+clumps                           # Merge XP orbs
+ai-improvements                  # Entity AI optimization
+servercore                       # Server-side performance
+fastsuite                        # Faster recipe lookups
+chunk-sending-forge-fabric       # Chunk send optimization
+fast-async-world-save-forge-fabric  # Async world saving
+fast-ip-ping                     # Faster server list ping
+smooth-chunk-save                # Smooth chunk saving
+modelfix                         # Model rendering fix
+connectivity                     # Connection fixes
+crash-assistant                  # Better crash reports
+crash-utilities                  # Crash recovery tools
+structure-essentials-forge-fabric  # Structure gen optimization
+
+# === Client QoL (client-side only) ============================================
+3dskinlayers                     # 3D skin layer rendering
+better-third-person              # Improved 3P camera
+mouse-tweaks                     # Better inventory mouse controls
+no-chat-reports                  # Disable chat reporting
+configured                       # In-game mod config GUI
+almanac                          # In-game info pages
+sound                            # Sound physics/config
+
+# === Fun / Misc ===============================================================
+estrogen                         # Gender-affirming mod
+mimi                             # Musical instruments
+
+# === World Pre-gen ============================================================
+chunky                           # Pre-generate chunks
+
+# === Libraries & Dependencies (usually auto-pulled) ==========================
+# Listed for tracking — packwiz will pull these as needed.
+# Uncomment if auto-resolution fails for any.
+# mantle                         # Tinkers dep
+# architectury-api               # Cross-loader lib
+# geckolib                       # Animation lib
+# citadel                        # Alex's Mobs dep
+# bookshelf-lib                  # Bookshelf lib
+# bookshelf                      # Bookshelf
+# balm                           # Waystones dep
+# cloth-config                   # Config lib
+# collective                     # Serilum mods dep
+# framework                      # Quark/Apotheosis dep
+# moonlight                      # Supplementaries dep
+# selene                         # Moonlight alias
+# placebo                        # Apotheosis dep
+# apothic-attributes             # Apotheosis dep
+# resourceful-lib                # Ars Nouveau dep
+# botarium                       # Resource lib
+# cupboard                       # Lib
+# coroutil                       # Weather/tornado dep
+# kotlin-for-forge               # Kotlin runtime
+# rhino                          # KubeJS dep
+# badpackets                     # Network lib
+# octolib                        # Lib
+# kleiders-custom-renderer-api   # Renderer lib
+# terrablender                   # Biome blending lib
+# blockui                        # Structurize dep
+# almanac-lib                    # Almanac dep
+# sophisticated-core             # Sophisticated mods shared
+# etstlib                        # Lib
+# lazrs-lib                      # Lib
+# rpl                            # Lib
+# runelic                        # Lib
+# lmd                            # Lib
+# mru                            # Lib
+# pig-pen-cipher                 # Lib
+# zeta                           # Quark lib
