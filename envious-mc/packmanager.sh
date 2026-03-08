@@ -262,9 +262,9 @@ verify_mod_install() {
 
     # Normalize for comparison (lowercase, strip hyphens)
     local req_norm res_norm res_name_norm
-    req_norm=$(echo "$requested_slug" | tr '[:upper:]' '[:lower:]' | tr -d '-_ ')
-    res_norm=$(echo "$resolved_slug" | tr '[:upper:]' '[:lower:]' | tr -d '-_ ')
-    res_name_norm=$(echo "$resolved_name" | tr '[:upper:]' '[:lower:]' | tr -d '-_ ')
+    req_norm=$(echo "$requested_slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
+    res_norm=$(echo "$resolved_slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
+    res_name_norm=$(echo "$resolved_name" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
 
     # Check 1: Slug match (exact or normalized)
     if [[ "$req_norm" == "$res_norm" ]]; then
@@ -339,10 +339,10 @@ verify_all_mods() {
             local found_match=false
             for req_slug in "${!requested_slugs[@]}"; do
                 local req_norm res_norm
-                req_norm=$(echo "$req_slug" | tr '[:upper:]' '[:lower:]' | tr -d '-_ ')
-                res_norm=$(echo "$resolved_slug" | tr '[:upper:]' '[:lower:]' | tr -d '-_ ')
+                req_norm=$(echo "$req_slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
+                res_norm=$(echo "$resolved_slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
                 local name_norm
-                name_norm=$(echo "$resolved_name" | tr '[:upper:]' '[:lower:]' | tr -d '-_ ')
+                name_norm=$(echo "$resolved_name" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
 
                 if [[ "$req_norm" == "$res_norm" ]]; then
                     found_match=true
@@ -377,10 +377,10 @@ verify_all_mods() {
                 local res_name
                 res_name=$(grep -oP '^name\s*=\s*"\K[^"]+' "$toml" 2>/dev/null || echo "")
                 local rn rr
-                rn=$(echo "$req_slug" | tr '[:upper:]' '[:lower:]' | tr -d '-_ ')
-                rr=$(echo "$res_slug" | tr '[:upper:]' '[:lower:]' | tr -d '-_ ')
+                rn=$(echo "$req_slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
+                rr=$(echo "$res_slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
                 local nn
-                nn=$(echo "$res_name" | tr '[:upper:]' '[:lower:]' | tr -d '-_ ')
+                nn=$(echo "$res_name" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
 
                 if [[ "$nn" == *"$rn"* || "$rr" == *"$rn"* || "$rn" == *"$rr"* ]]; then
                     found=true
@@ -1569,8 +1569,8 @@ cmd_diff() {
             for islug in "${!installed_map[@]}"; do
                 IFS='|' read -r iname _ _ _ <<< "${installed_map[$islug]}"
                 local rn in_
-                rn=$(echo "$slug" | tr '[:upper:]' '[:lower:]' | tr -d '-_ ')
-                in_=$(echo "$iname" | tr '[:upper:]' '[:lower:]' | tr -d '-_ ')
+                rn=$(echo "$slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
+                in_=$(echo "$iname" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
                 if [[ "$in_" == *"$rn"* || "$rn" == *"$in_"* ]]; then
                     echo -e "  ${CYAN}↔${NC} mods.txt: ${BOLD}${slug}${NC} → installed as: ${BOLD}${islug}${NC} (${iname})"
                     found=true
@@ -1593,9 +1593,9 @@ cmd_diff() {
             local is_alias=false
             for rslug in "${!requested_map[@]}"; do
                 local rn sn nn
-                rn=$(echo "$rslug" | tr '[:upper:]' '[:lower:]' | tr -d '-_ ')
-                sn=$(echo "$slug" | tr '[:upper:]' '[:lower:]' | tr -d '-_ ')
-                nn=$(echo "$name" | tr '[:upper:]' '[:lower:]' | tr -d '-_ ')
+                rn=$(echo "$rslug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
+                sn=$(echo "$slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
+                nn=$(echo "$name" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
                 if [[ "$nn" == *"$rn"* || "$sn" == *"$rn"* || "$rn" == *"$sn"* ]]; then
                     is_alias=true
                     break
