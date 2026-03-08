@@ -75,8 +75,9 @@ PACK_HOST_URL=""
 PACK_HOST_DIR=""
 
 # Self-update (GitHub)
-PM_GITHUB_REPO=""               # e.g. "yourusername/envious-mc" (owner/repo)
+PM_GITHUB_REPO=""               # e.g. "yourusername/PackwizWrapper" (owner/repo)
 PM_GITHUB_BRANCH="main"         # Branch to pull updates from
+PM_GITHUB_PATH=""               # Subdirectory in repo where files live (e.g. "envious-mc")
 PM_UPDATE_FILES="packmanager.sh install.sh packmanager.conf mods.txt"  # Files to update
 
 # Local/self-hosted mods (for mods not on Modrinth/CurseForge)
@@ -2249,13 +2250,23 @@ cmd_self_update() {
         exit 1
     fi
 
-    local raw_base="https://raw.githubusercontent.com/${PM_GITHUB_REPO}/${PM_GITHUB_BRANCH}"
+    # Sanitize: strip trailing/leading slashes and whitespace
+    local repo_clean="${PM_GITHUB_REPO#/}"; repo_clean="${repo_clean%/}"; repo_clean="$(echo "$repo_clean" | xargs)"
+    local branch_clean="${PM_GITHUB_BRANCH#/}"; branch_clean="${branch_clean%/}"; branch_clean="$(echo "$branch_clean" | xargs)"
+    local path_clean=""
+    if [[ -n "$PM_GITHUB_PATH" ]]; then
+        path_clean="${PM_GITHUB_PATH#/}"; path_clean="${path_clean%/}"; path_clean="$(echo "$path_clean" | xargs)"
+    fi
+
+    # Build base URL: repo/branch[/path]
+    local raw_base="https://raw.githubusercontent.com/${repo_clean}/${branch_clean}"
+    [[ -n "$path_clean" ]] && raw_base="${raw_base}/${path_clean}"
     local install_dir="${HOME}/.local/bin"
     local config_dir="${HOME}/.config/packmanager"
     local backup_dir="${config_dir}/backups/$(date +%Y%m%d_%H%M%S)"
 
     # --- Check connectivity & repo existence ---
-    log INFO "Checking ${PM_GITHUB_REPO} (branch: ${PM_GITHUB_BRANCH})..."
+    log INFO "Checking ${repo_clean} (branch: ${branch_clean})..."
 
     local http_code
     http_code=$(curl -sL -o /dev/null -w "%{http_code}" "${raw_base}/packmanager.sh" 2>/dev/null || echo "000")
@@ -2279,7 +2290,7 @@ cmd_self_update() {
 
     # --- Fetch latest commit hash for display ---
     local remote_sha=""
-    remote_sha=$(curl -sL "https://api.github.com/repos/${PM_GITHUB_REPO}/commits/${PM_GITHUB_BRANCH}" 2>/dev/null \
+    remote_sha=$(curl -sL "https://api.github.com/repos/${repo_clean}/commits/${branch_clean}" 2>/dev/null \
         | grep -oP '"sha"\s*:\s*"\K[a-f0-9]{40}' | head -1 || true)
 
     if [[ -n "$remote_sha" ]]; then
@@ -2432,8 +2443,12 @@ cmd_self_update_status() {
     local config_dir="${HOME}/.config/packmanager"
     local local_sha_file="${config_dir}/.last_update_sha"
 
-    echo -e "  Repo:    ${CYAN}${PM_GITHUB_REPO}${NC}"
-    echo -e "  Branch:  ${PM_GITHUB_BRANCH}"
+    # Sanitize repo/branch
+    local repo_clean="${PM_GITHUB_REPO#/}"; repo_clean="${repo_clean%/}"; repo_clean="$(echo "$repo_clean" | xargs)"
+    local branch_clean="${PM_GITHUB_BRANCH#/}"; branch_clean="${branch_clean%/}"; branch_clean="$(echo "$branch_clean" | xargs)"
+
+    echo -e "  Repo:    ${CYAN}${repo_clean}${NC}"
+    echo -e "  Branch:  ${branch_clean}"
 
     if [[ -f "$local_sha_file" ]]; then
         local local_sha; local_sha=$(cat "$local_sha_file" 2>/dev/null || echo "unknown")
@@ -2444,7 +2459,7 @@ cmd_self_update_status() {
 
     # Check remote
     local remote_sha=""
-    remote_sha=$(curl -sL --max-time 5 "https://api.github.com/repos/${PM_GITHUB_REPO}/commits/${PM_GITHUB_BRANCH}" 2>/dev/null \
+    remote_sha=$(curl -sL --max-time 5 "https://api.github.com/repos/${repo_clean}/commits/${branch_clean}" 2>/dev/null \
         | grep -oP '"sha"\s*:\s*"\K[a-f0-9]{40}' | head -1 || true)
 
     if [[ -n "$remote_sha" ]]; then

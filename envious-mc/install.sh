@@ -239,8 +239,9 @@ PACK_HOST_URL=""                # e.g. https://pack.enviouslabs.com
 PACK_HOST_DIR=""                # Local dir served by Cloudflare tunnel
 
 # --- Self-Update (GitHub) --------------------------------------------------
-PM_GITHUB_REPO=""               # e.g. "yourusername/envious-mc" (owner/repo)
+PM_GITHUB_REPO=""               # e.g. "yourusername/PackwizWrapper" (owner/repo)
 PM_GITHUB_BRANCH="main"         # Branch to pull updates from
+PM_GITHUB_PATH=""               # Subdirectory in repo (e.g. "envious-mc")
 PM_UPDATE_FILES="packmanager.sh install.sh packmanager.conf mods.txt"
 
 # --- Local/Self-Hosted Mods ------------------------------------------------
