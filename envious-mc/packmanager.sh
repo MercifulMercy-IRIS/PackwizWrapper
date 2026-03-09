@@ -20,6 +20,7 @@
 #   pm verify                  Full audit: mods.txt vs installed .pw.toml
 #   pm diff                    Side-by-side modlist vs packwiz diff
 #   pm doctor                  All checks + verify in one pass
+#   pm aliases                 Manage mod aliases (list/remove/clear)
 #
 # SERVER MANAGEMENT (Docker Compose + itzg/minecraft-server):
 #   pm targets add <n>          Register a server target
@@ -96,6 +97,7 @@ LOCAL_CONF="${PACK_DIR}/packmanager.conf"
 
 # Re-derive paths after config load (in case PACK_DIR changed)
 MODS_FILE="${PACK_DIR}/mods.txt"
+UNRESOLVED_FILE="${PACK_DIR}/unresolved.txt"
 LOG_DIR="${PACK_DIR}/.logs"
 
 # Setup
@@ -105,6 +107,7 @@ touch "$RUN_LOG" 2>/dev/null || RUN_LOG="/tmp/pm_run_$$.log"
 
 DEPS_ADDED=()
 MISMATCHES=()          # Tracks slug mismatches: requested|resolved_slug|resolved_name|toml
+UNRESOLVED_ADDED=()    # Mods saved to unresolved.txt this run
 
 # Colors
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -166,6 +169,34 @@ is_in_modlist() {
     local slug="$1"
     [[ -f "$MODS_FILE" ]] || return 1
     grep -qE "^!?((mr|cf|url):)?${slug}(\s|#|$)" "$MODS_FILE" 2>/dev/null
+}
+
+add_to_unresolved() {
+    local slug="$1" reason="${2:-not found}"
+    # Create file with header if it doesn't exist
+    if [[ ! -f "$UNRESOLVED_FILE" ]]; then
+        cat > "$UNRESOLVED_FILE" << 'HEADER'
+# PackManager — Unresolved Mods
+# These mods weren't found on Modrinth or CurseForge.
+# Add a URL or local JAR binding, then move to mods.txt:
+#
+#   url:https://example.com/my-mod-1.0.jar
+#   local:my-mod
+#
+# Or remove lines you no longer need.
+HEADER
+    fi
+    # Don't add duplicates
+    if ! grep -qE "^${slug}(\s|#|$)" "$UNRESOLVED_FILE" 2>/dev/null; then
+        printf '%-35s # %s\n' "$slug" "$reason" >> "$UNRESOLVED_FILE"
+    fi
+    UNRESOLVED_ADDED+=("$slug")
+}
+
+is_unresolved() {
+    local slug="$1"
+    [[ -f "$UNRESOLVED_FILE" ]] || return 1
+    grep -qE "^${slug}(\s|#|$)" "$UNRESOLVED_FILE" 2>/dev/null
 }
 
 append_to_modlist() {
@@ -236,8 +267,49 @@ parse_pw_toml() {
     echo "${slug}|${name}|${mod_id}|${source}|${filename}"
 }
 
+# ============================================================================
+# ALIAS TRACKING
+# ============================================================================
+# Aliases are stored in a JSON file so we can track what the user originally
+# requested vs what packwiz actually installed. This lets us:
+#   - Skip re-prompting for already-approved aliases
+#   - List all aliases with `pm aliases`
+#   - Remove aliased mods with `pm aliases remove <slug>`
+
+ALIASES_FILE="${HOME}/.config/packmanager/aliases.json"
+
+init_aliases_file() {
+    mkdir -p "$(dirname "$ALIASES_FILE")"
+    [[ -f "$ALIASES_FILE" ]] || echo '{}' > "$ALIASES_FILE"
+}
+
+alias_get() {
+    # Check if a requested slug has an approved alias
+    local requested="$1"
+    init_aliases_file
+    jq -r --arg r "$requested" '.[$r].resolved // empty' "$ALIASES_FILE" 2>/dev/null
+}
+
+alias_save() {
+    local requested="$1" resolved_slug="$2" resolved_name="$3" toml_file="$4"
+    init_aliases_file
+    local tmp; tmp=$(mktemp)
+    jq --arg r "$requested" --arg s "$resolved_slug" --arg n "$resolved_name" --arg f "$toml_file" \
+        '.[$r] = {"resolved": $s, "name": $n, "toml": $f, "approved_at": (now | todate)}' \
+        "$ALIASES_FILE" > "$tmp"
+    mv "$tmp" "$ALIASES_FILE"
+}
+
+alias_remove() {
+    local requested="$1"
+    init_aliases_file
+    local tmp; tmp=$(mktemp)
+    jq --arg r "$requested" 'del(.[$r])' "$ALIASES_FILE" > "$tmp"
+    mv "$tmp" "$ALIASES_FILE"
+}
+
 # Verify a single mod after installation
-# Returns 0 if match is good, 1 if mismatch detected
+# Returns 0 if match is good, 1 if mismatch detected, 2 if user rejected alias
 verify_mod_install() {
     local requested_slug="$1"
 
@@ -272,20 +344,64 @@ verify_mod_install() {
 
     # Check 2: Is the requested slug contained in the resolved name?
     # e.g., "ae2" matches "Applied Energistics 2" → ae2 is in "appliedenergistics2"
-    if [[ "$res_name_norm" == *"$req_norm"* || "$res_norm" == *"$req_norm"* ]]; then
-        # Close enough — likely an alias. Log it but don't flag as mismatch.
-        log INFO "${requested_slug} → ${resolved_name} (${resolved_slug}.pw.toml) ${DIM}— alias OK${NC}"
-        echo "ALIAS: ${requested_slug} → ${resolved_slug} (${resolved_name})" >> "$RUN_LOG"
-        return 0
+    if [[ "$res_name_norm" == *"$req_norm"* || "$res_norm" == *"$req_norm"* || "$req_norm" == *"$res_norm"* ]]; then
+        # This is an alias — check if already approved
+        local existing_alias
+        existing_alias=$(alias_get "$requested_slug")
+        if [[ "$existing_alias" == "$resolved_slug" ]]; then
+            # Previously approved, skip prompt
+            log INFO "${requested_slug} → ${resolved_name} ${DIM}(approved alias)${NC}"
+            return 0
+        fi
+
+        # --- Prompt user for approval ---
+        echo ""
+        echo -e "  ${YELLOW}${BOLD}ALIAS DETECTED${NC}"
+        echo -e "  Requested: ${BOLD}${requested_slug}${NC}"
+        echo -e "  Got:       ${BOLD}${resolved_name}${NC} (${resolved_slug}.pw.toml)"
+        echo ""
+        echo -e "  ${CYAN}(a)${NC} Accept — keep this mod and remember the alias"
+        echo -e "  ${RED}(r)${NC} Reject — remove and save to unresolved.txt for later binding"
+        echo -e "  ${RED}(d)${NC} Reject — remove and discard"
+        echo -e "  ${DIM}(s)${NC} Skip   — keep for now, ask again next time"
+        echo ""
+        echo -ne "  ${CYAN}choice [a/r/d/s]>${NC} "
+        read -r alias_choice
+
+        case "$alias_choice" in
+            a|A)
+                alias_save "$requested_slug" "$resolved_slug" "$resolved_name" "$toml_file"
+                log OK "${requested_slug} → ${resolved_name} ${DIM}(alias accepted)${NC}"
+                echo "ALIAS ACCEPTED: ${requested_slug} → ${resolved_slug} (${resolved_name})" >> "$RUN_LOG"
+                return 0
+                ;;
+            r|R)
+                # Remove the mod and save to unresolved for later url/jar binding
+                log WARN "Rejecting alias: removing ${resolved_slug}..."
+                $PACKWIZ_BIN remove "$resolved_slug" --yes 2>>"$RUN_LOG" || rm -f "$toml_file"
+                $PACKWIZ_BIN refresh 2>>"$RUN_LOG" || true
+                add_to_unresolved "$requested_slug" "alias rejected (got ${resolved_name})"
+                log WARN "${requested_slug} → saved to unresolved.txt"
+                echo "ALIAS REJECTED+UNRESOLVED: ${requested_slug} → ${resolved_slug} (removed)" >> "$RUN_LOG"
+                return 2
+                ;;
+            d|D)
+                # Remove the mod and discard entirely
+                log WARN "Rejecting alias: removing ${resolved_slug}..."
+                $PACKWIZ_BIN remove "$resolved_slug" --yes 2>>"$RUN_LOG" || rm -f "$toml_file"
+                $PACKWIZ_BIN refresh 2>>"$RUN_LOG" || true
+                echo "ALIAS REJECTED+DISCARDED: ${requested_slug} → ${resolved_slug} (removed)" >> "$RUN_LOG"
+                return 2
+                ;;
+            *)
+                log INFO "${requested_slug} → ${resolved_name} ${DIM}(skipped — will ask again)${NC}"
+                echo "ALIAS SKIPPED: ${requested_slug} → ${resolved_slug}" >> "$RUN_LOG"
+                return 0
+                ;;
+        esac
     fi
 
-    # Check 3: Is the resolved name at least related?
-    # Use a simple substring check in both directions
-    if [[ "$req_norm" == *"$res_norm"* ]]; then
-        return 0  # Resolved is a substring of requested
-    fi
-
-    # If we got here, it's a genuine mismatch
+    # If we got here, it's a genuine mismatch (not even an alias)
     MISMATCHES+=("${requested_slug}|${resolved_slug}|${resolved_name}|${toml_file}")
 
     echo -e "  ${RED}⚠ MISMATCH${NC}: asked for ${BOLD}${requested_slug}${NC}, got ${BOLD}${resolved_name}${NC} (${resolved_slug}.pw.toml)"
@@ -572,22 +688,16 @@ install_mod() {
 
     case "$source" in
         modrinth)
-            # Accepts: slug, project ID, Modrinth URL, or search term
             try_modrinth "$slug" && { installed=true; via="Modrinth"; }
-            $installed || { log FAIL "${slug} — not on Modrinth"; return 1; }
             ;;
         curseforge)
-            # Accepts: slug, project ID, CurseForge URL, or search term
             try_curseforge "$slug" && { installed=true; via="CurseForge"; }
-            $installed || { log FAIL "${slug} — not on CurseForge"; return 1; }
             ;;
         url)
             try_url "$url" "$slug" && { installed=true; via="URL"; }
-            $installed || { log FAIL "${slug} — URL failed"; return 1; }
             ;;
         local)
             try_local "$slug" && { installed=true; via="Local"; }
-            $installed || { log FAIL "${slug} — local JAR not found"; return 1; }
             ;;
         auto)
             local first second fn sn fp
@@ -608,10 +718,32 @@ install_mod() {
                     echo -e "    ${DIM}Tip: Pin as '${fp}:${slug}' in mods.txt${NC}"
                 fi
             fi
-
-            $installed || { log FAIL "${slug} — not found on either source"; return 1; }
             ;;
     esac
+
+    # --- Mod not found on any source: prompt user ---
+    if ! $installed; then
+        echo ""
+        echo -e "  ${RED}${BOLD}NOT FOUND${NC}: ${BOLD}${slug}${NC}"
+        echo -e "  ${DIM}Not available on Modrinth or CurseForge (source: ${source})${NC}"
+        echo ""
+        echo -e "  ${CYAN}(u)${NC} Save to unresolved.txt — bind a URL/JAR later"
+        echo -e "  ${DIM}(s)${NC} Skip — ignore for now"
+        echo ""
+        echo -ne "  ${CYAN}choice [u/s]>${NC} "
+        read -r nf_choice
+
+        case "$nf_choice" in
+            u|U)
+                add_to_unresolved "$slug" "not found on ${source}"
+                log WARN "${slug} → saved to unresolved.txt"
+                ;;
+            *)
+                log SKIP "${slug} — skipped (not found)"
+                ;;
+        esac
+        return 1
+    fi
 
     # Verify what actually got installed matches what we asked for
     if $installed; then
@@ -619,6 +751,9 @@ install_mod() {
         local verify_result=$?
         if (( verify_result == 0 )); then
             log OK "${slug} ${DIM}(${via})${NC}"
+        elif (( verify_result == 2 )); then
+            log WARN "${slug} ${DIM}(${via})${NC} — ${RED}alias rejected and removed${NC}"
+            return 1
         else
             log WARN "${slug} ${DIM}(${via})${NC} — ${YELLOW}VERIFY FAILED — review mismatch above${NC}"
         fi
@@ -1305,6 +1440,15 @@ cmd_sync() {
         echo "    4. Log: ${RUN_LOG}"
         printf '%s\n' "${failed_mods[@]}" > "${LOG_DIR}/last_failed.txt"
     fi
+
+    if (( ${#UNRESOLVED_ADDED[@]} > 0 )); then
+        echo ""
+        echo -e "  ${CYAN}${BOLD}Saved to unresolved.txt (${#UNRESOLVED_ADDED[@]}):${NC}"
+        printf '    → %s\n' "${UNRESOLVED_ADDED[@]}"
+        echo ""
+        echo -e "  ${DIM}Bind these later with a URL or local JAR in unresolved.txt,${NC}"
+        echo -e "  ${DIM}then move the entry to mods.txt. View with: pm unresolved${NC}"
+    fi
     echo ""
 }
 
@@ -1870,6 +2014,261 @@ cmd_markdown() {
     check_packwiz; check_pack_init
     header "Generating Mod List (Markdown)"
     $PACKWIZ_BIN utils markdown 2>>"$RUN_LOG"
+}
+
+# ============================================================================
+# ALIASES COMMAND
+# ============================================================================
+
+cmd_aliases() {
+    local subcmd="${1:-list}"
+    shift || true
+
+    case "$subcmd" in
+        list|ls|"")
+            init_aliases_file
+            header "Mod Aliases"
+
+            local count
+            count=$(jq 'length' "$ALIASES_FILE" 2>/dev/null || echo 0)
+
+            if (( count == 0 )); then
+                echo -e "  ${DIM}No aliases tracked.${NC}"
+                echo -e "  ${DIM}Aliases are created when packwiz installs a mod under a different name.${NC}"
+                echo ""
+                return
+            fi
+
+            printf "  ${BOLD}%-25s %-30s %s${NC}\n" "REQUESTED" "INSTALLED AS" "APPROVED"
+            separator
+
+            jq -r 'to_entries[] | "\(.key)|\(.value.resolved)|\(.value.name)|\(.value.approved_at)"' "$ALIASES_FILE" 2>/dev/null \
+            | while IFS='|' read -r requested resolved name approved; do
+                local short_date="${approved:-?}"
+                [[ ${#short_date} -gt 10 ]] && short_date="${short_date:0:10}"
+                printf "  ${CYAN}%-25s${NC} %-30s %s\n" "$requested" "${name} (${resolved})" "$short_date"
+            done
+
+            echo ""
+            echo -e "  ${BOLD}${count} alias(es)${NC}"
+            echo ""
+            echo -e "  ${DIM}Remove: pm aliases remove <requested-slug>${NC}"
+            echo -e "  ${DIM}Clear:  pm aliases clear${NC}"
+            echo ""
+            ;;
+
+        remove|rm)
+            local slug="${1:?Usage: pm aliases remove <requested-slug>}"
+            init_aliases_file
+
+            local resolved
+            resolved=$(alias_get "$slug")
+            if [[ -z "$resolved" ]]; then
+                log FAIL "No alias found for: ${slug}"
+                return 1
+            fi
+
+            local name
+            name=$(jq -r --arg r "$slug" '.[$r].name // empty' "$ALIASES_FILE" 2>/dev/null)
+
+            echo -e "  Alias: ${BOLD}${slug}${NC} → ${BOLD}${name}${NC} (${resolved})"
+            echo ""
+            echo -e "  ${CYAN}(a)${NC} Remove alias tracking only (keep the mod installed)"
+            echo -e "  ${RED}(b)${NC} Remove alias AND uninstall the mod"
+            echo -e "  ${DIM}(c)${NC} Cancel"
+            echo ""
+            echo -ne "  ${CYAN}choice [a/b/c]>${NC} "
+            read -r choice
+
+            case "$choice" in
+                a|A)
+                    alias_remove "$slug"
+                    log OK "Alias removed (mod still installed as ${resolved})"
+                    ;;
+                b|B)
+                    alias_remove "$slug"
+                    if [[ -f "${PACK_DIR}/mods/${resolved}.pw.toml" ]]; then
+                        $PACKWIZ_BIN remove "$resolved" --yes 2>>"$RUN_LOG" || rm -f "${PACK_DIR}/mods/${resolved}.pw.toml"
+                        $PACKWIZ_BIN refresh 2>>"$RUN_LOG" || true
+                        log OK "Alias removed and ${resolved} uninstalled"
+                    else
+                        log OK "Alias removed (${resolved}.pw.toml not found — may already be gone)"
+                    fi
+
+                    # Also remove from mods.txt if present
+                    if [[ -f "$MODS_FILE" ]]; then
+                        local tmp; tmp="$(mktemp)"
+                        grep -vE "^!?((mr|cf|url):)?${slug}(\s|#|$)" "$MODS_FILE" > "$tmp" || true
+                        mv "$tmp" "$MODS_FILE"
+                    fi
+                    ;;
+                *)
+                    echo -e "  ${DIM}Cancelled.${NC}"
+                    ;;
+            esac
+            ;;
+
+        clear)
+            init_aliases_file
+            local count
+            count=$(jq 'length' "$ALIASES_FILE" 2>/dev/null || echo 0)
+
+            if (( count == 0 )); then
+                echo -e "  ${DIM}No aliases to clear.${NC}"
+                return
+            fi
+
+            echo -e "  ${YELLOW}Clear all ${count} alias(es)? (y/N)${NC}"
+            echo -e "  ${DIM}This only removes tracking — installed mods are untouched.${NC}"
+            read -r confirm
+            [[ "$confirm" != [yY] ]] && return
+
+            echo '{}' > "$ALIASES_FILE"
+            log OK "Cleared ${count} alias(es)"
+            ;;
+
+        help|*)
+            echo ""
+            echo -e "  ${BOLD}pm aliases${NC} — Manage Mod Aliases"
+            echo ""
+            echo -e "  ${CYAN}pm aliases list${NC}             Show all tracked aliases"
+            echo -e "  ${CYAN}pm aliases remove <slug>${NC}    Remove alias (option to uninstall mod)"
+            echo -e "  ${CYAN}pm aliases clear${NC}            Clear all alias tracking"
+            echo ""
+            echo -e "  Aliases are created when packwiz installs a mod under a"
+            echo -e "  different slug than what you requested (e.g. ae2 → applied-energistics-2)."
+            echo -e "  You must approve each alias before it's kept."
+            echo ""
+            ;;
+    esac
+}
+
+# ============================================================================
+# UNRESOLVED COMMAND
+# ============================================================================
+
+cmd_unresolved() {
+    local subcmd="${1:-list}"
+    shift || true
+
+    case "$subcmd" in
+        list|ls|"")
+            header "Unresolved Mods"
+
+            if [[ ! -f "$UNRESOLVED_FILE" ]]; then
+                echo -e "  ${GREEN}No unresolved mods.${NC}"
+                echo ""
+                return
+            fi
+
+            local count=0
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                [[ "$line" =~ ^[[:space:]]*# ]] && continue
+                [[ -z "$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" ]] && continue
+                local slug comment=""
+                slug=$(echo "$line" | sed 's/\s*#.*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                comment=$(echo "$line" | grep -oP '#\s*\K.*' 2>/dev/null || true)
+
+                echo -e "  ${YELLOW}?${NC} ${BOLD}${slug}${NC}"
+                [[ -n "$comment" ]] && echo -e "    ${DIM}${comment}${NC}"
+                (( count++ ))
+            done < "$UNRESOLVED_FILE"
+
+            echo ""
+            if (( count == 0 )); then
+                echo -e "  ${GREEN}No unresolved mods.${NC}"
+            else
+                echo -e "  ${BOLD}${count} unresolved mod(s)${NC}"
+                echo ""
+                echo -e "  ${DIM}To resolve, edit unresolved.txt and add a URL or local prefix:${NC}"
+                echo -e "    ${CYAN}url:https://example.com/my-mod.jar${NC}"
+                echo -e "    ${CYAN}local:my-mod${NC}"
+                echo -e "  ${DIM}Then move the line to mods.txt and run: pm sync${NC}"
+            fi
+            echo ""
+            ;;
+
+        edit)
+            if [[ ! -f "$UNRESOLVED_FILE" ]]; then
+                echo -e "  ${DIM}No unresolved.txt exists yet.${NC}"
+                return
+            fi
+            local editor="${EDITOR:-nano}"
+            echo -e "  Opening ${CYAN}${UNRESOLVED_FILE}${NC} in ${editor}..."
+            "$editor" "$UNRESOLVED_FILE"
+            ;;
+
+        resolve)
+            local slug="${1:?Usage: pm unresolved resolve <slug> <url-or-local-path>}"
+            local binding="${2:?Usage: pm unresolved resolve <slug> <url|local:name>}"
+
+            if ! is_unresolved "$slug"; then
+                log FAIL "${slug} is not in unresolved.txt"
+                return 1
+            fi
+
+            # Build the mods.txt entry
+            local entry=""
+            if [[ "$binding" == local:* || "$binding" == url:* ]]; then
+                entry="$binding"
+            elif [[ "$binding" == https://* || "$binding" == http://* ]]; then
+                entry="url:${binding}"
+            else
+                entry="local:${binding}"
+            fi
+
+            # Remove from unresolved.txt
+            local tmp; tmp=$(mktemp)
+            grep -vE "^${slug}(\s|#|$)" "$UNRESOLVED_FILE" > "$tmp" || true
+            mv "$tmp" "$UNRESOLVED_FILE"
+
+            # Add to mods.txt
+            append_to_modlist "$entry" "resolved from unresolved.txt (was: ${slug})"
+            log OK "${slug} → ${entry} (moved to mods.txt)"
+            echo -e "  ${DIM}Run 'pm sync' to install.${NC}"
+            ;;
+
+        remove|rm)
+            local slug="${1:?Usage: pm unresolved remove <slug>}"
+            if [[ ! -f "$UNRESOLVED_FILE" ]]; then
+                log FAIL "No unresolved.txt"
+                return 1
+            fi
+            local tmp; tmp=$(mktemp)
+            grep -vE "^${slug}(\s|#|$)" "$UNRESOLVED_FILE" > "$tmp" || true
+            mv "$tmp" "$UNRESOLVED_FILE"
+            log OK "Removed ${slug} from unresolved.txt"
+            ;;
+
+        clear)
+            if [[ ! -f "$UNRESOLVED_FILE" ]]; then
+                echo -e "  ${DIM}Nothing to clear.${NC}"
+                return
+            fi
+            echo -e "  ${YELLOW}Clear all unresolved mods? (y/N)${NC}"
+            read -r confirm
+            [[ "$confirm" != [yY] ]] && return
+            rm -f "$UNRESOLVED_FILE"
+            log OK "Cleared unresolved.txt"
+            ;;
+
+        help|*)
+            echo ""
+            echo -e "  ${BOLD}pm unresolved${NC} — Manage Mods Not Found on MR/CF"
+            echo ""
+            echo -e "  ${CYAN}pm unresolved list${NC}                     Show pending mods"
+            echo -e "  ${CYAN}pm unresolved edit${NC}                     Open unresolved.txt in editor"
+            echo -e "  ${CYAN}pm unresolved resolve <slug> <url>${NC}     Bind a URL and move to mods.txt"
+            echo -e "  ${CYAN}pm unresolved remove <slug>${NC}            Remove from unresolved list"
+            echo -e "  ${CYAN}pm unresolved clear${NC}                    Delete unresolved.txt"
+            echo ""
+            echo -e "  ${BOLD}Example:${NC}"
+            echo "    pm unresolved resolve my-mod url:https://example.com/my-mod-1.0.jar"
+            echo "    pm unresolved resolve my-mod local:my-mod"
+            echo "    pm sync   # installs the resolved mod"
+            echo ""
+            ;;
+    esac
 }
 
 # ============================================================================
@@ -2545,6 +2944,13 @@ cmd_help() {
     verify                         Full audit: mods.txt ↔ installed .pw.toml
     diff                           Side-by-side modlist vs packwiz state
     doctor                         All checks + verify + refresh
+    aliases list                   Show all tracked mod aliases
+    aliases remove <slug>          Remove alias (option to uninstall mod)
+    aliases clear                  Clear all alias tracking
+    unresolved list                Show mods pending URL/JAR binding
+    unresolved resolve <slug> <u>  Bind a URL/local path and move to mods.txt
+    unresolved edit                Open unresolved.txt in editor
+    unresolved remove <slug>       Remove from unresolved list
 
   SERVER (Docker Compose — all accept --target <n>):
     targets list                   Show all server targets
@@ -2635,10 +3041,12 @@ main() {
         open)              cmd_open "${1:-}" ;;
         markdown|md)       cmd_markdown ;;
 
-        # Verification
+        # Verification & aliases
         doctor|doc)        cmd_doctor ;;
         verify|vf)         cmd_verify ;;
         diff|df)           cmd_diff ;;
+        aliases|al)        cmd_aliases "$@" ;;
+        unresolved|ur)     cmd_unresolved "$@" ;;
 
         # Server management
         targets|t)         cmd_targets "$@" ;;

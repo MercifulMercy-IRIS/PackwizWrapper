@@ -56,11 +56,16 @@ check_prerequisites() {
     info "Checking prerequisites..."
 
     # Check for Go (needed to install packwiz)
-    if ! command -v go &>/dev/null; then
+    if ! command -v go &>/dev/null && ! /usr/local/go/bin/go version &>/dev/null 2>&1; then
         warn "Go not found. Attempting to install..."
         install_go
+    elif ! command -v go &>/dev/null; then
+        # Go is installed but not in PATH — fix it for this session
+        export GOPATH="${HOME}/go"
+        export PATH="/usr/local/go/bin:${GOPATH}/bin:${PATH}"
+        hash -r 2>/dev/null || true
     fi
-    log "Go $(go version | grep -oP 'go\K[0-9.]+')"
+    log "Go $(go version 2>/dev/null | grep -oP 'go\K[0-9.]+' || echo 'unknown')"
 
     # Check for git
     if ! command -v git &>/dev/null; then
@@ -115,14 +120,37 @@ install_go() {
     rm -f "$tarball"
 
     # Add to PATH for this session
-    export PATH="/usr/local/go/bin:${HOME}/go/bin:$PATH"
+    export GOPATH="${HOME}/go"
+    export PATH="/usr/local/go/bin:${GOPATH}/bin:${PATH}"
 
-    # Persist in profile
-    if ! grep -q '/usr/local/go/bin' "${HOME}/.bashrc" 2>/dev/null; then
-        echo 'export PATH="/usr/local/go/bin:${HOME}/go/bin:$PATH"' >> "${HOME}/.bashrc"
+    # Persist in shell profiles — cover bash AND profile-based shells (Rocky uses .bash_profile)
+    local go_path_line='export GOPATH="${HOME}/go"'
+    local go_export_line='export PATH="/usr/local/go/bin:${HOME}/go/bin:${PATH}"'
+
+    for profile in "${HOME}/.bashrc" "${HOME}/.bash_profile" "${HOME}/.profile"; do
+        if [[ -f "$profile" ]] || [[ "$profile" == "${HOME}/.bashrc" ]]; then
+            if ! grep -q '/usr/local/go/bin' "$profile" 2>/dev/null; then
+                {
+                    echo ""
+                    echo "# Go (added by PackManager installer)"
+                    echo "$go_path_line"
+                    echo "$go_export_line"
+                } >> "$profile"
+                info "Added Go PATH to $(basename "$profile")"
+            fi
+        fi
+    done
+
+    # Rehash so the current shell picks up the new binary immediately
+    hash -r 2>/dev/null || true
+
+    # Verify Go is actually callable now
+    if ! /usr/local/go/bin/go version &>/dev/null; then
+        fail "Go installed to /usr/local/go but binary is not executable. Check permissions."
     fi
 
     log "Go ${go_version} installed"
+    info "Note: If 'go' isn't found after install, run: source ~/.bash_profile"
 }
 
 # ============================================================================
@@ -135,18 +163,30 @@ install_packwiz() {
         return
     fi
 
-    info "Installing PackWiz..."
-    go install github.com/packwiz/packwiz@latest 2>/dev/null || fail "Failed to install packwiz"
+    # Make sure Go is available
+    if ! command -v go &>/dev/null; then
+        if [[ -x /usr/local/go/bin/go ]]; then
+            export GOPATH="${HOME}/go"
+            export PATH="/usr/local/go/bin:${GOPATH}/bin:${PATH}"
+            hash -r 2>/dev/null || true
+        else
+            fail "Go is not installed. Cannot install PackWiz."
+        fi
+    fi
+
+    info "Installing PackWiz via 'go install'..."
+    go install github.com/packwiz/packwiz@latest 2>>"${LOG_FILE:-/dev/null}" || fail "Failed to install packwiz. Check Go installation and network."
 
     # Ensure Go bin is in PATH
-    local gobin="${HOME}/go/bin"
+    local gobin="${GOPATH:-${HOME}/go}/bin"
     if [[ -f "${gobin}/packwiz" ]]; then
         # Symlink to our install dir for reliability
         mkdir -p "$INSTALL_DIR"
         ln -sf "${gobin}/packwiz" "${INSTALL_DIR}/packwiz"
+        hash -r 2>/dev/null || true
         log "PackWiz installed → ${INSTALL_DIR}/packwiz"
     else
-        fail "PackWiz binary not found after install"
+        fail "PackWiz binary not found in ${gobin} after 'go install'. Check output above."
     fi
 }
 
@@ -274,7 +314,7 @@ _pm_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    commands="init sync update add remove list status deps refresh export serve pin unpin migrate settings import detect open markdown targets deploy doctor verify diff config publish self-update update-status help"
+    commands="init sync update add remove list status deps refresh export serve pin unpin migrate settings import detect open markdown targets deploy doctor verify diff aliases unresolved config publish self-update update-status help"
 
     case "$prev" in
         pm)
