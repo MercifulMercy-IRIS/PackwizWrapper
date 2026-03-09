@@ -11,7 +11,6 @@
 #   pm sync                    Install all mods from mods.txt
 #   pm update                  Update all non-pinned mods
 #   pm add [slug...]           Add mods (no args = interactive)
-#   pm search <query>          Search Modrinth & CurseForge
 #   pm remove <slug>           Remove a mod
 #   pm list                    Show installed mods with status
 #   pm status                  Pack health overview
@@ -1166,19 +1165,71 @@ print_srv_records() {
 cmd_init() {
     header "Initializing Pack"
     if [[ -f "${PACK_DIR}/pack.toml" ]]; then
-        echo -e "${YELLOW}pack.toml exists. Re-init? (y/N)${NC}"
+        echo -e "  ${YELLOW}pack.toml exists. Re-init? (y/N)${NC}"
         read -r c; [[ "$c" != [yY] ]] && exit 0
     fi
 
-    local loader_arg=""
-    [[ -n "$LOADER_VERSION" ]] && loader_arg="--${LOADER}-version ${LOADER_VERSION}"
+    # --- Minecraft version ---
+    local mc_ver="$MC_VERSION"
+    echo -e "  ${BOLD}Minecraft version${NC} ${DIM}(default: ${mc_ver})${NC}"
+    echo -ne "  ${CYAN}version>${NC} "
+    read -r input_mc
+    [[ -n "$input_mc" ]] && mc_ver="$input_mc"
 
-    $PACKWIZ_BIN init --mc-version "$MC_VERSION" --modloader "$LOADER" $loader_arg
+    # --- Mod loader ---
+    local loader="$LOADER"
+    echo ""
+    echo -e "  ${BOLD}Mod loader${NC} ${DIM}(default: ${loader})${NC}"
+    echo -e "  ${DIM}Options: forge, neoforge, fabric, quilt${NC}"
+    echo -ne "  ${CYAN}loader>${NC} "
+    read -r input_loader
+    if [[ -n "$input_loader" ]]; then
+        input_loader=$(echo "$input_loader" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        case "$input_loader" in
+            forge|neoforge|fabric|quilt) loader="$input_loader" ;;
+            *)
+                echo -e "  ${YELLOW}Unknown loader '${input_loader}' — using ${loader}${NC}"
+                ;;
+        esac
+    fi
+
+    # --- Loader version (optional) ---
+    local loader_ver="$LOADER_VERSION"
+    echo ""
+    echo -e "  ${BOLD}${loader^} version${NC} ${DIM}(blank = latest)${NC}"
+    echo -ne "  ${CYAN}${loader} version>${NC} "
+    read -r input_lv
+    [[ -n "$input_lv" ]] && loader_ver="$input_lv"
+
+    # --- Confirm ---
+    echo ""
+    separator
+    echo -e "  Minecraft:  ${BOLD}${mc_ver}${NC}"
+    echo -e "  Loader:     ${BOLD}${loader}${NC}"
+    if [[ -n "$loader_ver" ]]; then
+        echo -e "  Version:    ${BOLD}${loader_ver}${NC}"
+    else
+        echo -e "  Version:    ${DIM}latest${NC}"
+    fi
+    echo ""
+    echo -ne "  ${BOLD}Create pack? (Y/n)${NC} "
+    read -r confirm
+    [[ "$confirm" == [nN] ]] && { echo -e "  ${DIM}Cancelled.${NC}"; return; }
+
+    # --- Run packwiz init ---
+    local loader_arg=""
+    [[ -n "$loader_ver" ]] && loader_arg="--${loader}-version ${loader_ver}"
+
+    echo ""
+    $PACKWIZ_BIN init --mc-version "$mc_ver" --modloader "$loader" $loader_arg
 
     [[ -f "$MODS_FILE" ]] || {
         echo "# PackManager mods list — edit and run: pm sync" > "$MODS_FILE"
         log OK "Created mods.txt"
     }
+
+    echo ""
+    log OK "Pack initialized (MC ${mc_ver} / ${loader})"
 }
 
 cmd_sync() {
@@ -1307,7 +1358,7 @@ cmd_add() {
 cmd_add_interactive() {
     header "Interactive Add"
     echo -e "  Enter mod slugs (supports mr:, cf:, url: prefixes)."
-    echo -e "  Type ${BOLD}search <query>${NC} to search. Blank or ${BOLD}done${NC} to finish."
+    echo -e "  Blank or ${BOLD}done${NC} to finish."
     echo ""
 
     local queue=()
@@ -1315,9 +1366,6 @@ cmd_add_interactive() {
         echo -ne "  ${CYAN}mod>${NC} "
         read -r input
         [[ -z "$input" || "$input" == "done" || "$input" == "q" ]] && break
-        if [[ "$input" == search\ * || "$input" == s\ * ]]; then
-            _do_search "${input#* }"; continue
-        fi
         queue+=("$input")
         echo -e "    ${DIM}+ queued${NC}"
     done
@@ -1327,28 +1375,6 @@ cmd_add_interactive() {
     echo -e "  ${BOLD}Installing ${#queue[@]} mod(s)...${NC}"
     separator
     cmd_add "${queue[@]}"
-}
-
-cmd_search() {
-    check_packwiz
-    [[ -z "${1:-}" ]] && { echo -e "${RED}Usage: pm search <query>${NC}"; exit 1; }
-    _do_search "$1"
-}
-
-_do_search() {
-    local query="$1"
-    echo ""
-    echo -e "  ${BLUE}Modrinth: '${query}'${NC}"
-    local mr_out
-    mr_out=$($PACKWIZ_BIN modrinth search "$query" 2>&1) || true
-    [[ -n "$mr_out" ]] && echo "$mr_out" | head -25 | while IFS= read -r l; do echo "    $l"; done || echo -e "    ${DIM}No results${NC}"
-
-    echo ""
-    echo -e "  ${BLUE}CurseForge: '${query}'${NC}"
-    local cf_out
-    cf_out=$($PACKWIZ_BIN curseforge search "$query" 2>&1) || true
-    [[ -n "$cf_out" ]] && echo "$cf_out" | head -25 | while IFS= read -r l; do echo "    $l"; done || echo -e "    ${DIM}No results${NC}"
-    echo ""
 }
 
 cmd_remove() {
@@ -2497,7 +2523,6 @@ cmd_help() {
     sync                           Install all mods from mods.txt
     update                         Update all non-pinned mods
     add [slug...]                  Add mods (no args = interactive)
-    search <query>                 Search Modrinth & CurseForge
     remove <slug>                  Remove a mod from pack + mods.txt
     list [--side <s>] [--version]  Show installed mods (--native for raw packwiz)
     status                         Pack health overview
@@ -2592,7 +2617,6 @@ main() {
         sync)              cmd_sync ;;
         update|up)         cmd_update ;;
         add|a)             cmd_add "$@" ;;
-        search|s|find)     cmd_search "${1:-}" ;;
         remove|rm)         cmd_remove "${1:-}" ;;
         list|ls)           cmd_list "$@" ;;
         status|st)         cmd_status ;;

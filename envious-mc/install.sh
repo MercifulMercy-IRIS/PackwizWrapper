@@ -274,7 +274,7 @@ _pm_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    commands="init sync update add search remove list status deps refresh export serve pin unpin migrate settings import detect open markdown targets deploy doctor verify diff config publish self-update update-status help"
+    commands="init sync update add remove list status deps refresh export serve pin unpin migrate settings import detect open markdown targets deploy doctor verify diff config publish self-update update-status help"
 
     case "$prev" in
         pm)
