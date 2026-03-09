@@ -184,7 +184,7 @@ append_to_modlist() {
 
 parse_mod_entry() {
     local raw="$1"
-    raw="$(echo "$raw" | sed 's/\s*#.*$//' | xargs)"
+    raw="$(echo "$raw" | sed 's/\s*#.*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [[ -z "$raw" || "$raw" == \#* || "$raw" == @* ]] && return 1
 
     local pinned=false source="auto" slug="" url=""
@@ -315,7 +315,7 @@ verify_all_mods() {
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" =~ ^[[:space:]]*@ ]] && continue
-        [[ -z "$(echo "$line" | xargs)" ]] && continue
+        [[ -z "$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" ]] && continue
 
         local parsed
         parsed="$(parse_mod_entry "$line")" || continue
@@ -1194,7 +1194,7 @@ cmd_sync() {
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" =~ ^[[:space:]]*@ ]] && continue
-        [[ -z "$(echo "$line" | xargs)" ]] && continue
+        [[ -z "$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" ]] && continue
 
         local parsed
         parsed="$(parse_mod_entry "$line")" || continue
@@ -1439,7 +1439,7 @@ cmd_update() {
     if [[ -f "$MODS_FILE" ]]; then
         local hp=false
         while IFS= read -r line || [[ -n "$line" ]]; do
-            local cl; cl="$(echo "$line" | sed 's/\s*#.*$//' | xargs)"
+            local cl; cl="$(echo "$line" | sed 's/\s*#.*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
             if [[ "$cl" == !* ]]; then
                 $hp || { echo -e "  ${YELLOW}Pinned (skipping):${NC}"; hp=true; }
                 echo -e "    ${CYAN}⊘${NC} ${cl:1}"
@@ -1509,7 +1509,7 @@ cmd_doctor() {
     [[ -f "$MODS_FILE" ]] && while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" =~ ^[[:space:]]*@ ]] && continue
-        [[ -z "$(echo "$line" | xargs)" ]] && continue
+        [[ -z "$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" ]] && continue
         local parsed; parsed="$(parse_mod_entry "$line")" || continue
         IFS='|' read -r _ slug _ _ <<< "$parsed"
         is_installed "$slug" || { log WARN "Missing: ${slug}"; (( issues++ )); }
@@ -1543,7 +1543,7 @@ cmd_diff() {
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" =~ ^[[:space:]]*@ ]] && continue
-        [[ -z "$(echo "$line" | xargs)" ]] && continue
+        [[ -z "$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" ]] && continue
         local parsed
         parsed="$(parse_mod_entry "$line")" || continue
         IFS='|' read -r _ slug _ _ <<< "$parsed"
@@ -2251,11 +2251,11 @@ cmd_self_update() {
     fi
 
     # Sanitize: strip trailing/leading slashes and whitespace
-    local repo_clean="${PM_GITHUB_REPO#/}"; repo_clean="${repo_clean%/}"; repo_clean="$(echo "$repo_clean" | xargs)"
-    local branch_clean="${PM_GITHUB_BRANCH#/}"; branch_clean="${branch_clean%/}"; branch_clean="$(echo "$branch_clean" | xargs)"
+    local repo_clean="${PM_GITHUB_REPO#/}"; repo_clean="${repo_clean%/}"; repo_clean="$(echo "$repo_clean" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    local branch_clean="${PM_GITHUB_BRANCH#/}"; branch_clean="${branch_clean%/}"; branch_clean="$(echo "$branch_clean" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     local path_clean=""
     if [[ -n "$PM_GITHUB_PATH" ]]; then
-        path_clean="${PM_GITHUB_PATH#/}"; path_clean="${path_clean%/}"; path_clean="$(echo "$path_clean" | xargs)"
+        path_clean="${PM_GITHUB_PATH#/}"; path_clean="${path_clean%/}"; path_clean="$(echo "$path_clean" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     fi
 
     # Build base URL: repo/branch[/path]
@@ -2444,8 +2444,8 @@ cmd_self_update_status() {
     local local_sha_file="${config_dir}/.last_update_sha"
 
     # Sanitize repo/branch
-    local repo_clean="${PM_GITHUB_REPO#/}"; repo_clean="${repo_clean%/}"; repo_clean="$(echo "$repo_clean" | xargs)"
-    local branch_clean="${PM_GITHUB_BRANCH#/}"; branch_clean="${branch_clean%/}"; branch_clean="$(echo "$branch_clean" | xargs)"
+    local repo_clean="${PM_GITHUB_REPO#/}"; repo_clean="${repo_clean%/}"; repo_clean="$(echo "$repo_clean" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    local branch_clean="${PM_GITHUB_BRANCH#/}"; branch_clean="${branch_clean%/}"; branch_clean="$(echo "$branch_clean" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 
     echo -e "  Repo:    ${CYAN}${repo_clean}${NC}"
     echo -e "  Branch:  ${branch_clean}"
