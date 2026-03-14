@@ -983,7 +983,33 @@ resolve_target() {
 load_target() {
     local name="$1"
     local pack_dir; pack_dir=$(target_get "$name" "pack_dir")
-    [[ -n "$pack_dir" ]] && PACK_DIR="$pack_dir" && MODS_FILE="${PACK_DIR}/mods.txt"
+
+    if [[ -n "$pack_dir" ]]; then
+        # If the stored pack_dir is stale (no pack.toml), run discovery on it.
+        # This handles targets registered before `pm organize` moved things.
+        if [[ ! -f "${pack_dir}/pack.toml" ]]; then
+            local resolved
+            resolved=$(discover_pack_dir "$pack_dir")
+            if [[ -f "${resolved}/pack.toml" ]]; then
+                pack_dir="$resolved"
+                # Persist the fix so it doesn't re-discover every time
+                target_set "$name" "pack_dir=${pack_dir}"
+            fi
+        fi
+        PACK_DIR="$pack_dir"
+        MODS_FILE="${PACK_DIR}/mods.txt"
+        UNRESOLVED_FILE="${PACK_DIR}/unresolved.txt"
+        LOG_DIR="${PACK_DIR}/.logs"
+
+        # Handle stray mods.txt at the old location
+        local stored_root
+        stored_root=$(target_get "$name" "pack_dir")  # original before we overwrote
+        if [[ ! -f "$MODS_FILE" ]]; then
+            local parent
+            parent=$(dirname "$PACK_DIR")
+            [[ -f "${parent}/mods.txt" ]] && MODS_FILE="${parent}/mods.txt"
+        fi
+    fi
 
     local ram; ram=$(target_get "$name" "ram")
     [[ -n "$ram" ]] && SERVER_RAM="$ram"
