@@ -111,10 +111,75 @@ GLOBAL_CONF="${HOME}/.config/packmanager/packmanager.conf"
 LOCAL_CONF="${PACK_DIR}/packmanager.conf"
 [[ -f "$LOCAL_CONF" ]] && source "$LOCAL_CONF"
 
-# Re-derive paths after config load (in case PACK_DIR changed)
+# ============================================================================
+# PACK DIRECTORY DISCOVERY
+# ============================================================================
+# If PACK_DIR (pwd) doesn't contain pack.toml, try to find it:
+#   1. pack/ subdirectory (organized layout)
+#   2. Walk up parent directories (running from server/ or cdn/)
+#   3. Sibling pack/ when standing in server/ or cdn/
+# This lets pm work from the project root, from server/, or from anywhere
+# inside an organized tree without needing to cd into pack/ first.
+
+discover_pack_dir() {
+    local dir="$1"
+
+    # Already has pack.toml — nothing to do
+    [[ -f "${dir}/pack.toml" ]] && { echo "$dir"; return 0; }
+
+    # Check pack/ subdirectory (organized layout: root/pack/)
+    [[ -f "${dir}/pack/pack.toml" ]] && { echo "${dir}/pack"; return 0; }
+
+    # Check if we're inside server/ or cdn/ — look for sibling pack/
+    local dirname
+    dirname=$(basename "$dir")
+    if [[ "$dirname" == "server" || "$dirname" == "cdn" ]]; then
+        local parent
+        parent=$(dirname "$dir")
+        [[ -f "${parent}/pack/pack.toml" ]] && { echo "${parent}/pack"; return 0; }
+    fi
+
+    # Walk up to 3 parent directories
+    local walk="$dir"
+    local depth=0
+    while (( depth < 3 )); do
+        walk=$(dirname "$walk")
+        [[ "$walk" == "/" || "$walk" == "." ]] && break
+        [[ -f "${walk}/pack.toml" ]] && { echo "$walk"; return 0; }
+        [[ -f "${walk}/pack/pack.toml" ]] && { echo "${walk}/pack"; return 0; }
+        (( depth++ ))
+    done
+
+    # Not found — return original dir (check_pack_init will handle the error)
+    echo "$dir"
+    return 1
+}
+
+# Only auto-discover if the current PACK_DIR doesn't have pack.toml
+# and the user hasn't explicitly set PACK_DIR in config
+if [[ ! -f "${PACK_DIR}/pack.toml" ]]; then
+    _discovered=$(discover_pack_dir "$PACK_DIR")
+    if [[ -f "${_discovered}/pack.toml" ]]; then
+        PACK_DIR="$_discovered"
+    fi
+    unset _discovered
+fi
+
+# Re-derive paths after config load + discovery
 MODS_FILE="${PACK_DIR}/mods.txt"
 UNRESOLVED_FILE="${PACK_DIR}/unresolved.txt"
 LOG_DIR="${PACK_DIR}/.logs"
+
+# Also try to load a local config from the discovered pack dir
+# (in case discovery moved us and there's a packmanager.conf there)
+if [[ -f "${PACK_DIR}/packmanager.conf" && "${PACK_DIR}/packmanager.conf" != "$LOCAL_CONF" ]]; then
+    source "${PACK_DIR}/packmanager.conf"
+    LOCAL_CONF="${PACK_DIR}/packmanager.conf"
+    # Re-derive again after this config
+    MODS_FILE="${PACK_DIR}/mods.txt"
+    UNRESOLVED_FILE="${PACK_DIR}/unresolved.txt"
+    LOG_DIR="${PACK_DIR}/.logs"
+fi
 
 # Setup
 mkdir -p "$LOG_DIR" 2>/dev/null || true
@@ -157,7 +222,19 @@ check_packwiz() {
 
 check_pack_init() {
     [[ -f "${PACK_DIR}/pack.toml" ]] || {
-        echo -e "${RED}No pack.toml. Run 'pm init' first.${NC}"
+        echo -e "${RED}No pack.toml found.${NC}"
+        echo ""
+        echo -e "  Looked in: ${CYAN}${PACK_DIR}${NC}"
+        # Suggest where it might actually be
+        if [[ -f "$(pwd)/pack/pack.toml" ]]; then
+            echo -e "  ${GREEN}Found it at:${NC} ${CYAN}$(pwd)/pack/pack.toml${NC}"
+            echo -e "  This should have been auto-detected — check your config."
+        fi
+        echo ""
+        echo -e "  ${BOLD}Fixes:${NC}"
+        echo -e "    • cd into your pack directory and retry"
+        echo -e "    • Run ${CYAN}pm init${NC} to create a new pack here"
+        echo -e "    • Run ${CYAN}pm organize${NC} if your files are scattered"
         exit 1
     }
 }
@@ -1960,10 +2037,22 @@ print_srv_records() {
 cmd_organize() {
     header "Organize Directory"
 
-    local root="${1:-$PACK_DIR}"
+    # Organize always works on the directory the user is standing in (or the arg),
+    # NOT the auto-discovered PACK_DIR — because the point is to reorganize the
+    # flat directory that contains pack.toml alongside server files.
+    local root="${1:-$(pwd)}"
 
     # Sanity: must have at least a pack.toml somewhere to know this is a PM dir
     if [[ ! -f "${root}/pack.toml" ]]; then
+        # Maybe they're in the parent of an already-organized layout
+        if [[ -f "${root}/pack/pack.toml" ]]; then
+            echo -e "  ${YELLOW}This directory already has a pack/ subdirectory.${NC}"
+            echo -e "  ${DIM}Looks like it may already be organized.${NC}"
+            echo ""
+            echo -e "  To re-organize, run from inside the pack/ directory"
+            echo -e "  or pass the path: ${CYAN}pm organize ${root}/pack${NC}"
+            return 0
+        fi
         echo -e "  ${RED}No pack.toml in ${root}${NC}"
         echo -e "  ${DIM}Run this from your existing pack directory, or pass it as an argument.${NC}"
         return 1
