@@ -74,6 +74,12 @@ SERVER_VM_IP=""                      # Public/Tailscale IP of the Docker VM
 PACK_HOST_URL=""
 PACK_HOST_DIR=""
 
+# CDN / Reverse Proxy — serves pack files + mod JARs to clients
+CDN_DOMAIN=""                      # e.g. "pack.enviouslabs.com" (per-target override via targets set)
+CDN_PROTO="https"                  # Protocol for CDN URLs (http or https)
+CDN_ROOT="/var/www/packwiz"        # Local filesystem root for nginx-served files
+NGINX_CONF_DIR=""                  # Where to write nginx configs (default: CDN_ROOT/nginx)
+
 # Self-update (GitHub)
 PM_GITHUB_REPO=""               # e.g. "yourusername/PackwizWrapper" (owner/repo)
 PM_GITHUB_BRANCH="main"         # Branch to pull updates from
@@ -1241,6 +1247,321 @@ publish_pack() {
     echo ""
     echo -e "  ${GREEN}Server auto-syncs on startup if PACKWIZ_URL is set.${NC}"
     echo -e "  Regenerate compose to pick it up: ${CYAN}pm deploy regenerate${NC}"
+    echo ""
+}
+
+# ============================================================================
+# CDN PUBLISHING (nginx reverse-proxy subdirectories)
+# ============================================================================
+# Creates a directory structure per target that nginx can serve directly:
+#
+#   CDN_ROOT/<target>/
+#     ├── pack.toml          ← packwiz pack descriptor
+#     ├── index.toml         ← mod index with hashes
+#     ├── mods/
+#     │   ├── mod-slug.pw.toml   ← metadata (download URL points at our CDN for url/local mods)
+#     │   └── ...
+#     └── jars/
+#         ├── custom-mod.jar     ← only for url: and local: mods (self-hosted)
+#         └── ...
+#
+# Clients using packwiz-installer-bootstrap hit:
+#   https://<CDN_DOMAIN>/<target>/pack.toml
+# which references index.toml → mods/*.pw.toml → jars/*.jar (for self-hosted)
+# Modrinth/CurseForge mods keep their original CDN download URLs.
+
+# Resolve the CDN domain for a given target (per-target override or global)
+resolve_cdn_domain() {
+    local target_name="${1:-}"
+    local domain=""
+
+    # 1. Per-target override
+    if [[ -n "$target_name" ]]; then
+        domain=$(target_get "$target_name" "cdn_domain")
+    fi
+
+    # 2. Global CDN_DOMAIN
+    [[ -z "$domain" ]] && domain="$CDN_DOMAIN"
+
+    # 3. Fall back to PACK_HOST_URL's hostname
+    if [[ -z "$domain" && -n "$PACK_HOST_URL" ]]; then
+        domain=$(echo "$PACK_HOST_URL" | sed 's|^https\?://||; s|/.*||')
+    fi
+
+    # 4. Fall back to SERVER_VM_IP:8080
+    [[ -z "$domain" ]] && domain="${SERVER_VM_IP:-localhost}:8080"
+
+    echo "$domain"
+}
+
+# Build the full CDN base URL for a target
+resolve_cdn_base_url() {
+    local target_name="${1:-}"
+    local domain
+    domain=$(resolve_cdn_domain "$target_name")
+
+    local proto="$CDN_PROTO"
+    [[ -z "$proto" ]] && proto="https"
+
+    # If domain already has a port, it's likely a dev setup — use http
+    [[ "$domain" == *:* ]] && proto="http"
+
+    echo "${proto}://${domain}/${target_name}"
+}
+
+# Publish pack files + jar files to CDN_ROOT in nginx-ready structure
+publish_cdn() {
+    local target_name="${1:-}"
+
+    header "Publishing Pack to CDN"
+    check_pack_init
+
+    local cdn_root="${CDN_ROOT:-/var/www/packwiz}"
+
+    if [[ -z "$target_name" ]]; then
+        echo -e "  ${RED}Target required. Usage: pm deploy cdn --target <name>${NC}"
+        return 1
+    fi
+
+    local target_dir="${cdn_root}/${target_name}"
+    local mods_dir="${target_dir}/mods"
+    local jars_dir="${target_dir}/jars"
+
+    mkdir -p "$mods_dir" "$jars_dir"
+
+    # Build index with hashes for distribution
+    $PACKWIZ_BIN refresh --build 2>>"$RUN_LOG"
+
+    local cdn_base
+    cdn_base=$(resolve_cdn_base_url "$target_name")
+
+    log INFO "CDN base URL: ${cdn_base}"
+    log INFO "Publishing to: ${target_dir}"
+
+    # Copy pack.toml and index.toml
+    cp "${PACK_DIR}/pack.toml" "${target_dir}/"
+    [[ -f "${PACK_DIR}/index.toml" ]] && cp "${PACK_DIR}/index.toml" "${target_dir}/"
+
+    # Process each .pw.toml — copy and rewrite URLs for url/local sources
+    local jar_count=0
+    local toml_count=0
+
+    for toml in "${PACK_DIR}/mods/"*.pw.toml; do
+        [[ -f "$toml" ]] || continue
+        local slug
+        slug=$(basename "$toml" .pw.toml)
+        local dest_toml="${mods_dir}/${slug}.pw.toml"
+
+        # Detect if this mod uses a URL or local source (no [update.modrinth] or [update.curseforge])
+        local is_self_hosted=false
+        if ! grep -q '\[update\.modrinth\]' "$toml" 2>/dev/null && \
+           ! grep -q '\[update\.curseforge\]' "$toml" 2>/dev/null; then
+            is_self_hosted=true
+        fi
+
+        if $is_self_hosted; then
+            # Get the filename from the toml
+            local mod_filename
+            mod_filename=$(grep -oP '^filename\s*=\s*"\K[^"]+' "$toml" 2>/dev/null || echo "")
+
+            if [[ -n "$mod_filename" ]]; then
+                # Find and copy the JAR to jars/
+                local jar_src=""
+                if [[ -f "${PACK_DIR}/mods/${mod_filename}" ]]; then
+                    jar_src="${PACK_DIR}/mods/${mod_filename}"
+                elif [[ -n "$LOCAL_MODS_DIR" && -f "${LOCAL_MODS_DIR}/${mod_filename}" ]]; then
+                    jar_src="${LOCAL_MODS_DIR}/${mod_filename}"
+                fi
+
+                if [[ -n "$jar_src" && -f "$jar_src" ]]; then
+                    cp "$jar_src" "${jars_dir}/${mod_filename}"
+                    (( jar_count++ ))
+                    log DEP "Copied JAR: ${mod_filename}"
+
+                    # Rewrite .pw.toml — replace the download URL with our CDN URL
+                    local new_url="${cdn_base}/jars/${mod_filename}"
+                    sed "s|^url = \".*\"|url = \"${new_url}\"|" "$toml" > "$dest_toml"
+                    log OK "${slug} → rewritten to ${new_url}"
+                else
+                    # JAR not found locally — copy toml as-is
+                    cp "$toml" "$dest_toml"
+                    log WARN "${slug} — JAR '${mod_filename}' not found locally, keeping original URL"
+                fi
+            else
+                cp "$toml" "$dest_toml"
+            fi
+        else
+            # Modrinth/CurseForge mod — copy toml as-is (uses their CDN)
+            cp "$toml" "$dest_toml"
+        fi
+        (( toml_count++ ))
+    done
+
+    # Copy config dir if present
+    if [[ -d "${PACK_DIR}/config" ]]; then
+        cp -r "${PACK_DIR}/config" "${target_dir}/" 2>/dev/null || true
+    fi
+
+    # Regenerate the index.toml inside the published dir to reflect rewritten URLs
+    # We do this by running packwiz refresh in the published directory
+    if command -v "$PACKWIZ_BIN" &>/dev/null; then
+        (cd "$target_dir" && $PACKWIZ_BIN refresh --build 2>/dev/null || true)
+    fi
+
+    log OK "Published: ${toml_count} mod(s), ${jar_count} self-hosted JAR(s)"
+
+    echo ""
+    echo -e "  ${GREEN}${BOLD}CDN Directory:${NC}"
+    echo -e "  ${CYAN}${target_dir}/${NC}"
+    echo ""
+    echo -e "  ${GREEN}Client (Prism Launcher pre-launch command):${NC}"
+    echo -e "  ${CYAN}\"\$INST_JAVA\" -jar packwiz-installer-bootstrap.jar ${cdn_base}/pack.toml${NC}"
+    echo ""
+    if (( jar_count > 0 )); then
+        echo -e "  ${MAGENTA}${jar_count} self-hosted mod JAR(s) in:${NC}"
+        echo -e "  ${CYAN}${jars_dir}/${NC}"
+        echo ""
+    fi
+    echo -e "  ${DIM}Generate nginx config: pm deploy nginx --target ${target_name}${NC}"
+    echo ""
+}
+
+# Generate nginx site config for serving packwiz files via reverse proxy
+generate_nginx_config() {
+    local target_name="${1:-}"
+    local all_targets=false
+
+    if [[ -z "$target_name" ]]; then
+        all_targets=true
+    fi
+
+    header "Generating Nginx Config"
+
+    local cdn_root="${CDN_ROOT:-/var/www/packwiz}"
+    local nginx_dir="${NGINX_CONF_DIR:-${cdn_root}/nginx}"
+    mkdir -p "$nginx_dir"
+
+    local targets
+    if $all_targets; then
+        targets=$(target_list)
+    else
+        targets="$target_name"
+    fi
+
+    [[ -z "$targets" ]] && { echo -e "  ${DIM}No targets.${NC}"; return; }
+
+    # Group targets by CDN domain so we generate one server block per domain
+    declare -A domain_targets  # domain → "target1 target2 ..."
+
+    while IFS= read -r t; do
+        local dom
+        dom=$(resolve_cdn_domain "$t")
+        # Strip port if present for server_name
+        local server_name="${dom%%:*}"
+        domain_targets["$server_name"]+=" $t"
+    done <<< "$targets"
+
+    for server_name in "${!domain_targets[@]}"; do
+        local conf_file="${nginx_dir}/${server_name}.conf"
+        local target_list_for_domain="${domain_targets[$server_name]}"
+
+        cat > "$conf_file" << NGINXHEAD
+# ============================================================================
+# PackWiz CDN — Auto-generated by PackManager
+# Domain: ${server_name}
+# Targets:${target_list_for_domain}
+# ============================================================================
+# Place this in /etc/nginx/sites-available/ and symlink to sites-enabled/
+# Or include from your main nginx.conf:  include ${nginx_dir}/*.conf;
+# ============================================================================
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${server_name};
+
+    # --- Redirect HTTP to HTTPS (uncomment if using SSL) ---
+    # return 301 https://\$host\$request_uri;
+
+    root ${cdn_root};
+    index index.html;
+
+    # --- Global headers ---
+    add_header X-Content-Type-Options nosniff;
+    add_header Cache-Control "public, max-age=60";
+
+NGINXHEAD
+
+        # Add location blocks for each target under this domain
+        for t in $target_list_for_domain; do
+            cat >> "$conf_file" << NGINXTARGET
+    # --- ${t} ---
+    # Pack TOML files (pack.toml, index.toml, mods/*.pw.toml)
+    location /${t}/ {
+        alias ${cdn_root}/${t}/;
+        types {
+            application/toml toml;
+        }
+        add_header Access-Control-Allow-Origin *;
+        add_header Cache-Control "public, max-age=60";
+        try_files \$uri \$uri/ =404;
+    }
+
+    # Mod JAR files (self-hosted mods downloaded by clients)
+    location /${t}/jars/ {
+        alias ${cdn_root}/${t}/jars/;
+        types {
+            application/java-archive jar;
+        }
+        add_header Access-Control-Allow-Origin *;
+        add_header Cache-Control "public, max-age=3600";
+        try_files \$uri =404;
+    }
+
+NGINXTARGET
+        done
+
+        # Close server block
+        cat >> "$conf_file" << 'NGINXFOOT'
+    # --- Deny dotfiles ---
+    location ~ /\. {
+        deny all;
+    }
+}
+
+# --- HTTPS (uncomment and configure for SSL) ---
+# server {
+#     listen 443 ssl http2;
+#     listen [::]:443 ssl http2;
+#     server_name ${server_name};
+#
+#     ssl_certificate     /etc/letsencrypt/live/${server_name}/fullchain.pem;
+#     ssl_certificate_key /etc/letsencrypt/live/${server_name}/privkey.pem;
+#
+#     # Copy the root, location blocks, and headers from above
+# }
+NGINXFOOT
+
+        # Fix the HTTPS comment block to use actual server_name
+        sed -i "s|\${server_name}|${server_name}|g" "$conf_file"
+
+        log OK "Generated: ${conf_file}"
+    done
+
+    echo ""
+    echo -e "  ${GREEN}${BOLD}Nginx configs written to:${NC}"
+    echo -e "  ${CYAN}${nginx_dir}/${NC}"
+    echo ""
+    echo -e "  ${BOLD}Setup:${NC}"
+    echo -e "    1. ${CYAN}sudo ln -sf ${nginx_dir}/*.conf /etc/nginx/sites-enabled/${NC}"
+    echo -e "    2. ${CYAN}sudo nginx -t && sudo systemctl reload nginx${NC}"
+    echo ""
+    echo -e "  ${BOLD}SSL (recommended):${NC}"
+    for server_name in "${!domain_targets[@]}"; do
+        echo -e "    ${CYAN}sudo certbot --nginx -d ${server_name}${NC}"
+    done
+    echo ""
+    echo -e "  ${DIM}Re-run after adding targets to regenerate.${NC}"
     echo ""
 }
 
@@ -2429,7 +2750,7 @@ cmd_deploy() {
     # Resolve target
     local target_name=""
     case "$subcmd" in
-        status|st|regenerate|help) target_name="${target_flag:-}" ;;
+        status|st|regenerate|nginx|help) target_name="${target_flag:-}" ;;
         *)
             target_name=$(resolve_target "$target_flag")
             load_target "$target_name"
@@ -2514,6 +2835,15 @@ cmd_deploy() {
             echo ""
             ;;
 
+        cdn)
+            check_packwiz; check_pack_init
+            publish_cdn "$target_name"
+            ;;
+
+        nginx)
+            generate_nginx_config "$target_name"
+            ;;
+
         full)
             header "Full Deployment: ${target_name}"
             echo -e "  sync mods → publish pack → generate compose → start"
@@ -2557,7 +2887,15 @@ cmd_deploy() {
             echo -e "  ${CYAN}pm deploy logs${NC}             Tail server logs"
             echo -e "  ${CYAN}pm deploy backup${NC}           Backup server world"
             echo -e "  ${CYAN}pm deploy regenerate${NC}       Rebuild docker-compose.yml"
+            echo -e "  ${CYAN}pm deploy cdn${NC}              Publish pack + JARs to nginx-ready dirs"
+            echo -e "  ${CYAN}pm deploy nginx${NC}            Generate nginx reverse proxy config"
             echo -e "  ${CYAN}pm deploy full${NC}             Pipeline: sync → publish → create → start"
+            echo ""
+            echo -e "  ${BOLD}CDN / Reverse Proxy:${NC}"
+            echo "    pm targets set survival cdn_domain=pack.enviouslabs.com"
+            echo "    pm deploy cdn --target survival      # publish files to CDN_ROOT"
+            echo "    pm deploy nginx --target survival     # generate nginx config"
+            echo "    pm deploy nginx                       # generate for ALL targets"
             echo ""
             echo -e "  ${BOLD}Example:${NC}"
             echo "    pm targets add survival domain=survival.enviouslabs.com ram=8192"
@@ -2629,6 +2967,13 @@ cmd_config() {
                 echo -e "    URL: ${PACK_HOST_URL}"
                 echo -e "    Dir: ${PACK_HOST_DIR:-not set}"
             fi
+
+            echo ""
+            echo -e "  ${BOLD}CDN / Reverse Proxy:${NC}"
+            echo -e "    Domain:    ${CDN_DOMAIN:-${YELLOW}not set${NC}}"
+            echo -e "    Protocol:  ${CDN_PROTO:-https}"
+            echo -e "    Root:      ${CDN_ROOT:-/var/www/packwiz}"
+            echo -e "    Nginx dir: ${NGINX_CONF_DIR:-${CDN_ROOT:-/var/www/packwiz}/nginx}"
             echo ""
             ;;
         edit)
@@ -2967,7 +3312,14 @@ cmd_help() {
     deploy logs                    Tail server logs
     deploy backup                  Backup server world
     deploy regenerate              Rebuild docker-compose.yml
+    deploy cdn                     Publish pack + JARs to nginx-ready dirs
+    deploy nginx                   Generate nginx reverse proxy config
     deploy full                    Pipeline: sync → publish → create → start
+
+  CDN / REVERSE PROXY:
+    targets set <n> cdn_domain=x   Set per-target CDN domain
+    deploy cdn --target <n>        Publish pack files + self-hosted JARs
+    deploy nginx [--target <n>]    Generate nginx site configs (all or one)
 
   CONFIG:
     config show                    Print active configuration
@@ -3006,6 +3358,9 @@ cmd_help() {
     pm deploy start --target survival      # docker compose up
     pm deploy status                       # all servers at a glance
     pm targets dns                         # SRV records for Cloudflare
+    pm targets set survival cdn_domain=pack.enviouslabs.com
+    pm deploy cdn --target survival    # publish to /var/www/packwiz/survival/
+    pm deploy nginx                    # generate nginx config for all targets
 
 HELP
 }
