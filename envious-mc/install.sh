@@ -16,6 +16,7 @@
 # After install, use from anywhere:
 #   pm init
 #   pm sync
+#   pm organize
 #   pm deploy
 #   pm add tinkers-construct mekanism
 # ============================================================================
@@ -258,6 +259,10 @@ RETRY_ATTEMPTS=2                # Retries per source before fallback
 RETRY_DELAY=3                   # Seconds between retries
 PREFER_SOURCE="mr"              # "mr" (Modrinth first) or "cf" (CurseForge first)
 
+# --- Sync Behavior -----------------------------------------------------------
+SYNC_ON_FAIL="prompt"           # "prompt" = pause and ask, "unresolved" = auto-save, "skip" = ignore
+AUTO_PUBLISH=""                 # "" = off, "__auto__" = sibling cdn/ dir, "<target>" = named target
+
 # --- Docker Server -----------------------------------------------------------
 SERVER_IMAGE="itzg/minecraft-server:java17"
 SERVER_VM_IP=""                 # Public/Tailscale IP of the Docker VM
@@ -277,6 +282,12 @@ SERVER_BACKUPS="3"              # Backup limit
 # --- Pack Hosting -----------------------------------------------------------
 PACK_HOST_URL=""                # e.g. https://pack.enviouslabs.com
 PACK_HOST_DIR=""                # Local dir served by Cloudflare tunnel
+
+# --- CDN / Reverse Proxy ---------------------------------------------------
+CDN_DOMAIN=""                   # e.g. "pack.enviouslabs.com" (per-target override via targets set)
+CDN_PROTO="https"               # Protocol for CDN URLs (http or https)
+CDN_ROOT="/var/www/packwiz"     # Local filesystem root nginx serves from
+NGINX_CONF_DIR=""               # Where to write nginx configs (default: CDN_ROOT/nginx)
 
 # --- Self-Update (GitHub) --------------------------------------------------
 PM_GITHUB_REPO=""               # e.g. "yourusername/PackwizWrapper" (owner/repo)
@@ -314,7 +325,7 @@ _pm_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    commands="init sync update add remove list status deps refresh export serve pin unpin migrate settings import detect open markdown targets deploy doctor verify diff aliases unresolved config publish self-update update-status help"
+    commands="init organize sync update add remove list status deps refresh export serve pin unpin migrate settings import detect open markdown targets deploy doctor verify diff aliases unresolved config publish self-update update-status help"
 
     case "$prev" in
         pm)
@@ -333,7 +344,7 @@ _pm_completions() {
             return 0
             ;;
         deploy|d)
-            COMPREPLY=($(compgen -W "create push publish start stop restart kill status console backup full help --target" -- "$cur"))
+            COMPREPLY=($(compgen -W "create push publish start stop restart kill status console backup regenerate cdn nginx full help --target" -- "$cur"))
             return 0
             ;;
         targets|t)
@@ -461,7 +472,9 @@ verify() {
     echo -e "    ${CYAN}pm init${NC}              Initialize a pack in the current directory"
     echo -e "    ${CYAN}pm sync${NC}              Install all mods from mods.txt"
     echo -e "    ${CYAN}pm add <slug>${NC}        Add a mod"
+    echo -e "    ${CYAN}pm organize${NC}          Sort messy dir into pack/ server/ cdn/"
     echo -e "    ${CYAN}pm deploy create${NC}     Generate Docker compose for a target"
+    echo -e "    ${CYAN}pm deploy cdn${NC}        Publish pack + JARs for nginx"
     echo -e "    ${CYAN}pm config edit${NC}       Edit your config (VM IP, domain, etc.)"
     echo ""
     echo -e "  ${BOLD}Config:${NC} ${CYAN}${CONFIG_DIR}/packmanager.conf${NC}"
