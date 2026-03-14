@@ -95,7 +95,7 @@ PM_GITHUB_PATH=""               # Subdirectory in repo where files live (e.g. "e
 PM_UPDATE_FILES="packmanager.sh install.sh packmanager.conf mods.txt"  # Files to update
 
 # Local/self-hosted mods (for mods not on Modrinth/CurseForge)
-LOCAL_MODS_DIR=""               # e.g. /var/www/mods — served by nginx/tunnel
+LOCAL_MODS_DIR=""               # e.g. /var/www/mods — served by Caddy/tunnel
 LOCAL_MODS_URL=""               # e.g. https://mods.enviouslabs.com
 
 # JVM
@@ -222,6 +222,11 @@ log()       { local l="$1"; shift; echo "$(date '+%H:%M:%S') [${l}] $*" >> "$RUN
               esac; }
 header()    { echo ""; echo -e "${BOLD}═══ $* ═══${NC}"; echo ""; }
 separator() { echo -e "${DIM}  ─────────────────────────────────────────${NC}"; }
+
+# Normalize a slug/name for comparison: lowercase, strip underscores/hyphens/spaces
+normalize_slug() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d '_ -'
+}
 
 check_packwiz() {
     command -v "$PACKWIZ_BIN" &>/dev/null || {
@@ -436,11 +441,11 @@ verify_mod_install() {
     parsed=$(parse_pw_toml "$toml_file") || return 0
     IFS='|' read -r resolved_slug resolved_name resolved_id resolved_source resolved_filename <<< "$parsed"
 
-    # Normalize for comparison (lowercase, strip hyphens)
+    # Normalize for comparison
     local req_norm res_norm res_name_norm
-    req_norm=$(echo "$requested_slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
-    res_norm=$(echo "$resolved_slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
-    res_name_norm=$(echo "$resolved_name" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
+    req_norm=$(normalize_slug "$requested_slug")
+    res_norm=$(normalize_slug "$resolved_slug")
+    res_name_norm=$(normalize_slug "$resolved_name")
 
     # Check 1: Slug match (exact or normalized)
     if [[ "$req_norm" == "$res_norm" ]]; then
@@ -558,11 +563,10 @@ verify_all_mods() {
             # Check if ANY slug in mods.txt roughly matches this resolved name
             local found_match=false
             for req_slug in "${!requested_slugs[@]}"; do
-                local req_norm res_norm
-                req_norm=$(echo "$req_slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
-                res_norm=$(echo "$resolved_slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
-                local name_norm
-                name_norm=$(echo "$resolved_name" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
+                local req_norm res_norm name_norm
+                req_norm=$(normalize_slug "$req_slug")
+                res_norm=$(normalize_slug "$resolved_slug")
+                name_norm=$(normalize_slug "$resolved_name")
 
                 if [[ "$req_norm" == "$res_norm" ]]; then
                     found_match=true
@@ -596,11 +600,10 @@ verify_all_mods() {
                 res_slug=$(basename "$toml" .pw.toml)
                 local res_name
                 res_name=$(grep -oP '^name\s*=\s*"\K[^"]+' "$toml" 2>/dev/null || echo "")
-                local rn rr
-                rn=$(echo "$req_slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
-                rr=$(echo "$res_slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
-                local nn
-                nn=$(echo "$res_name" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
+                local rn rr nn
+                rn=$(normalize_slug "$req_slug")
+                rr=$(normalize_slug "$res_slug")
+                nn=$(normalize_slug "$res_name")
 
                 if [[ "$nn" == *"$rn"* || "$rr" == *"$rn"* || "$rn" == *"$rr"* ]]; then
                     found=true
@@ -690,25 +693,20 @@ run_packwiz_install() {
     return "$exit_code"
 }
 
-try_modrinth() {
-    local slug="$1" attempt=0
+# Retry wrapper for packwiz install commands (works for any source)
+try_source() {
+    local source="$1" slug="$2" attempt=0
     while (( attempt < RETRY_ATTEMPTS )); do
-        run_packwiz_install "modrinth" "$slug" && return 0
+        run_packwiz_install "$source" "$slug" && return 0
         (( attempt++ ))
         (( attempt < RETRY_ATTEMPTS )) && sleep "$RETRY_DELAY"
     done
     return 1
 }
 
-try_curseforge() {
-    local slug="$1" attempt=0
-    while (( attempt < RETRY_ATTEMPTS )); do
-        run_packwiz_install "curseforge" "$slug" && return 0
-        (( attempt++ ))
-        (( attempt < RETRY_ATTEMPTS )) && sleep "$RETRY_DELAY"
-    done
-    return 1
-}
+# Convenience aliases
+try_modrinth()   { try_source "modrinth" "$1"; }
+try_curseforge() { try_source "curseforge" "$1"; }
 
 try_url() {
     local url="$1" slug="$2"
@@ -894,7 +892,7 @@ install_mod() {
 #
 # Architecture:
 #   Docker VM (Rocky/Ubuntu)
-#     ├─ nginx container         ← serves pack files for all targets
+#     ├─ caddy container         ← serves pack files for all targets (auto-HTTPS)
 #     ├─ mc-survival  :25565     ← survival.enviouslabs.com (SRV record)
 #     ├─ mc-creative  :25566     ← creative.enviouslabs.com (SRV record)
 #     └─ mc-modded    :25567     ← modded.enviouslabs.com   (SRV record)
@@ -999,9 +997,7 @@ load_target() {
         UNRESOLVED_FILE="${PACK_DIR}/unresolved.txt"
         LOG_DIR="${PACK_DIR}/.logs"
 
-        # Handle stray mods.txt at the old location
-        local stored_root
-        stored_root=$(target_get "$name" "pack_dir")  # original before we overwrote
+        # Handle stray mods.txt at the parent directory (e.g. project root)
         if [[ ! -f "$MODS_FILE" ]]; then
             local parent
             parent=$(dirname "$PACK_DIR")
@@ -1139,6 +1135,12 @@ HEADER
         caddy_ports="\"8080:8080\""
     fi
 
+    # Health check port must match what Caddy actually listens on
+    local healthcheck_port="8080"
+    if [[ -n "$CDN_DOMAIN" ]]; then
+        healthcheck_port="80"
+    fi
+
     cat >> "$compose_file" << CADDY
 
   # --- Pack file server (Caddy — serves packwiz packs for client auto-update) ---
@@ -1154,7 +1156,7 @@ HEADER
     ports:
       - ${caddy_ports}
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:${healthcheck_port}/health"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -1183,7 +1185,7 @@ CADDY
         # MC container fetches pack.toml from the Caddy container over the internal network
         local packwiz_url=""
         if [[ -d "${cdn_host_dir}/${t}" ]] || [[ -d "${cdn_host_dir}" && -f "${cdn_host_dir}/pack.toml" ]]; then
-            packwiz_url="http://packserver:8080/${t}/pack.toml"
+            packwiz_url="http://packserver:${healthcheck_port}/${t}/pack.toml"
         fi
 
         cat >> "$compose_file" << SERVICE
@@ -1425,7 +1427,7 @@ docker_backup_target() {
 }
 
 # ============================================================================
-# PACK PUBLISHING (copies pack files to nginx for auto-update)
+# PACK PUBLISHING (copies pack files to cdn/ for Caddy to serve)
 # ============================================================================
 
 publish_pack() {
@@ -1448,7 +1450,7 @@ publish_pack() {
     # Build index with hashes for distribution
     $PACKWIZ_BIN refresh --build 2>>"$RUN_LOG"
 
-    info "Publishing pack to ${publish_dir}..."
+    log INFO "Publishing pack to ${publish_dir}..."
 
     # Copy pack descriptor files
     cp "${PACK_DIR}/pack.toml" "${publish_dir}/"
@@ -1908,15 +1910,15 @@ print_srv_records() {
 #     │   ├── logs/
 #     │   ├── ops.json, whitelist.json, banned-*.json
 #     │   └── ...
-#     └── cdn/                 ← nginx-served files (client downloads)
+#     └── cdn/                 ← Caddy-served files (client downloads)
 #         ├── pack.toml
 #         ├── index.toml
 #         ├── mods/            ← .pw.toml metadata
 #         └── jars/            ← self-hosted mod JARs
 #
-# After organizing, PACK_DIR points at <root>/pack/ and CDN_ROOT can
-# point at <root>/cdn/.  The server/ dir is left alone — Docker or
-# the itzg image manage it — but loose server files are relocated there.
+# After organizing, PACK_DIR points at <root>/pack/ and the Caddy
+# container serves <root>/cdn/.  The server/ dir is left alone — Docker
+# or the itzg image manage it — but loose server files are relocated there.
 
 cmd_organize() {
     header "Organize Directory"
@@ -1985,7 +1987,7 @@ cmd_organize() {
     echo -e "  ${BOLD}Will create:${NC}"
     echo -e "    ${CYAN}pack/${NC}    ← packwiz files (pack.toml, mods/, mods.txt, config)"
     echo -e "    ${CYAN}server/${NC}  ← minecraft server runtime (world, properties, logs)"
-    echo -e "    ${CYAN}cdn/${NC}     ← nginx-served client downloads (toml + jars)"
+    echo -e "    ${CYAN}cdn/${NC}     ← Caddy-served client downloads (toml + jars)"
     echo ""
 
     if (( ${#packwiz_files[@]} > 0 )); then
@@ -2126,7 +2128,7 @@ cmd_organize() {
     else
     echo -e "  │   └── ${DIM}(empty — Docker/itzg manages this)${NC}"
     fi
-    echo -e "  └── ${BOLD}cdn/${NC}       ← point nginx here"
+    echo -e "  └── ${BOLD}cdn/${NC}       ← Caddy serves this"
     echo -e "      ├── pack.toml, index.toml"
     echo -e "      ├── mods/*.pw.toml"
     echo -e "      └── jars/*.jar"
@@ -2588,8 +2590,8 @@ cmd_diff() {
             for islug in "${!installed_map[@]}"; do
                 IFS='|' read -r iname _ _ _ <<< "${installed_map[$islug]}"
                 local rn in_
-                rn=$(echo "$slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
-                in_=$(echo "$iname" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
+                rn=$(normalize_slug "$slug")
+                in_=$(normalize_slug "$iname")
                 if [[ "$in_" == *"$rn"* || "$rn" == *"$in_"* ]]; then
                     echo -e "  ${CYAN}↔${NC} mods.txt: ${BOLD}${slug}${NC} → installed as: ${BOLD}${islug}${NC} (${iname})"
                     found=true
@@ -2612,9 +2614,9 @@ cmd_diff() {
             local is_alias=false
             for rslug in "${!requested_map[@]}"; do
                 local rn sn nn
-                rn=$(echo "$rslug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
-                sn=$(echo "$slug" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
-                nn=$(echo "$name" | tr '[:upper:]' '[:lower:]' | tr -d '_ -')
+                rn=$(normalize_slug "$rslug")
+                sn=$(normalize_slug "$slug")
+                nn=$(normalize_slug "$name")
                 if [[ "$nn" == *"$rn"* || "$sn" == *"$rn"* || "$rn" == *"$sn"* ]]; then
                     is_alias=true
                     break
@@ -3278,7 +3280,7 @@ cmd_deploy() {
     # Resolve target
     local target_name=""
     case "$subcmd" in
-        status|st|regenerate|nginx|help) target_name="${target_flag:-}" ;;
+        status|st|regenerate|nginx|caddy|help) target_name="${target_flag:-}" ;;
         *)
             target_name=$(resolve_target "$target_flag")
             load_target "$target_name"
@@ -3372,9 +3374,9 @@ cmd_deploy() {
             echo ""
             ;;
 
-        cdn)
+        cdn|publish)
             check_packwiz; check_pack_init
-            publish_cdn "$target_name"
+            publish_pack "$target_name"
             ;;
 
         mods|download)
@@ -3401,8 +3403,15 @@ cmd_deploy() {
             download_server_mods "$mods_dest"
             ;;
 
-        nginx|caddy)
+        nginx)
             generate_nginx_config "$target_name"
+            ;;
+
+        caddy)
+            header "Regenerating Caddyfile"
+            generate_caddyfile
+            echo -e "  ${DIM}Apply changes with: pm deploy regenerate${NC}"
+            echo ""
             ;;
 
         full)
@@ -3891,16 +3900,15 @@ cmd_help() {
     deploy logs                    Tail server logs
     deploy backup                  Backup server world
     deploy regenerate              Rebuild docker-compose.yml
-    deploy cdn                     Publish pack + JARs to nginx-ready dirs
+    deploy cdn                     Publish pack + JARs to cdn/ directory
     deploy mods                    Download mod JARs into server/mods/
-    deploy nginx                   Generate nginx reverse proxy config
     deploy full                    Pipeline: sync → publish → create → start
 
-  CDN / REVERSE PROXY:
+  CDN (Caddy — auto-HTTPS):
     targets set <n> cdn_domain=x   Set per-target CDN domain
     deploy cdn --target <n>        Publish pack files + self-hosted JARs
     deploy mods [--target <n>]     Download mod JARs into server/mods/
-    deploy nginx [--target <n>]    Generate nginx site configs (all or one)
+    deploy regenerate              Rebuild docker-compose.yml + Caddyfile
 
   CONFIG:
     config show                    Print active configuration
@@ -3940,8 +3948,8 @@ cmd_help() {
     pm deploy status                       # all servers at a glance
     pm targets dns                         # SRV records for Cloudflare
     pm targets set survival cdn_domain=pack.enviouslabs.com
-    pm deploy cdn --target survival    # publish to /var/www/packwiz/survival/
-    pm deploy nginx                    # generate nginx config for all targets
+    pm deploy cdn --target survival    # publish pack to cdn/survival/
+    pm deploy regenerate               # rebuild docker-compose.yml + Caddyfile
     pm organize                        # sort flat dir → pack/ server/ cdn/
     cd pack && pm sync                 # auto-publishes to cdn/
 
