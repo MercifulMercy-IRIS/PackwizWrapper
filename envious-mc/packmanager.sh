@@ -8,6 +8,7 @@
 #
 # PACK MANAGEMENT:
 #   pm init                    Initialize pack + mods.txt in current dir
+#   pm organize [dir]          Sort messy dir into pack/ server/ cdn/
 #   pm sync                    Install all mods from mods.txt
 #   pm update                  Update all non-pinned mods
 #   pm add [slug...]           Add mods (no args = interactive)
@@ -62,6 +63,8 @@ SYNC_ON_FAIL="prompt"              # What to do when a mod can't be found during
                                    #   "prompt"     — pause and ask the user (a/u/s)
                                    #   "unresolved" — auto-save to unresolved.txt
                                    #   "skip"       — silently skip
+AUTO_PUBLISH=""                    # Target name to auto-publish to CDN after sync/update
+                                   #   "" = disabled, "<target>" = auto-run publish_cdn after sync/update
 
 # Docker / Server defaults
 DOCKER_COMPOSE_DIR="${HOME}/.config/packmanager/servers"  # Where compose files live
@@ -1329,6 +1332,84 @@ resolve_cdn_base_url() {
     echo "${proto}://${domain}/${target_name}"
 }
 
+# Auto-publish hook — called after sync/update if AUTO_PUBLISH is set
+auto_publish_cdn() {
+    [[ -z "$AUTO_PUBLISH" ]] && return 0
+
+    local target="$AUTO_PUBLISH"
+
+    if [[ "$target" == "__auto__" ]]; then
+        # Convention: sibling cdn/ directory from pack/
+        # e.g. if PACK_DIR=/srv/mc/pack, publish to /srv/mc/cdn
+        local parent
+        parent=$(dirname "$PACK_DIR")
+        local cdn_dir="${parent}/cdn"
+
+        if [[ ! -d "$cdn_dir" ]]; then
+            log WARN "Auto-publish: cdn/ dir not found at ${cdn_dir} — skipping"
+            return 0
+        fi
+
+        separator
+        log INFO "Auto-publishing to ${cdn_dir}..."
+
+        # Copy pack descriptor files
+        for f in pack.toml index.toml; do
+            [[ -f "${PACK_DIR}/${f}" ]] && cp "${PACK_DIR}/${f}" "${cdn_dir}/${f}"
+        done
+
+        mkdir -p "${cdn_dir}/mods" "${cdn_dir}/jars"
+
+        # Copy .pw.toml files
+        for toml in "${PACK_DIR}/mods/"*.pw.toml; do
+            [[ -f "$toml" ]] || continue
+            cp "$toml" "${cdn_dir}/mods/"
+        done
+
+        # Remove stale .pw.toml files in cdn that no longer exist in pack
+        for cdn_toml in "${cdn_dir}/mods/"*.pw.toml; do
+            [[ -f "$cdn_toml" ]] || continue
+            local base
+            base=$(basename "$cdn_toml")
+            if [[ ! -f "${PACK_DIR}/mods/${base}" ]]; then
+                rm -f "$cdn_toml"
+                log WARN "Removed stale: cdn/mods/${base}"
+            fi
+        done
+
+        # Copy self-hosted JARs
+        for toml in "${PACK_DIR}/mods/"*.pw.toml; do
+            [[ -f "$toml" ]] || continue
+            if ! grep -q '\[update\.modrinth\]' "$toml" 2>/dev/null && \
+               ! grep -q '\[update\.curseforge\]' "$toml" 2>/dev/null; then
+                local mod_filename
+                mod_filename=$(grep -oP '^filename\s*=\s*"\K[^"]+' "$toml" 2>/dev/null || echo "")
+                if [[ -n "$mod_filename" && -f "${PACK_DIR}/mods/${mod_filename}" ]]; then
+                    cp "${PACK_DIR}/mods/${mod_filename}" "${cdn_dir}/jars/${mod_filename}"
+                fi
+            fi
+        done
+
+        # Remove stale JARs in cdn/jars that no longer have a matching .pw.toml
+        for jar in "${cdn_dir}/jars/"*.jar; do
+            [[ -f "$jar" ]] || continue
+            local jar_name
+            jar_name=$(basename "$jar")
+            # Check if any .pw.toml in the pack still references this filename
+            if ! grep -rlq "\"${jar_name}\"" "${PACK_DIR}/mods/"*.pw.toml 2>/dev/null; then
+                rm -f "$jar"
+                log WARN "Removed stale: cdn/jars/${jar_name}"
+            fi
+        done
+
+        log OK "Auto-published to cdn/"
+        return 0
+    fi
+
+    # Named target — use the full publish_cdn pipeline
+    publish_cdn "$target"
+}
+
 # Publish pack files + jar files to CDN_ROOT in nginx-ready structure
 publish_cdn() {
     local target_name="${1:-}"
@@ -1638,6 +1719,246 @@ print_srv_records() {
 # PACK COMMANDS
 # ============================================================================
 
+# ============================================================================
+# ORGANIZE — restructure a flat/messy directory into pack/ server/ cdn/
+# ============================================================================
+#
+# Target layout:
+#   <root>/
+#     ├── pack/                ← packwiz working directory (pm operates here)
+#     │   ├── pack.toml
+#     │   ├── index.toml
+#     │   ├── mods.txt
+#     │   ├── packmanager.conf
+#     │   ├── unresolved.txt
+#     │   ├── mods/            ← .pw.toml files + downloaded JARs
+#     │   └── config/          ← mod config files
+#     ├── server/              ← minecraft server runtime data
+#     │   ├── world/
+#     │   ├── server.properties
+#     │   ├── logs/
+#     │   ├── ops.json, whitelist.json, banned-*.json
+#     │   └── ...
+#     └── cdn/                 ← nginx-served files (client downloads)
+#         ├── pack.toml
+#         ├── index.toml
+#         ├── mods/            ← .pw.toml metadata
+#         └── jars/            ← self-hosted mod JARs
+#
+# After organizing, PACK_DIR points at <root>/pack/ and CDN_ROOT can
+# point at <root>/cdn/.  The server/ dir is left alone — Docker or
+# the itzg image manage it — but loose server files are relocated there.
+
+cmd_organize() {
+    header "Organize Directory"
+
+    local root="${1:-$PACK_DIR}"
+
+    # Sanity: must have at least a pack.toml somewhere to know this is a PM dir
+    if [[ ! -f "${root}/pack.toml" ]]; then
+        echo -e "  ${RED}No pack.toml in ${root}${NC}"
+        echo -e "  ${DIM}Run this from your existing pack directory, or pass it as an argument.${NC}"
+        return 1
+    fi
+
+    echo -e "  ${BOLD}Current directory:${NC} ${CYAN}${root}${NC}"
+    echo ""
+
+    # --- Scan what's here ---
+    local packwiz_files=()     # Things that belong in pack/
+    local server_files=()      # Things that belong in server/
+    local other_files=()       # Unknown / already organized
+
+    # PackWiz / PackManager files
+    for f in pack.toml index.toml mods.txt packmanager.conf unresolved.txt; do
+        [[ -f "${root}/${f}" ]] && packwiz_files+=("$f")
+    done
+    [[ -d "${root}/mods" ]]   && packwiz_files+=("mods/")
+    [[ -d "${root}/config" ]] && packwiz_files+=("config/")
+    [[ -d "${root}/.logs" ]]  && packwiz_files+=(".logs/")
+
+    # Minecraft server files
+    for f in server.properties server-icon.png eula.txt banned-ips.json banned-players.json \
+             ops.json whitelist.json usercache.json; do
+        [[ -f "${root}/${f}" ]] && server_files+=("$f")
+    done
+    for d in world world_nether world_the_end logs crash-reports; do
+        [[ -d "${root}/${d}" ]] && server_files+=("${d}/")
+    done
+    # Catch server JAR files
+    for f in "${root}"/forge-*.jar "${root}"/minecraft_server*.jar "${root}"/server.jar \
+             "${root}"/libraries; do
+        [[ -e "$f" ]] && server_files+=("$(basename "$f")")
+    done
+
+    # Already organized?
+    if [[ -d "${root}/pack" && -f "${root}/pack/pack.toml" ]]; then
+        echo -e "  ${YELLOW}This directory already has a pack/ subdirectory with pack.toml.${NC}"
+        echo -e "  ${DIM}Looks like it may already be organized. Re-organize? (y/N)${NC}"
+        echo -ne "  ${CYAN}>${NC} "
+        read -r reorg < /dev/tty
+        [[ "$reorg" != [yY] ]] && { echo -e "  ${DIM}Cancelled.${NC}"; return; }
+    fi
+
+    # --- Preview ---
+    echo -e "  ${BOLD}Will create:${NC}"
+    echo -e "    ${CYAN}pack/${NC}    ← packwiz files (pack.toml, mods/, mods.txt, config)"
+    echo -e "    ${CYAN}server/${NC}  ← minecraft server runtime (world, properties, logs)"
+    echo -e "    ${CYAN}cdn/${NC}     ← nginx-served client downloads (toml + jars)"
+    echo ""
+
+    if (( ${#packwiz_files[@]} > 0 )); then
+        echo -e "  ${GREEN}→ pack/${NC} (${#packwiz_files[@]} items):"
+        for f in "${packwiz_files[@]}"; do
+            echo -e "    ${DIM}${f}${NC}"
+        done
+    fi
+    if (( ${#server_files[@]} > 0 )); then
+        echo -e "  ${GREEN}→ server/${NC} (${#server_files[@]} items):"
+        for f in "${server_files[@]}"; do
+            echo -e "    ${DIM}${f}${NC}"
+        done
+    fi
+
+    echo ""
+    echo -e "  ${YELLOW}${BOLD}This will move files. Continue? (y/N)${NC}"
+    echo -ne "  ${CYAN}>${NC} "
+    read -r confirm < /dev/tty
+    [[ "$confirm" != [yY] ]] && { echo -e "  ${DIM}Cancelled.${NC}"; return; }
+
+    echo ""
+
+    # --- Create directories ---
+    mkdir -p "${root}/pack/mods" "${root}/server" "${root}/cdn/mods" "${root}/cdn/jars"
+    log OK "Created pack/ server/ cdn/"
+
+    # --- Move packwiz files into pack/ ---
+    for f in pack.toml index.toml mods.txt packmanager.conf unresolved.txt; do
+        if [[ -f "${root}/${f}" ]]; then
+            mv "${root}/${f}" "${root}/pack/${f}"
+            log OK "  ${f} → pack/"
+        fi
+    done
+    # Move mods/ directory
+    if [[ -d "${root}/mods" ]]; then
+        # Move contents, not the dir itself (pack/mods/ already created)
+        mv "${root}"/mods/* "${root}/pack/mods/" 2>/dev/null || true
+        rmdir "${root}/mods" 2>/dev/null || true
+        log OK "  mods/ → pack/mods/"
+    fi
+    if [[ -d "${root}/config" ]]; then
+        mv "${root}/config" "${root}/pack/config"
+        log OK "  config/ → pack/config/"
+    fi
+    if [[ -d "${root}/.logs" ]]; then
+        mv "${root}/.logs" "${root}/pack/.logs"
+        log OK "  .logs/ → pack/.logs/"
+    fi
+
+    # --- Move server files into server/ ---
+    for f in server.properties server-icon.png eula.txt banned-ips.json banned-players.json \
+             ops.json whitelist.json usercache.json; do
+        if [[ -f "${root}/${f}" ]]; then
+            mv "${root}/${f}" "${root}/server/${f}"
+            log OK "  ${f} → server/"
+        fi
+    done
+    for d in world world_nether world_the_end logs crash-reports; do
+        if [[ -d "${root}/${d}" ]]; then
+            mv "${root}/${d}" "${root}/server/${d}"
+            log OK "  ${d}/ → server/"
+        fi
+    done
+    # Server JARs and libraries
+    for f in "${root}"/forge-*.jar "${root}"/minecraft_server*.jar "${root}"/server.jar; do
+        [[ -f "$f" ]] && { mv "$f" "${root}/server/"; log OK "  $(basename "$f") → server/"; }
+    done
+    if [[ -d "${root}/libraries" ]]; then
+        mv "${root}/libraries" "${root}/server/libraries"
+        log OK "  libraries/ → server/"
+    fi
+
+    # --- Initial CDN publish from pack/ ---
+    log INFO "Populating cdn/ from pack/..."
+
+    # Copy pack descriptor files
+    for f in pack.toml index.toml; do
+        [[ -f "${root}/pack/${f}" ]] && cp "${root}/pack/${f}" "${root}/cdn/${f}"
+    done
+
+    # Copy .pw.toml files into cdn/mods/ — rewrite self-hosted URLs if CDN is configured
+    if [[ -d "${root}/pack/mods" ]]; then
+        for toml in "${root}/pack/mods/"*.pw.toml; do
+            [[ -f "$toml" ]] || continue
+            cp "$toml" "${root}/cdn/mods/"
+        done
+
+        # Copy self-hosted JARs into cdn/jars/
+        for toml in "${root}/pack/mods/"*.pw.toml; do
+            [[ -f "$toml" ]] || continue
+            # Self-hosted = no [update.modrinth] and no [update.curseforge]
+            if ! grep -q '\[update\.modrinth\]' "$toml" 2>/dev/null && \
+               ! grep -q '\[update\.curseforge\]' "$toml" 2>/dev/null; then
+                local mod_filename
+                mod_filename=$(grep -oP '^filename\s*=\s*"\K[^"]+' "$toml" 2>/dev/null || echo "")
+                if [[ -n "$mod_filename" && -f "${root}/pack/mods/${mod_filename}" ]]; then
+                    cp "${root}/pack/mods/${mod_filename}" "${root}/cdn/jars/${mod_filename}"
+                    log DEP "  ${mod_filename} → cdn/jars/"
+                fi
+            fi
+        done
+    fi
+
+    log OK "cdn/ populated"
+
+    # --- Update local packmanager.conf to point at new paths ---
+    local conf="${root}/pack/packmanager.conf"
+    if [[ -f "$conf" ]]; then
+        # Add or update AUTO_PUBLISH setting
+        if grep -q '^AUTO_PUBLISH=' "$conf" 2>/dev/null; then
+            sed -i 's|^AUTO_PUBLISH=.*|AUTO_PUBLISH="__auto__"|' "$conf"
+        elif grep -q '^# SYNC_ON_FAIL' "$conf" || grep -q '^SYNC_ON_FAIL' "$conf"; then
+            # Insert after SYNC_ON_FAIL line
+            sed -i '/SYNC_ON_FAIL/a AUTO_PUBLISH="__auto__"' "$conf"
+        else
+            echo '' >> "$conf"
+            echo '# Auto-publish to cdn/ after sync/update' >> "$conf"
+            echo 'AUTO_PUBLISH="__auto__"' >> "$conf"
+        fi
+        log OK "Set AUTO_PUBLISH in pack/packmanager.conf"
+    fi
+
+    # --- Summary ---
+    separator
+    echo ""
+    echo -e "  ${GREEN}${BOLD}Organized!${NC} New layout:"
+    echo ""
+    echo -e "  ${CYAN}${root}/${NC}"
+    echo -e "  ├── ${BOLD}pack/${NC}      ← run pm commands from here"
+    echo -e "  │   ├── pack.toml, index.toml"
+    echo -e "  │   ├── mods.txt, packmanager.conf"
+    echo -e "  │   └── mods/  config/"
+    echo -e "  ├── ${BOLD}server/${NC}    ← minecraft server runtime"
+    if (( ${#server_files[@]} > 0 )); then
+    echo -e "  │   ├── world/  server.properties  logs/"
+    echo -e "  │   └── (${#server_files[@]} items moved)"
+    else
+    echo -e "  │   └── ${DIM}(empty — Docker/itzg manages this)${NC}"
+    fi
+    echo -e "  └── ${BOLD}cdn/${NC}       ← point nginx here"
+    echo -e "      ├── pack.toml, index.toml"
+    echo -e "      ├── mods/*.pw.toml"
+    echo -e "      └── jars/*.jar"
+    echo ""
+    echo -e "  ${BOLD}Next steps:${NC}"
+    echo -e "    ${CYAN}cd ${root}/pack${NC}"
+    echo -e "    ${CYAN}pm sync${NC}                          # pack changes auto-publish to cdn/"
+    echo ""
+    echo -e "  ${DIM}Point CDN_ROOT at ${root}/cdn/ or let AUTO_PUBLISH handle it.${NC}"
+    echo -e "  ${DIM}Set nginx root:  root ${root}/cdn;${NC}"
+    echo ""
+}
+
 cmd_init() {
     header "Initializing Pack"
     if [[ -f "${PACK_DIR}/pack.toml" ]]; then
@@ -1739,6 +2060,9 @@ cmd_sync() {
     separator
     log INFO "Refreshing pack index..."
     $PACKWIZ_BIN refresh 2>>"$RUN_LOG" && log OK "Index updated" || log WARN "Index warnings"
+
+    # Auto-publish to CDN if configured
+    auto_publish_cdn
 
     header "Sync Summary"
     echo -e "  Processed:   ${BOLD}${total}${NC}"
@@ -1962,6 +2286,9 @@ cmd_update() {
     log INFO "Running packwiz update --all..."
     $PACKWIZ_BIN update --all --yes 2>>"$RUN_LOG" && log OK "Done" || log WARN "Some updates failed"
     $PACKWIZ_BIN refresh 2>>"$RUN_LOG"
+
+    # Auto-publish to CDN if configured
+    auto_publish_cdn
 }
 
 cmd_status() {
@@ -3284,6 +3611,7 @@ cmd_help() {
 
   PACK MANAGEMENT:
     init                           Initialize pack.toml + mods.txt
+    organize [dir]                 Sort flat dir into pack/ server/ cdn/
     sync                           Install all mods from mods.txt
     update                         Update all non-pinned mods
     add [slug...]                  Add mods (no args = interactive)
@@ -3381,6 +3709,8 @@ cmd_help() {
     pm targets set survival cdn_domain=pack.enviouslabs.com
     pm deploy cdn --target survival    # publish to /var/www/packwiz/survival/
     pm deploy nginx                    # generate nginx config for all targets
+    pm organize                        # sort flat dir → pack/ server/ cdn/
+    cd pack && pm sync                 # auto-publishes to cdn/
 
 HELP
 }
@@ -3395,6 +3725,7 @@ main() {
     case "$cmd" in
         # Pack management
         init)              cmd_init ;;
+        organize|org)      cmd_organize "${1:-}" ;;
         sync)              cmd_sync ;;
         update|up)         cmd_update ;;
         add|a)             cmd_add "$@" ;;
