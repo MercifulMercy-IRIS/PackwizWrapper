@@ -58,6 +58,10 @@ RETRY_ATTEMPTS=2
 RETRY_DELAY=3
 AUTO_DEPS=true
 PREFER_SOURCE="mr"
+SYNC_ON_FAIL="prompt"              # What to do when a mod can't be found during sync:
+                                   #   "prompt"     — pause and ask the user (a/u/s)
+                                   #   "unresolved" — auto-save to unresolved.txt
+                                   #   "skip"       — silently skip
 
 # Docker / Server defaults
 DOCKER_COMPOSE_DIR="${HOME}/.config/packmanager/servers"  # Where compose files live
@@ -372,7 +376,7 @@ verify_mod_install() {
         echo -e "  ${DIM}(s)${NC} Skip   — keep for now, ask again next time"
         echo ""
         echo -ne "  ${CYAN}choice [a/r/d/s]>${NC} "
-        read -r alias_choice
+        read -r alias_choice < /dev/tty
 
         case "$alias_choice" in
             a|A)
@@ -727,25 +731,41 @@ install_mod() {
             ;;
     esac
 
-    # --- Mod not found on any source: prompt user ---
+    # --- Mod not found on any source ---
     if ! $installed; then
         echo ""
         echo -e "  ${RED}${BOLD}NOT FOUND${NC}: ${BOLD}${slug}${NC}"
         echo -e "  ${DIM}Not available on Modrinth or CurseForge (source: ${source})${NC}"
-        echo ""
-        echo -e "  ${CYAN}(u)${NC} Save to unresolved.txt — bind a URL/JAR later"
-        echo -e "  ${DIM}(s)${NC} Skip — ignore for now"
-        echo ""
-        echo -ne "  ${CYAN}choice [u/s]>${NC} "
-        read -r nf_choice
 
-        case "$nf_choice" in
-            u|U)
+        local fail_action="${SYNC_ON_FAIL:-prompt}"
+
+        case "$fail_action" in
+            unresolved)
+                # Auto-save to unresolved.txt without prompting
                 add_to_unresolved "$slug" "not found on ${source}"
-                log WARN "${slug} → saved to unresolved.txt"
+                log WARN "${slug} → auto-saved to unresolved.txt"
                 ;;
-            *)
+            skip)
                 log SKIP "${slug} — skipped (not found)"
+                ;;
+            prompt|*)
+                # Pause and ask — read from /dev/tty so it works inside while-read loops
+                echo ""
+                echo -e "  ${CYAN}(u)${NC} Save to unresolved.txt — bind a URL/JAR later"
+                echo -e "  ${DIM}(s)${NC} Skip — ignore for now"
+                echo ""
+                echo -ne "  ${CYAN}choice [u/s]>${NC} "
+                read -r nf_choice < /dev/tty
+
+                case "$nf_choice" in
+                    u|U)
+                        add_to_unresolved "$slug" "not found on ${source}"
+                        log WARN "${slug} → saved to unresolved.txt"
+                        ;;
+                    *)
+                        log SKIP "${slug} — skipped (not found)"
+                        ;;
+                esac
                 ;;
         esac
         return 1
