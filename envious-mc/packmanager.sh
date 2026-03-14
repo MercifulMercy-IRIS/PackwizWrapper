@@ -157,6 +157,7 @@ discover_pack_dir() {
 
 # Only auto-discover if the current PACK_DIR doesn't have pack.toml
 # and the user hasn't explicitly set PACK_DIR in config
+_ORIGINAL_DIR="$PACK_DIR"
 if [[ ! -f "${PACK_DIR}/pack.toml" ]]; then
     _discovered=$(discover_pack_dir "$PACK_DIR")
     if [[ -f "${_discovered}/pack.toml" ]]; then
@@ -180,6 +181,19 @@ if [[ -f "${PACK_DIR}/packmanager.conf" && "${PACK_DIR}/packmanager.conf" != "$L
     UNRESOLVED_FILE="${PACK_DIR}/unresolved.txt"
     LOG_DIR="${PACK_DIR}/.logs"
 fi
+
+# Handle stray files: if mods.txt / unresolved.txt exist at the original dir
+# (project root) but not in the discovered pack dir, use the root copies.
+# This covers partially-organized layouts where some files didn't move.
+if [[ "$_ORIGINAL_DIR" != "$PACK_DIR" ]]; then
+    if [[ ! -f "$MODS_FILE" && -f "${_ORIGINAL_DIR}/mods.txt" ]]; then
+        MODS_FILE="${_ORIGINAL_DIR}/mods.txt"
+    fi
+    if [[ ! -f "$UNRESOLVED_FILE" && -f "${_ORIGINAL_DIR}/unresolved.txt" ]]; then
+        UNRESOLVED_FILE="${_ORIGINAL_DIR}/unresolved.txt"
+    fi
+fi
+unset _ORIGINAL_DIR
 
 # Setup
 mkdir -p "$LOG_DIR" 2>/dev/null || true
@@ -3811,11 +3825,22 @@ cmd_self_update() {
     separator
     log INFO "Applying updates..."
 
-    # 1. Update the pm binary (packmanager.sh → ~/.local/bin/pm)
+    # 1. Update the pm binary (packmanager.sh)
+    #    If pm is a symlink, update the file it points at (the source repo copy)
+    #    Otherwise, overwrite the binary directly
     if [[ -f "${tmp_dir}/packmanager.sh" ]]; then
-        cp "${tmp_dir}/packmanager.sh" "${install_dir}/pm"
-        chmod +x "${install_dir}/pm"
-        log OK "Updated pm → ${install_dir}/pm"
+        local pm_target="${install_dir}/pm"
+        if [[ -L "$pm_target" ]]; then
+            local link_dest
+            link_dest=$(readlink -f "$pm_target")
+            cp "${tmp_dir}/packmanager.sh" "$link_dest"
+            chmod +x "$link_dest"
+            log OK "Updated source → ${link_dest} (symlinked from pm)"
+        else
+            cp "${tmp_dir}/packmanager.sh" "$pm_target"
+            chmod +x "$pm_target"
+            log OK "Updated pm → ${pm_target}"
+        fi
     fi
 
     # 2. Update install.sh (store in config dir for future use)

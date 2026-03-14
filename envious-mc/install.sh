@@ -200,7 +200,7 @@ install_packmanager() {
 
     mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
 
-    # Copy the main script
+    # Symlink the main script (so edits to packmanager.sh take effect immediately)
     local src="${SCRIPT_DIR}/packmanager.sh"
     local dest="${INSTALL_DIR}/pm"
 
@@ -208,9 +208,16 @@ install_packmanager() {
         fail "packmanager.sh not found in ${SCRIPT_DIR}"
     fi
 
-    cp "$src" "$dest"
-    chmod +x "$dest"
-    log "Installed → ${dest}"
+    chmod +x "$src"
+
+    # Use symlink if source is on the same filesystem, otherwise copy
+    if ln -sf "$src" "$dest" 2>/dev/null; then
+        log "Linked → ${dest} → ${src}"
+    else
+        cp "$src" "$dest"
+        chmod +x "$dest"
+        log "Copied → ${dest} (symlink failed — re-run install after edits)"
+    fi
 
     # Copy default config if none exists
     if [[ ! -f "${CONFIG_DIR}/packmanager.conf" ]]; then
