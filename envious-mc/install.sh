@@ -290,11 +290,8 @@ SERVER_BACKUPS="3"              # Backup limit
 PACK_HOST_URL=""                # e.g. https://pack.enviouslabs.com
 PACK_HOST_DIR=""                # Local dir served by Cloudflare tunnel
 
-# --- CDN / Reverse Proxy ---------------------------------------------------
-CDN_DOMAIN=""                   # e.g. "pack.enviouslabs.com" (per-target override via targets set)
-CDN_PROTO="https"               # Protocol for CDN URLs (http or https)
-CDN_ROOT="/var/www/packwiz"     # Local filesystem root nginx serves from
-NGINX_CONF_DIR=""               # Where to write nginx configs (default: CDN_ROOT/nginx)
+# --- CDN (Caddy — auto-HTTPS via Let's Encrypt) ----------------------------
+CDN_DOMAIN=""                   # Set for automatic HTTPS; leave empty for http://server-ip:8080
 
 # --- Self-Update (GitHub) --------------------------------------------------
 PM_GITHUB_REPO=""               # e.g. "yourusername/PackwizWrapper" (owner/repo)
@@ -351,7 +348,7 @@ _pm_completions() {
             return 0
             ;;
         deploy|d)
-            COMPREPLY=($(compgen -W "create push publish start stop restart kill status console backup regenerate cdn mods download nginx full help --target" -- "$cur"))
+            COMPREPLY=($(compgen -W "create push publish start stop restart kill status console backup regenerate mods download full help --target" -- "$cur"))
             return 0
             ;;
         targets|t)
@@ -480,9 +477,9 @@ verify() {
     echo -e "    ${CYAN}pm sync${NC}              Install all mods from mods.txt"
     echo -e "    ${CYAN}pm add <slug>${NC}        Add a mod"
     echo -e "    ${CYAN}pm organize${NC}          Sort messy dir into pack/ server/ cdn/"
-    echo -e "    ${CYAN}pm deploy create${NC}     Generate Docker compose for a target"
-    echo -e "    ${CYAN}pm deploy cdn${NC}        Publish pack + JARs for nginx"
-    echo -e "    ${CYAN}pm config edit${NC}       Edit your config (VM IP, domain, etc.)"
+    echo -e "    ${CYAN}pm deploy create${NC}     Publish pack + generate Docker compose (auto-HTTPS)"
+    echo -e "    ${CYAN}pm deploy full${NC}       Pipeline: sync → publish → compose → start"
+    echo -e "    ${CYAN}pm config edit${NC}       Edit your config (set CDN_DOMAIN for HTTPS)"
     echo ""
     echo -e "  ${BOLD}Config:${NC} ${CYAN}${CONFIG_DIR}/packmanager.conf${NC}"
     echo -e "  ${BOLD}Docs:${NC}   ${CYAN}pm help${NC}"
