@@ -344,7 +344,7 @@ _pm_completions() {
             return 0
             ;;
         deploy|d)
-            COMPREPLY=($(compgen -W "create push publish start stop restart kill status console backup regenerate cdn nginx full help --target" -- "$cur"))
+            COMPREPLY=($(compgen -W "create push publish start stop restart kill status console backup regenerate cdn mods download nginx full help --target" -- "$cur"))
             return 0
             ;;
         targets|t)

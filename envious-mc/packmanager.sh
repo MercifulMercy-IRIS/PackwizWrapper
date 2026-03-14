@@ -32,6 +32,9 @@
 #   pm deploy status            Show all servers
 #   pm deploy console <cmd>     Send RCON command
 #   pm deploy logs              Tail server logs
+#   pm deploy cdn               Publish pack + JARs for nginx
+#   pm deploy mods              Download mod JARs into server/mods/
+#   pm deploy nginx             Generate nginx reverse proxy config
 #
 # CONFIG:
 #   pm config show             Print active config
@@ -1332,6 +1335,204 @@ resolve_cdn_base_url() {
     echo "${proto}://${domain}/${target_name}"
 }
 
+# ============================================================================
+# DOWNLOAD SERVER MODS
+# ============================================================================
+# Reads every .pw.toml in the pack, extracts the download URL, and fetches
+# the actual JAR file into a target mods directory (typically server/mods/).
+#
+# For Modrinth/CurseForge mods the URL points at their CDN.
+# For url:/local: mods it points at whatever was configured.
+# Either way, the JAR lands in server/mods/ ready for the server to load.
+#
+# Handles:
+#   - Skipping JARs that already exist and haven't changed (by hash)
+#   - Removing stale JARs that no longer have a matching .pw.toml
+#   - Filtering by side (skip client-only mods for the server)
+
+download_server_mods() {
+    local dest_dir="${1:-}"
+
+    # Auto-detect: sibling server/mods/ relative to pack/
+    if [[ -z "$dest_dir" ]]; then
+        local parent
+        parent=$(dirname "$PACK_DIR")
+        if [[ -d "${parent}/server" ]]; then
+            dest_dir="${parent}/server/mods"
+        else
+            echo -e "  ${RED}No destination specified and no sibling server/ directory found.${NC}"
+            echo -e "  ${DIM}Usage: pm deploy mods [--dir /path/to/server/mods]${NC}"
+            echo -e "  ${DIM}Or run 'pm organize' first to create the directory layout.${NC}"
+            return 1
+        fi
+    fi
+
+    header "Downloading Server Mods"
+    check_pack_init
+
+    mkdir -p "$dest_dir"
+
+    if ! command -v curl &>/dev/null; then
+        echo -e "  ${RED}curl is required to download mods.${NC}"
+        return 1
+    fi
+
+    local total=0 downloaded=0 skipped=0 failed=0 removed=0 client_only=0
+    local failed_mods=()
+
+    log INFO "Source:  ${PACK_DIR}/mods/*.pw.toml"
+    log INFO "Dest:    ${dest_dir}/"
+    echo ""
+
+    # --- Download each mod JAR ---
+    for toml in "${PACK_DIR}/mods/"*.pw.toml; do
+        [[ -f "$toml" ]] || continue
+        (( total++ ))
+
+        local slug
+        slug=$(basename "$toml" .pw.toml)
+
+        # Extract fields from .pw.toml
+        local mod_name mod_filename mod_url mod_hash mod_hash_format mod_side
+        mod_name=$(grep -oP '^name\s*=\s*"\K[^"]+' "$toml" 2>/dev/null || echo "$slug")
+        mod_filename=$(grep -oP '^filename\s*=\s*"\K[^"]+' "$toml" 2>/dev/null || echo "")
+        mod_side=$(grep -oP '^side\s*=\s*"\K[^"]+' "$toml" 2>/dev/null || echo "both")
+
+        # Skip client-only mods — the server doesn't need them
+        if [[ "$mod_side" == "client" ]]; then
+            log SKIP "${mod_name} ${DIM}(client-only)${NC}"
+            (( client_only++ ))
+            continue
+        fi
+
+        # Extract download URL and hash from [download] section
+        mod_url=$(grep -A5 '^\[download\]' "$toml" | grep -oP '^url\s*=\s*"\K[^"]+' 2>/dev/null || echo "")
+        mod_hash=$(grep -A5 '^\[download\]' "$toml" | grep -oP '^hash\s*=\s*"\K[^"]+' 2>/dev/null || echo "")
+        mod_hash_format=$(grep -A5 '^\[download\]' "$toml" | grep -oP '^hash-format\s*=\s*"\K[^"]+' 2>/dev/null || echo "sha256")
+
+        if [[ -z "$mod_url" ]]; then
+            log WARN "${mod_name} — no download URL in .pw.toml"
+            (( failed++ ))
+            failed_mods+=("$slug (no URL)")
+            continue
+        fi
+
+        if [[ -z "$mod_filename" ]]; then
+            # Derive from URL
+            mod_filename=$(basename "$mod_url" | sed 's/?.*//')
+        fi
+
+        local dest_file="${dest_dir}/${mod_filename}"
+
+        # --- Check if JAR already exists and matches hash ---
+        if [[ -f "$dest_file" && -n "$mod_hash" ]]; then
+            local existing_hash=""
+            case "$mod_hash_format" in
+                sha256) existing_hash=$(sha256sum "$dest_file" 2>/dev/null | cut -d' ' -f1) ;;
+                sha512) existing_hash=$(sha512sum "$dest_file" 2>/dev/null | cut -d' ' -f1) ;;
+                sha1)   existing_hash=$(sha1sum "$dest_file" 2>/dev/null | cut -d' ' -f1) ;;
+                md5)    existing_hash=$(md5sum "$dest_file" 2>/dev/null | cut -d' ' -f1) ;;
+                murmur2) existing_hash="" ;;  # Can't verify murmur2 easily, re-download
+            esac
+
+            if [[ -n "$existing_hash" && "$existing_hash" == "$mod_hash" ]]; then
+                log SKIP "${mod_name} ${DIM}(up to date)${NC}"
+                (( skipped++ ))
+                continue
+            fi
+        fi
+
+        # --- Download the JAR ---
+        log INFO "Downloading ${mod_name}..."
+        echo "  DOWNLOAD: ${mod_url} → ${dest_file}" >> "$RUN_LOG"
+
+        local http_code
+        http_code=$(curl -sL -o "$dest_file" -w "%{http_code}" \
+            --connect-timeout 15 --max-time 120 \
+            -H "User-Agent: PackManager/4 (github.com/PackwizWrapper)" \
+            "$mod_url" 2>>"$RUN_LOG" || echo "000")
+
+        if [[ "$http_code" == "200" && -s "$dest_file" ]]; then
+            # Verify hash if available
+            local verified=true
+            if [[ -n "$mod_hash" ]]; then
+                local dl_hash=""
+                case "$mod_hash_format" in
+                    sha256) dl_hash=$(sha256sum "$dest_file" 2>/dev/null | cut -d' ' -f1) ;;
+                    sha512) dl_hash=$(sha512sum "$dest_file" 2>/dev/null | cut -d' ' -f1) ;;
+                    sha1)   dl_hash=$(sha1sum "$dest_file" 2>/dev/null | cut -d' ' -f1) ;;
+                    md5)    dl_hash=$(md5sum "$dest_file" 2>/dev/null | cut -d' ' -f1) ;;
+                esac
+
+                if [[ -n "$dl_hash" && "$dl_hash" != "$mod_hash" ]]; then
+                    log WARN "${mod_name} — hash mismatch (expected ${mod_hash:0:12}…, got ${dl_hash:0:12}…)"
+                    verified=false
+                fi
+            fi
+
+            if $verified; then
+                log OK "${mod_name} → ${mod_filename}"
+                (( downloaded++ ))
+            else
+                log WARN "${mod_name} — downloaded but hash mismatch, keeping anyway"
+                (( downloaded++ ))
+            fi
+        else
+            log FAIL "${mod_name} — HTTP ${http_code}"
+            rm -f "$dest_file"  # Remove partial download
+            (( failed++ ))
+            failed_mods+=("$slug (HTTP ${http_code})")
+        fi
+    done
+
+    # --- Remove stale JARs no longer in the pack ---
+    log INFO "Checking for stale JARs..."
+
+    # Build a set of expected filenames from all .pw.toml files
+    declare -A expected_filenames
+    for toml in "${PACK_DIR}/mods/"*.pw.toml; do
+        [[ -f "$toml" ]] || continue
+        local fn
+        fn=$(grep -oP '^filename\s*=\s*"\K[^"]+' "$toml" 2>/dev/null || echo "")
+        [[ -n "$fn" ]] && expected_filenames["$fn"]=1
+    done
+
+    for jar in "${dest_dir}/"*.jar; do
+        [[ -f "$jar" ]] || continue
+        local jar_name
+        jar_name=$(basename "$jar")
+        if [[ -z "${expected_filenames[$jar_name]+_}" ]]; then
+            rm -f "$jar"
+            log WARN "Removed stale: ${jar_name}"
+            (( removed++ ))
+        fi
+    done
+
+    # --- Summary ---
+    separator
+    echo ""
+    echo -e "  ${BOLD}Download Summary${NC}"
+    echo -e "  Total .pw.toml:  ${BOLD}${total}${NC}"
+    echo -e "  Downloaded:      ${GREEN}${downloaded}${NC}"
+    echo -e "  Up to date:      ${CYAN}${skipped}${NC}"
+    echo -e "  Client-only:     ${DIM}${client_only}${NC} (skipped)"
+    echo -e "  Failed:          ${RED}${failed}${NC}"
+    (( removed > 0 )) && echo -e "  Stale removed:   ${YELLOW}${removed}${NC}"
+    echo ""
+
+    if (( failed > 0 )); then
+        echo -e "  ${RED}${BOLD}Failed downloads:${NC}"
+        printf '    • %s\n' "${failed_mods[@]}"
+        echo ""
+        echo -e "  ${DIM}Check URLs with: pm list --version${NC}"
+        echo -e "  ${DIM}Full log: ${RUN_LOG}${NC}"
+        echo ""
+    fi
+
+    echo -e "  ${GREEN}Server mods:${NC} ${CYAN}${dest_dir}/${NC}"
+    echo ""
+}
+
 # Auto-publish hook — called after sync/update if AUTO_PUBLISH is set
 auto_publish_cdn() {
     [[ -z "$AUTO_PUBLISH" ]] && return 0
@@ -1403,6 +1604,13 @@ auto_publish_cdn() {
         done
 
         log OK "Auto-published to cdn/"
+
+        # Also download server mods into sibling server/mods/
+        local server_mods="${parent}/server/mods"
+        if [[ -d "${parent}/server" ]]; then
+            download_server_mods "$server_mods"
+        fi
+
         return 0
     fi
 
@@ -3187,6 +3395,30 @@ cmd_deploy() {
             publish_cdn "$target_name"
             ;;
 
+        mods|download)
+            check_pack_init
+            # Parse optional --dir flag
+            local mods_dest=""
+            local margs=()
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --dir|-d) mods_dest="$2"; shift 2 ;;
+                    *)        margs+=("$1"); shift ;;
+                esac
+            done
+            # If no --dir, try target's server dir, then sibling convention
+            if [[ -z "$mods_dest" && -n "$target_name" ]]; then
+                local srv_pack_dir
+                srv_pack_dir=$(target_get "$target_name" "pack_dir")
+                if [[ -n "$srv_pack_dir" ]]; then
+                    local srv_parent
+                    srv_parent=$(dirname "$srv_pack_dir")
+                    [[ -d "${srv_parent}/server" ]] && mods_dest="${srv_parent}/server/mods"
+                fi
+            fi
+            download_server_mods "$mods_dest"
+            ;;
+
         nginx)
             generate_nginx_config "$target_name"
             ;;
@@ -3235,12 +3467,15 @@ cmd_deploy() {
             echo -e "  ${CYAN}pm deploy backup${NC}           Backup server world"
             echo -e "  ${CYAN}pm deploy regenerate${NC}       Rebuild docker-compose.yml"
             echo -e "  ${CYAN}pm deploy cdn${NC}              Publish pack + JARs to nginx-ready dirs"
+            echo -e "  ${CYAN}pm deploy mods${NC}             Download mod JARs into server/mods/"
             echo -e "  ${CYAN}pm deploy nginx${NC}            Generate nginx reverse proxy config"
             echo -e "  ${CYAN}pm deploy full${NC}             Pipeline: sync → publish → create → start"
             echo ""
             echo -e "  ${BOLD}CDN / Reverse Proxy:${NC}"
             echo "    pm targets set survival cdn_domain=pack.enviouslabs.com"
             echo "    pm deploy cdn --target survival      # publish files to CDN_ROOT"
+            echo "    pm deploy mods --target survival     # download JARs to server/mods/"
+            echo "    pm deploy mods --dir /srv/mc/mods    # download to a custom path"
             echo "    pm deploy nginx --target survival     # generate nginx config"
             echo "    pm deploy nginx                       # generate for ALL targets"
             echo ""
@@ -3661,12 +3896,14 @@ cmd_help() {
     deploy backup                  Backup server world
     deploy regenerate              Rebuild docker-compose.yml
     deploy cdn                     Publish pack + JARs to nginx-ready dirs
+    deploy mods                    Download mod JARs into server/mods/
     deploy nginx                   Generate nginx reverse proxy config
     deploy full                    Pipeline: sync → publish → create → start
 
   CDN / REVERSE PROXY:
     targets set <n> cdn_domain=x   Set per-target CDN domain
     deploy cdn --target <n>        Publish pack files + self-hosted JARs
+    deploy mods [--target <n>]     Download mod JARs into server/mods/
     deploy nginx [--target <n>]    Generate nginx site configs (all or one)
 
   CONFIG:
