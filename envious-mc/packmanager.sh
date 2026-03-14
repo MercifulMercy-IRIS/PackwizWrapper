@@ -1396,6 +1396,80 @@ docker_logs() {
     docker logs --tail "$lines" -f "el-mc-${target_name}" 2>&1
 }
 
+docker_kill_target() {
+    local target_name="$1"
+    check_docker
+    header "Force Stopping: ${target_name}"
+    dc kill "mc-${target_name}" 2>/dev/null || true
+    dc rm -f "mc-${target_name}" 2>/dev/null || true
+    log OK "${target_name} killed and removed"
+}
+
+docker_remove_target() {
+    local target_name="$1"
+    check_docker
+
+    header "Removing Deployment: ${target_name}"
+
+    local container="el-mc-${target_name}"
+
+    # Stop the container if running
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${container}$"; then
+        log INFO "Stopping ${target_name}..."
+        dc stop "mc-${target_name}" 2>>"$RUN_LOG" || true
+    fi
+
+    # Remove the container
+    dc rm -f "mc-${target_name}" 2>>"$RUN_LOG" || true
+    log OK "Container removed"
+
+    # Clean up CDN published files for this target
+    local parent; parent=$(dirname "$PACK_DIR")
+    if [[ -d "${parent}/cdn/${target_name}" ]]; then
+        echo -e "  ${YELLOW}Remove published pack files in cdn/${target_name}/? (y/N)${NC}"
+        read -r confirm < /dev/tty
+        if [[ "$confirm" == [yY] ]]; then
+            rm -rf "${parent}/cdn/${target_name}"
+            log OK "Removed cdn/${target_name}/"
+        fi
+    fi
+
+    # Offer to remove docker volume
+    local volume="mc-${target_name}-data"
+    if docker volume inspect "$volume" &>/dev/null 2>&1; then
+        echo ""
+        echo -e "  ${YELLOW}${BOLD}Remove Docker volume '${volume}'?${NC}"
+        echo -e "  ${RED}This permanently deletes the server world, configs, and all data.${NC}"
+        echo -e "  ${DIM}(Consider running 'pm deploy backup' first)${NC}"
+        echo ""
+        echo -ne "  ${CYAN}Delete volume? (y/N)>${NC} "
+        read -r vol_confirm < /dev/tty
+        if [[ "$vol_confirm" == [yY] ]]; then
+            docker volume rm "$volume" 2>>"$RUN_LOG" && log OK "Volume '${volume}' removed" || log WARN "Could not remove volume (may still be in use)"
+        else
+            echo -e "  ${DIM}Volume kept. Remove later with: docker volume rm ${volume}${NC}"
+        fi
+    fi
+
+    # Remove target from registry
+    echo ""
+    echo -e "  ${YELLOW}Remove target '${target_name}' from registry? (y/N)${NC}"
+    read -r reg_confirm < /dev/tty
+    if [[ "$reg_confirm" == [yY] ]]; then
+        target_remove "$target_name"
+        log OK "Target '${target_name}' removed from registry"
+        # Regenerate compose without this target
+        generate_compose 2>/dev/null || true
+        log OK "Compose regenerated"
+    else
+        echo -e "  ${DIM}Target kept in registry.${NC}"
+    fi
+
+    echo ""
+    log OK "Deployment '${target_name}' removed"
+    echo ""
+}
+
 docker_backup_target() {
     local target_name="$1"
 
@@ -3315,7 +3389,7 @@ cmd_deploy() {
 
             log OK "Compose generated for ${target_name}"
             echo ""
-            echo -e "  Start with:  ${CYAN}pm deploy start --target ${target_name}${NC}"
+            echo -e "  Start with:  ${CYAN}pm start ${target_name}${NC}"
             if [[ -n "$CDN_DOMAIN" ]]; then
                 echo -e "  Pack URL:    ${CYAN}https://${CDN_DOMAIN}/${target_name}/pack.toml${NC}"
             else
@@ -3365,6 +3439,14 @@ cmd_deploy() {
 
         backup|bk)
             docker_backup_target "$target_name"
+            ;;
+
+        remove|rm|destroy)
+            docker_remove_target "$target_name"
+            ;;
+
+        kill)
+            docker_kill_target "$target_name"
             ;;
 
         regenerate|regen)
@@ -3441,8 +3523,8 @@ cmd_deploy() {
             echo -e "  ${GREEN}${BOLD}Server is starting!${NC}"
             [[ -n "$domain" ]] && echo -e "  Game:    ${CYAN}${domain}${NC}"
             echo -e "  Pack:    ${CYAN}${cdn_url}/pack.toml${NC}"
-            echo -e "  Status:  ${CYAN}pm deploy status --target ${target_name}${NC}"
-            echo -e "  Logs:    ${CYAN}pm deploy logs --target ${target_name}${NC}"
+            echo -e "  Status:  ${CYAN}pm deploy status${NC}"
+            echo -e "  Logs:    ${CYAN}pm logs ${target_name}${NC}"
             echo ""
             ;;
 
@@ -3451,19 +3533,22 @@ cmd_deploy() {
             echo -e "  ${BOLD}pm deploy${NC} — Docker Server Management"
             echo ""
             echo -e "  All commands accept ${CYAN}--target <name>${NC} (auto-resolves if only one)"
+            echo -e "  ${DIM}Tip: Use shortcuts for common ops: pm start/stop/restart/logs <name>${NC}"
             echo ""
             echo -e "  ${BOLD}Setup:${NC}"
             echo -e "  ${CYAN}pm deploy create${NC}           Publish pack + generate compose (auto-HTTPS)"
             echo -e "  ${CYAN}pm deploy full${NC}             Pipeline: sync → publish → compose → start"
+            echo -e "  ${CYAN}pm deploy remove${NC}           Tear down a deployment (containers, volumes, registry)"
             echo ""
             echo -e "  ${BOLD}Server:${NC}"
-            echo -e "  ${CYAN}pm deploy start${NC}            Start the server"
-            echo -e "  ${CYAN}pm deploy stop${NC}             Stop the server"
-            echo -e "  ${CYAN}pm deploy restart${NC}          Restart the server"
+            echo -e "  ${CYAN}pm start <name>${NC}            Start the server"
+            echo -e "  ${CYAN}pm stop <name>${NC}             Stop the server"
+            echo -e "  ${CYAN}pm restart <name>${NC}          Restart the server"
             echo -e "  ${CYAN}pm deploy status${NC}           All servers (or --target for one)"
-            echo -e "  ${CYAN}pm deploy console <cmd>${NC}    Send RCON command"
-            echo -e "  ${CYAN}pm deploy logs${NC}             Tail server logs"
-            echo -e "  ${CYAN}pm deploy backup${NC}           Backup server world"
+            echo -e "  ${CYAN}pm console <name> <cmd>${NC}    Send RCON command"
+            echo -e "  ${CYAN}pm logs <name>${NC}             Tail server logs"
+            echo -e "  ${CYAN}pm backup <name>${NC}           Backup server world"
+            echo -e "  ${CYAN}pm destroy <name>${NC}          Tear down deployment"
             echo ""
             echo -e "  ${BOLD}Updates:${NC}"
             echo -e "  ${CYAN}pm deploy push${NC}             Re-publish pack after changes"
@@ -3474,7 +3559,7 @@ cmd_deploy() {
             echo "    pm targets add survival domain=survival.enviouslabs.com ram=8192"
             echo "    pm config edit   # set CDN_DOMAIN=pack.enviouslabs.com for HTTPS"
             echo "    pm deploy create --target survival"
-            echo "    pm deploy start --target survival"
+            echo "    pm start survival"
             echo ""
             echo -e "  ${DIM}Caddy handles HTTPS automatically when CDN_DOMAIN is set.${NC}"
             echo -e "  ${DIM}Without CDN_DOMAIN, pack files are served on http://server-ip:8080${NC}"
@@ -3885,7 +3970,16 @@ cmd_help() {
     unresolved edit                Open unresolved.txt in editor
     unresolved remove <slug>       Remove from unresolved list
 
-  SERVER (Docker Compose — all accept --target <n>):
+  SERVER SHORTCUTS (name auto-resolves if only one target):
+    start <name>                   Start a server
+    stop <name>                    Stop a server
+    restart <name>                 Restart a server
+    logs <name>                    Tail server logs
+    console <name> <cmd>           Send RCON command
+    backup <name>                  Backup server world
+    destroy <name>                 Tear down deployment (containers + data)
+
+  SERVER MANAGEMENT (Docker Compose — accept --target <n>):
     targets list                   Show all server targets
     targets add <n> [k=v...]    Register a new target (auto-assigns port)
     targets set <n> k=v ...     Update target settings
@@ -3893,22 +3987,18 @@ cmd_help() {
     targets dns [n]                Show SRV records for Cloudflare
     targets remove <n>          Remove a target
     deploy create               Generate compose service for target
+    deploy full                    Pipeline: sync → publish → create → start
     deploy push                    Publish pack for auto-update
-    deploy start/stop/restart      Docker compose controls
     deploy status                  All servers (or --target for one)
-    deploy console <cmd>           Send RCON command
-    deploy logs                    Tail server logs
-    deploy backup                  Backup server world
-    deploy regenerate              Rebuild docker-compose.yml
+    deploy remove                  Tear down deployment (containers, volumes)
     deploy cdn                     Publish pack + JARs to cdn/ directory
     deploy mods                    Download mod JARs into server/mods/
-    deploy full                    Pipeline: sync → publish → create → start
+    deploy regenerate              Rebuild docker-compose.yml + Caddyfile
 
   CDN (Caddy — auto-HTTPS):
     targets set <n> cdn_domain=x   Set per-target CDN domain
     deploy cdn --target <n>        Publish pack files + self-hosted JARs
     deploy mods [--target <n>]     Download mod JARs into server/mods/
-    deploy regenerate              Rebuild docker-compose.yml + Caddyfile
 
   CONFIG:
     config show                    Print active configuration
@@ -3944,8 +4034,9 @@ cmd_help() {
     pm targets add creative domain=creative.enviouslabs.com ram=4096
     pm deploy create --target survival     # generates compose
     pm deploy create --target creative
-    pm deploy start --target survival      # docker compose up
+    pm start survival                      # docker compose up
     pm deploy status                       # all servers at a glance
+    pm destroy survival                    # tear down deployment
     pm targets dns                         # SRV records for Cloudflare
     pm targets set survival cdn_domain=pack.enviouslabs.com
     pm deploy cdn --target survival    # publish pack to cdn/survival/
@@ -4000,6 +4091,16 @@ main() {
         deploy|d)          cmd_deploy "$@" ;;
         config|cfg)        cmd_config "$@" ;;
         publish)           publish_pack ;;
+
+        # Server shortcuts — pm start <name> instead of pm deploy start --target <name>
+        start)             cmd_deploy start --target "${1:-}" ;;
+        stop)              cmd_deploy stop --target "${1:-}" ;;
+        restart)           cmd_deploy restart --target "${1:-}" ;;
+        kill)              cmd_deploy kill --target "${1:-}" ;;
+        logs)              cmd_deploy logs --target "${1:-}" ;;
+        console|rcon)      cmd_deploy console "${2:-}" --target "${1:-}" ;;
+        backup)            cmd_deploy backup --target "${1:-}" ;;
+        destroy)           cmd_deploy remove --target "${1:-}" ;;
 
         # Self-update
         self-update|selfupdate|su)  cmd_self_update ;;

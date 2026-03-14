@@ -329,7 +329,7 @@ _pm_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    commands="init organize sync update add remove list status deps refresh export serve pin unpin migrate settings import detect open markdown targets deploy doctor verify diff aliases unresolved config publish self-update update-status help"
+    commands="init organize sync update add remove list status deps refresh export serve pin unpin migrate settings import detect open markdown targets deploy doctor verify diff aliases unresolved config publish self-update update-status start stop restart kill logs console backup destroy help"
 
     case "$prev" in
         pm)
@@ -348,7 +348,7 @@ _pm_completions() {
             return 0
             ;;
         deploy|d)
-            COMPREPLY=($(compgen -W "create push publish start stop restart kill status console backup regenerate mods download full help --target" -- "$cur"))
+            COMPREPLY=($(compgen -W "create push publish start stop restart kill remove destroy status console backup regenerate mods download full help --target" -- "$cur"))
             return 0
             ;;
         targets|t)
@@ -381,6 +381,16 @@ _pm_completions() {
             ;;
         --target|-t)
             # Complete with target names from registry
+            local targets_file="${HOME}/.config/packmanager/targets.json"
+            if [[ -f "$targets_file" ]] && command -v jq &>/dev/null; then
+                local target_names
+                target_names=$(jq -r 'keys[]' "$targets_file" 2>/dev/null)
+                COMPREPLY=($(compgen -W "$target_names" -- "$cur"))
+            fi
+            return 0
+            ;;
+        start|stop|restart|kill|logs|console|backup|destroy)
+            # Complete with target names for server shortcuts
             local targets_file="${HOME}/.config/packmanager/targets.json"
             if [[ -f "$targets_file" ]] && command -v jq &>/dev/null; then
                 local target_names
