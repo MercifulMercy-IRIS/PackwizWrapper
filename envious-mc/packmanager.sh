@@ -1,50 +1,12 @@
 #!/usr/bin/env bash
 # ============================================================================
-# PackManager v4 — PackWiz + Docker Compose Server Management
+# ELM v1.0.0 — EnviousLabs Minecraft CLI
 # ============================================================================
 #
 # USAGE:
-#   pm <command> [args]
+#   elm <command> [args]
 #
-# PACK MANAGEMENT:
-#   pm init                    Initialize pack + mods.txt in current dir
-#   pm organize [dir]          Sort messy dir into pack/ server/ cdn/
-#   pm sync                    Install all mods from mods.txt
-#   pm update                  Update all non-pinned mods
-#   pm add [slug...]           Add mods (no args = interactive)
-#   pm add file:/path/to.jar   Add a single JAR as self-hosted mod
-#   pm remove <slug>           Remove a mod
-#   pm list                    Show installed mods with status
-#   pm status                  Pack health overview
-#   pm deps                    Show auto-pulled dependencies
-#   pm search <query>          Search Modrinth/CurseForge APIs
-#   pm stage                   Batch-match JARs in staging/ vs unresolved
-#   pm export [mr|cf]          Export pack for distribution
-#   pm serve                   Local HTTP server for testing
-#   pm verify                  Full audit: mods.txt vs installed .pw.toml
-#   pm diff                    Side-by-side modlist vs packwiz diff
-#   pm doctor                  All checks + verify in one pass
-#   pm netcheck                Network diagnosis: can clients reach pack.toml?
-#   pm resolve                 Re-attempt unresolved mods (fuzzy search + variants)
-#   pm resolve -i              Interactive mode (pick from search results)
-#   pm aliases                 Manage mod aliases (list/remove/clear)
-#
-# SERVER MANAGEMENT (Docker Compose + itzg/minecraft-server):
-#   pm targets add <n>          Register a server target
-#   pm deploy create            Generate compose service + start
-#   pm deploy push              Publish pack for auto-update
-#   pm deploy start/stop        Docker compose up/down per target
-#   pm deploy restart           Restart a server
-#   pm deploy status            Show all servers
-#   pm deploy console <cmd>     Send RCON command
-#   pm deploy logs              Tail server logs
-#   pm deploy mods              Download mod JARs into server/mods/
-#   pm deploy full              Sync → publish → compose → start
-#
-# CONFIG:
-#   pm config show             Print active config
-#   pm config edit             Open config in $EDITOR
-#   pm config path             Show config file paths
+# Run 'elm help' for full command reference.
 #
 # ============================================================================
 
@@ -53,7 +15,7 @@ set -uo pipefail
 # ============================================================================
 # CONFIG LOADING
 # ============================================================================
-# Priority: local packmanager.conf > global ~/.config/packmanager/packmanager.conf > defaults
+# Priority: local elm.conf > global ~/.config/elm/elm.conf > defaults
 
 # Defaults
 PACK_DIR="$(pwd)"
@@ -68,12 +30,12 @@ RETRY_DELAY=3
 AUTO_DEPS=true
 PREFER_SOURCE="mr"
 # When a mod can't be found during sync, it's automatically saved
-# to unresolved.txt. Use 'pm unresolved search' to find alternatives.
+# to unresolved.txt. Use 'elm resolve search' to find alternatives.
 AUTO_PUBLISH=""                    # Target name to auto-publish to CDN after sync/update
                                    #   "" = disabled, "<target>" = auto-run publish_cdn after sync/update
 
 # Docker / Server defaults
-DOCKER_COMPOSE_DIR="${HOME}/.config/packmanager/servers"  # Where compose files live
+DOCKER_COMPOSE_DIR="${HOME}/.config/elm/servers"  # Where compose files live
 SERVER_IMAGE="itzg/minecraft-server:java17"
 SERVER_RAM="8192"
 SERVER_DISK="25600"
@@ -93,10 +55,10 @@ CDN_DOMAIN=""                      # e.g. "pack.enviouslabs.com" (per-target ove
                                    # If empty, serves on http://<server-ip>:8080
 
 # Self-update (GitHub)
-PM_GITHUB_REPO=""               # e.g. "yourusername/PackwizWrapper" (owner/repo)
-PM_GITHUB_BRANCH="main"         # Branch to pull updates from
-PM_GITHUB_PATH=""               # Subdirectory in repo where files live (e.g. "envious-mc")
-PM_UPDATE_FILES="packmanager.sh install.sh packmanager.conf mods.txt"  # Files to update
+ELM_GITHUB_REPO=""               # e.g. "yourusername/PackwizWrapper" (owner/repo)
+ELM_GITHUB_BRANCH="main"         # Branch to pull updates from
+ELM_GITHUB_PATH=""               # Subdirectory in repo where files live (e.g. "envious-mc")
+ELM_UPDATE_FILES="elm.sh install.sh elm.conf mods.txt"  # Files to update
 
 # CurseForge API key (optional — enables fuzzy search on CurseForge)
 # Get one free at https://console.curseforge.com
@@ -110,13 +72,38 @@ LOCAL_MODS_URL=""               # e.g. https://mods.enviouslabs.com
 # JVM
 JVM_FLAGS="-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCLiveThresholdPercent=90 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1"
 
+# Migrate from packmanager -> elm config paths
+_old_config="${HOME}/.config/packmanager"
+_new_config="${HOME}/.config/elm"
+if [[ -d "$_old_config" && ! -d "$_new_config" ]]; then
+    echo -e "${YELLOW:-}Migrating config from packmanager -> elm...${NC:-}"
+    mv "$_old_config" "$_new_config"
+    [[ -f "${_new_config}/packmanager.conf" ]] && mv "${_new_config}/packmanager.conf" "${_new_config}/elm.conf"
+    echo -e "${GREEN:-}Done. Config now at ${_new_config}${NC:-}"
+fi
+unset _old_config _new_config
+
+# Map legacy PM_ variables if user still has old config
+[[ -n "${PM_GITHUB_REPO:-}" && -z "${ELM_GITHUB_REPO:-}" ]] && ELM_GITHUB_REPO="$PM_GITHUB_REPO"
+[[ -n "${PM_GITHUB_BRANCH:-}" && -z "${ELM_GITHUB_BRANCH:-}" ]] && ELM_GITHUB_BRANCH="$PM_GITHUB_BRANCH"
+[[ -n "${PM_GITHUB_PATH:-}" && -z "${ELM_GITHUB_PATH:-}" ]] && ELM_GITHUB_PATH="$PM_GITHUB_PATH"
+[[ -n "${PM_UPDATE_FILES:-}" && -z "${ELM_UPDATE_FILES:-}" ]] && ELM_UPDATE_FILES="$PM_UPDATE_FILES"
+
 # Load global config
-GLOBAL_CONF="${HOME}/.config/packmanager/packmanager.conf"
+GLOBAL_CONF="${HOME}/.config/elm/elm.conf"
 [[ -f "$GLOBAL_CONF" ]] && source "$GLOBAL_CONF"
 
 # Load local config (overrides global)
-LOCAL_CONF="${PACK_DIR}/packmanager.conf"
+LOCAL_CONF="${PACK_DIR}/elm.conf"
 [[ -f "$LOCAL_CONF" ]] && source "$LOCAL_CONF"
+
+# Load API keys (separate file, chmod 600)
+KEYS_FILE="${HOME}/.config/elm/keys.conf"
+[[ -f "$KEYS_FILE" ]] && source "$KEYS_FILE"
+
+# Load DNS config
+DNS_CONF="${HOME}/.config/elm/dns.conf"
+[[ -f "$DNS_CONF" ]] && source "$DNS_CONF"
 
 # ============================================================================
 # PACK DIRECTORY DISCOVERY
@@ -125,7 +112,7 @@ LOCAL_CONF="${PACK_DIR}/packmanager.conf"
 #   1. pack/ subdirectory (organized layout)
 #   2. Walk up parent directories (running from server/ or cdn/)
 #   3. Sibling pack/ when standing in server/ or cdn/
-# This lets pm work from the project root, from server/, or from anywhere
+# This lets elm work from the project root, from server/, or from anywhere
 # inside an organized tree without needing to cd into pack/ first.
 
 discover_pack_dir() {
@@ -181,10 +168,10 @@ LOG_DIR="${PACK_DIR}/.logs"
 STAGING_DIR="$(dirname "$PACK_DIR")/staging"
 
 # Also try to load a local config from the discovered pack dir
-# (in case discovery moved us and there's a packmanager.conf there)
-if [[ -f "${PACK_DIR}/packmanager.conf" && "${PACK_DIR}/packmanager.conf" != "$LOCAL_CONF" ]]; then
-    source "${PACK_DIR}/packmanager.conf"
-    LOCAL_CONF="${PACK_DIR}/packmanager.conf"
+# (in case discovery moved us and there's a elm.conf there)
+if [[ -f "${PACK_DIR}/elm.conf" && "${PACK_DIR}/elm.conf" != "$LOCAL_CONF" ]]; then
+    source "${PACK_DIR}/elm.conf"
+    LOCAL_CONF="${PACK_DIR}/elm.conf"
     # Re-derive again after this config
     MODS_FILE="${PACK_DIR}/mods.txt"
     UNRESOLVED_FILE="${PACK_DIR}/unresolved.txt"
@@ -208,7 +195,7 @@ unset _ORIGINAL_DIR
 # Setup
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 RUN_LOG="${LOG_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
-touch "$RUN_LOG" 2>/dev/null || RUN_LOG="/tmp/pm_run_$$.log"
+touch "$RUN_LOG" 2>/dev/null || RUN_LOG="/tmp/elm_run_$$.log"
 
 DEPS_ADDED=()
 UNRESOLVED_ADDED=()    # Mods saved to unresolved.txt this run
@@ -220,7 +207,7 @@ BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
 # ── Packwiz wrapper — always runs from PACK_DIR ─────────────────────
 # Packwiz requires pwd to contain pack.toml. This wrapper ensures every
-# call runs from the correct directory, even when pm is invoked from the
+# call runs from the correct directory, even when elm is invoked from the
 # project root or a sibling directory like server/.
 pw() {
     (cd "$PACK_DIR" && "$PACKWIZ_BIN" "$@")
@@ -250,7 +237,7 @@ normalize_slug() {
 check_packwiz() {
     command -v "$PACKWIZ_BIN" &>/dev/null || {
         echo -e "${RED}Error: packwiz not found.${NC}"
-        echo "Install with: pm --install-packwiz"
+        echo "Install with: elm --install-packwiz"
         echo "Or set PACKWIZ_BIN in config"
         exit 1
     }
@@ -269,8 +256,8 @@ check_pack_init() {
         echo ""
         echo -e "  ${BOLD}Fixes:${NC}"
         echo -e "    • cd into your pack directory and retry"
-        echo -e "    • Run ${CYAN}pm init${NC} to create a new pack here"
-        echo -e "    • Run ${CYAN}pm organize${NC} if your files are scattered"
+        echo -e "    • Run ${CYAN}elm init${NC} to create a new pack here"
+        echo -e "    • Run ${CYAN}elm organize${NC} if your files are scattered"
         exit 1
     }
 }
@@ -305,7 +292,7 @@ add_to_unresolved() {
     # Create file with header if it doesn't exist
     if [[ ! -f "$UNRESOLVED_FILE" ]]; then
         cat > "$UNRESOLVED_FILE" << 'HEADER'
-# PackManager — Unresolved Mods
+# ELM — Unresolved Mods
 # These mods weren't found on Modrinth or CurseForge.
 # Add a URL or local JAR binding, then move to mods.txt:
 #
@@ -402,10 +389,10 @@ parse_pw_toml() {
 # Aliases are stored in a JSON file so we can track what the user originally
 # requested vs what packwiz actually installed. This lets us:
 #   - Skip re-prompting for already-approved aliases
-#   - List all aliases with `pm aliases`
-#   - Remove aliased mods with `pm aliases remove <slug>`
+#   - List all aliases with `elm config alias`
+#   - Remove aliased mods with `elm config alias remove <slug>`
 
-ALIASES_FILE="${HOME}/.config/packmanager/aliases.json"
+ALIASES_FILE="${HOME}/.config/elm/aliases.json"
 
 init_aliases_file() {
     mkdir -p "$(dirname "$ALIASES_FILE")"
@@ -486,7 +473,7 @@ verify_mod_install() {
     # Save to unresolved for later resolution
     add_to_unresolved "$requested_slug" "got wrong mod: ${resolved_name} (${resolved_slug})"
     echo -e "    ${DIM}→ saved to unresolved.txt${NC}"
-    echo -e "    ${DIM}Resolve with: ${CYAN}pm search ${requested_slug}${NC}  or  ${CYAN}pm stage${NC}"
+    echo -e "    ${DIM}Resolve with: ${CYAN}elm search ${requested_slug}${NC}  or  ${CYAN}elm add --stage${NC}"
 
     return 1
 }
@@ -616,7 +603,7 @@ verify_all_mods() {
             echo -e "    ${RED}✗${NC} ${m}"
         done
         echo ""
-        echo -e "  ${YELLOW}Run 'pm sync' to install these, or check slugs.${NC}"
+        echo -e "  ${YELLOW}Run 'elm sync' to install these, or check slugs.${NC}"
     fi
 
     # Write full audit to log
@@ -823,7 +810,7 @@ install_mod() {
         add_to_unresolved "$slug" "not found on ${source}"
         log WARN "${slug} → saved to unresolved.txt"
         echo -e "  ${DIM}Investigate: ${CYAN}${UNRESOLVED_FILE}${NC}"
-        echo -e "  ${DIM}Try:         ${CYAN}pm search ${slug}${NC}  or  ${CYAN}pm unresolved search ${slug}${NC}"
+        echo -e "  ${DIM}Try:         ${CYAN}elm search ${slug}${NC}  or  ${CYAN}elm resolve search ${slug}${NC}"
         return 1
     fi
 
@@ -846,10 +833,10 @@ install_mod() {
 # ============================================================================
 # Fuzzy search for mods by name/slug across both platforms.
 # Modrinth's API is free with no key. CurseForge requires CURSEFORGE_API_KEY.
-# Used by: pm search <query>, pm unresolved search, and sync failure suggestions.
+# Used by: elm search <query>, elm resolve search, and sync failure suggestions.
 
 # User-Agent for API requests (good etiquette)
-PM_USER_AGENT="PackManager/4 (github.com/PackwizWrapper)"
+ELM_USER_AGENT="ELM/1 (EnviousLabsMinecraft) (github.com/PackwizWrapper)"
 
 # Search Modrinth API — returns tab-separated: slug \t name \t downloads \t description
 search_modrinth_api() {
@@ -867,7 +854,7 @@ search_modrinth_api() {
 
     local response
     response=$(curl -sL --max-time 10 \
-        -H "User-Agent: ${PM_USER_AGENT}" \
+        -H "User-Agent: ${ELM_USER_AGENT}" \
         "https://api.modrinth.com/v2/search?query=${encoded_query}&limit=${limit}&facets=${facets}" \
         2>/dev/null) || return 1
 
@@ -900,7 +887,7 @@ search_curseforge_api() {
     local response
     response=$(curl -sL --max-time 10 \
         -H "x-api-key: ${CURSEFORGE_API_KEY}" \
-        -H "User-Agent: ${PM_USER_AGENT}" \
+        -H "User-Agent: ${ELM_USER_AGENT}" \
         "$url" 2>/dev/null) || return 1
 
     echo "$response" | jq -r '.data[]? | [.slug, .name, (.downloadCount | tostring), .summary[:80]] | @tsv' 2>/dev/null
@@ -928,7 +915,7 @@ modrinth_download_mod() {
     # Step 1: Get the project to verify it exists
     local project
     project=$(curl -sL --max-time 10 \
-        -H "User-Agent: ${PM_USER_AGENT}" \
+        -H "User-Agent: ${ELM_USER_AGENT}" \
         "https://api.modrinth.com/v2/project/${slug}" \
         2>/dev/null) || return 1
 
@@ -956,7 +943,7 @@ modrinth_download_mod() {
 
     local versions
     versions=$(curl -sL --max-time 10 \
-        -H "User-Agent: ${PM_USER_AGENT}" \
+        -H "User-Agent: ${ELM_USER_AGENT}" \
         "$versions_url" \
         2>/dev/null) || return 1
 
@@ -1035,7 +1022,7 @@ curseforge_download_mod() {
     local search_result
     search_result=$(curl -sL --max-time 10 \
         -H "x-api-key: ${CURSEFORGE_API_KEY}" \
-        -H "User-Agent: ${PM_USER_AGENT}" \
+        -H "User-Agent: ${ELM_USER_AGENT}" \
         "$search_url" 2>/dev/null) || return 1
 
     local mod_id mod_name
@@ -1062,7 +1049,7 @@ curseforge_download_mod() {
     local files_result
     files_result=$(curl -sL --max-time 10 \
         -H "x-api-key: ${CURSEFORGE_API_KEY}" \
-        -H "User-Agent: ${PM_USER_AGENT}" \
+        -H "User-Agent: ${ELM_USER_AGENT}" \
         "$files_url" 2>/dev/null) || return 1
 
     # Step 3: Pick the first (most recent) file with a download URL
@@ -1373,7 +1360,7 @@ interactive_search() {
 # Manages multiple Docker-based MC server instances. Each target has:
 #   name, pack_dir, domain, port, rcon_port, ram, cpu, description
 #
-# Stored as JSON at ~/.config/packmanager/targets.json
+# Stored as JSON at ~/.config/elm/targets.json
 #
 # Architecture:
 #   Docker VM (Rocky/Ubuntu)
@@ -1383,7 +1370,7 @@ interactive_search() {
 #     └─ mc-modded    :25567     ← modded.enviouslabs.com   (SRV record)
 # ============================================================================
 
-TARGETS_FILE="${HOME}/.config/packmanager/targets.json"
+TARGETS_FILE="${HOME}/.config/elm/targets.json"
 
 init_targets_file() {
     mkdir -p "$(dirname "$TARGETS_FILE")"
@@ -1444,7 +1431,7 @@ resolve_target() {
     count=$(jq 'length' "$TARGETS_FILE" 2>/dev/null || echo 0)
 
     if (( count == 0 )); then
-        echo -e "${RED}No targets configured. Run: pm targets add <name>${NC}" >&2
+        echo -e "${RED}No targets configured. Run: elm target add <name>${NC}" >&2
         exit 1
     elif (( count == 1 )); then
         target_list | head -1
@@ -1467,7 +1454,7 @@ load_target() {
 
     if [[ -n "$pack_dir" ]]; then
         # If the stored pack_dir is stale (no pack.toml), run discovery on it.
-        # This handles targets registered before `pm organize` moved things.
+        # This handles targets registered before `elm organize` moved things.
         if [[ ! -f "${pack_dir}/pack.toml" ]]; then
             local resolved
             resolved=$(discover_pack_dir "$pack_dir")
@@ -1540,8 +1527,8 @@ generate_caddyfile() {
 
     cat > "$caddyfile" << CADDYEOF
 # ============================================================================
-# PackManager — Auto-generated Caddyfile
-# DO NOT EDIT — regenerated by pm deploy create / pm deploy regenerate
+# ELM — Auto-generated Caddyfile
+# DO NOT EDIT — regenerated by elm deploy create / elm deploy regenerate
 # ============================================================================
 
 ${site_addr} {
@@ -1603,8 +1590,8 @@ generate_compose() {
     # Header
     cat > "$compose_file" << 'HEADER'
 # ============================================================================
-# PackManager — Auto-generated Docker Compose
-# DO NOT EDIT — regenerated by `pm deploy create` and `pm deploy regenerate`
+# ELM — Auto-generated Docker Compose
+# DO NOT EDIT — regenerated by `elm deploy create` and `elm deploy regenerate`
 # ============================================================================
 
 services:
@@ -1662,10 +1649,10 @@ CADDY
         [[ -z "$port" ]] && continue
 
         local ram_mb="${ram:-$SERVER_RAM}"
-        local motd="${domain:-${t}} — PackManager"
+        local motd="${domain:-${t}} — ELM"
         local rcon_pass
         rcon_pass=$(target_get "$t" "rcon_password")
-        [[ -z "$rcon_pass" ]] && rcon_pass="pm-${t}-$(openssl rand -hex 4 2>/dev/null || echo "change-me")"
+        [[ -z "$rcon_pass" ]] && rcon_pass="elm-${t}-$(openssl rand -hex 4 2>/dev/null || echo "change-me")"
 
         # MC container fetches pack.toml from the Caddy container over the internal network
         local packwiz_url=""
@@ -1738,7 +1725,7 @@ dc() {
     local compose_file="${cdir}/docker-compose.yml"
 
     [[ -f "$compose_file" ]] || {
-        echo -e "${RED}No compose file. Run 'pm deploy create' first.${NC}"
+        echo -e "${RED}No compose file. Run 'elm deploy create' first.${NC}"
         exit 1
     }
 
@@ -1925,7 +1912,7 @@ docker_remove_target() {
         echo ""
         echo -e "  ${YELLOW}${BOLD}Remove Docker volume '${volume}'?${NC}"
         echo -e "  ${RED}This permanently deletes the server world, configs, and all data.${NC}"
-        echo -e "  ${DIM}(Consider running 'pm deploy backup' first)${NC}"
+        echo -e "  ${DIM}(Consider running 'elm deploy backup' first)${NC}"
         echo ""
         echo -ne "  ${CYAN}Delete volume? (y/N)>${NC} "
         read -r vol_confirm < /dev/tty
@@ -2181,8 +2168,8 @@ download_server_mods() {
             dest_dir="${parent}/server/mods"
         else
             echo -e "  ${RED}No destination specified and no sibling server/ directory found.${NC}"
-            echo -e "  ${DIM}Usage: pm deploy mods [--dir /path/to/server/mods]${NC}"
-            echo -e "  ${DIM}Or run 'pm organize' first to create the directory layout.${NC}"
+            echo -e "  ${DIM}Usage: elm deploy mods [--dir /path/to/server/mods]${NC}"
+            echo -e "  ${DIM}Or run 'elm organize' first to create the directory layout.${NC}"
             return 1
         fi
     fi
@@ -2269,7 +2256,7 @@ download_server_mods() {
         local http_code
         http_code=$(curl -sL -o "$dest_file" -w "%{http_code}" \
             --connect-timeout 15 --max-time 120 \
-            -H "User-Agent: PackManager/4 (github.com/PackwizWrapper)" \
+            -H "User-Agent: ELM/1 (EnviousLabsMinecraft) (github.com/PackwizWrapper)" \
             "$mod_url" 2>>"$RUN_LOG" || echo "000")
 
         if [[ "$http_code" == "200" && -s "$dest_file" ]]; then
@@ -2344,7 +2331,7 @@ download_server_mods() {
         echo -e "  ${RED}${BOLD}Failed downloads:${NC}"
         printf '    • %s\n' "${failed_mods[@]}"
         echo ""
-        echo -e "  ${DIM}Check URLs with: pm list --version${NC}"
+        echo -e "  ${DIM}Check URLs with: elm ls --version${NC}"
         echo -e "  ${DIM}Full log: ${RUN_LOG}${NC}"
         echo ""
     fi
@@ -2390,7 +2377,7 @@ generate_nginx_config() {
     log WARN "Nginx config generation has been replaced by Caddy."
     echo -e "  Pack files are now served by the Caddy container in Docker Compose."
     echo -e "  Set ${CYAN}CDN_DOMAIN${NC} in your config for automatic HTTPS."
-    echo -e "  Run ${CYAN}pm deploy regenerate${NC} to update the Caddyfile."
+    echo -e "  Run ${CYAN}elm deploy regenerate${NC} to update the Caddyfile."
     echo ""
     echo -e "  ${DIM}Caddy handles HTTPS automatically via Let's Encrypt — no certbot needed.${NC}"
     echo ""
@@ -2455,11 +2442,11 @@ print_srv_records() {
 #
 # Target layout:
 #   <root>/
-#     ├── pack/                ← packwiz working directory (pm operates here)
+#     ├── pack/                ← packwiz working directory (elm operates here)
 #     │   ├── pack.toml
 #     │   ├── index.toml
 #     │   ├── mods.txt
-#     │   ├── packmanager.conf
+#     │   ├── elm.conf
 #     │   ├── unresolved.txt
 #     │   ├── mods/            ← .pw.toml files + downloaded JARs
 #     │   └── config/          ← mod config files
@@ -2469,7 +2456,7 @@ print_srv_records() {
 #     │   ├── logs/
 #     │   ├── ops.json, whitelist.json, banned-*.json
 #     │   └── ...
-#     ├── staging/             ← drop JARs here for 'pm stage' batch matching
+#     ├── staging/             ← drop JARs here for 'elm add --stage' batch matching
 #     └── cdn/                 ← Caddy-served files (client downloads)
 #         ├── pack.toml
 #         ├── index.toml
@@ -2496,7 +2483,7 @@ cmd_organize() {
             echo -e "  ${DIM}Looks like it may already be organized.${NC}"
             echo ""
             echo -e "  To re-organize, run from inside the pack/ directory"
-            echo -e "  or pass the path: ${CYAN}pm organize ${root}/pack${NC}"
+            echo -e "  or pass the path: ${CYAN}elm organize ${root}/pack${NC}"
             return 0
         fi
         echo -e "  ${RED}No pack.toml in ${root}${NC}"
@@ -2512,8 +2499,8 @@ cmd_organize() {
     local server_files=()      # Things that belong in server/
     local other_files=()       # Unknown / already organized
 
-    # PackWiz / PackManager files
-    for f in pack.toml index.toml mods.txt packmanager.conf unresolved.txt; do
+    # PackWiz / ELM files
+    for f in pack.toml index.toml mods.txt elm.conf unresolved.txt; do
         [[ -f "${root}/${f}" ]] && packwiz_files+=("$f")
     done
     [[ -d "${root}/mods" ]]   && packwiz_files+=("mods/")
@@ -2576,7 +2563,7 @@ cmd_organize() {
     log OK "Created pack/ server/ cdn/"
 
     # --- Move packwiz files into pack/ ---
-    for f in pack.toml index.toml mods.txt packmanager.conf unresolved.txt; do
+    for f in pack.toml index.toml mods.txt elm.conf unresolved.txt; do
         if [[ -f "${root}/${f}" ]]; then
             mv "${root}/${f}" "${root}/pack/${f}"
             log OK "  ${f} → pack/"
@@ -2654,8 +2641,8 @@ cmd_organize() {
 
     log OK "cdn/ populated"
 
-    # --- Update local packmanager.conf to point at new paths ---
-    local conf="${root}/pack/packmanager.conf"
+    # --- Update local elm.conf to point at new paths ---
+    local conf="${root}/pack/elm.conf"
     if [[ -f "$conf" ]]; then
         # Add or update AUTO_PUBLISH setting
         if grep -q '^AUTO_PUBLISH=' "$conf" 2>/dev/null; then
@@ -2668,7 +2655,7 @@ cmd_organize() {
             echo '# Auto-publish to cdn/ after sync/update' >> "$conf"
             echo 'AUTO_PUBLISH="__auto__"' >> "$conf"
         fi
-        log OK "Set AUTO_PUBLISH in pack/packmanager.conf"
+        log OK "Set AUTO_PUBLISH in pack/elm.conf"
     fi
 
     # --- Summary ---
@@ -2677,9 +2664,9 @@ cmd_organize() {
     echo -e "  ${GREEN}${BOLD}Organized!${NC} New layout:"
     echo ""
     echo -e "  ${CYAN}${root}/${NC}"
-    echo -e "  ├── ${BOLD}pack/${NC}      ← run pm commands from here"
+    echo -e "  ├── ${BOLD}pack/${NC}      ← run elm commands from here"
     echo -e "  │   ├── pack.toml, index.toml"
-    echo -e "  │   ├── mods.txt, packmanager.conf"
+    echo -e "  │   ├── mods.txt, elm.conf"
     echo -e "  │   └── mods/  config/"
     echo -e "  ├── ${BOLD}server/${NC}    ← minecraft server runtime"
     if (( ${#server_files[@]} > 0 )); then
@@ -2695,7 +2682,7 @@ cmd_organize() {
     echo ""
     echo -e "  ${BOLD}Next steps:${NC}"
     echo -e "    ${CYAN}cd ${root}/pack${NC}"
-    echo -e "    ${CYAN}pm sync${NC}                          # pack changes auto-publish to cdn/"
+    echo -e "    ${CYAN}elm sync${NC}                          # pack changes auto-publish to cdn/"
     echo ""
     echo -e "  ${DIM}Caddy serves cdn/ automatically via Docker Compose.${NC}"
     echo -e "  ${DIM}Set CDN_DOMAIN in config for automatic HTTPS.${NC}"
@@ -2764,7 +2751,7 @@ cmd_init() {
     pw init --mc-version "$mc_ver" --modloader "$loader" $loader_arg
 
     [[ -f "$MODS_FILE" ]] || {
-        echo "# PackManager mods list — edit and run: pm sync" > "$MODS_FILE"
+        echo "# ELM mods list — edit and run: elm sync" > "$MODS_FILE"
         log OK "Created mods.txt"
     }
 
@@ -2837,13 +2824,22 @@ cmd_sync() {
         printf '    → %s\n' "${UNRESOLVED_ADDED[@]}"
         echo ""
         echo -e "  ${DIM}Bind these later with a URL or local JAR in unresolved.txt,${NC}"
-        echo -e "  ${DIM}then move the entry to mods.txt. View with: pm unresolved${NC}"
+        echo -e "  ${DIM}then move the entry to mods.txt. View with: elm resolve${NC}"
     fi
     echo ""
 }
 
 cmd_add() {
     check_packwiz; check_pack_init
+
+    # Handle --stage and --import flags
+    if [[ "${1:-}" == "--stage" ]]; then
+        cmd_stage; return
+    fi
+    if [[ "${1:-}" == "--import" ]]; then
+        shift
+        cmd_cf_import "${1:-}"; return
+    fi
 
     if [[ $# -eq 0 ]]; then
         cmd_add_interactive; return
@@ -2888,10 +2884,10 @@ cmd_add() {
         else
             echo ""
             echo -e "  ${YELLOW}Failed '${slug}'. Try:${NC}"
-            echo "    pm search ${slug}"
-            echo "    pm add cf:alternate-slug"
-            echo "    pm add url:https://direct-link.jar"
-            echo "    pm add file:/path/to/mod.jar"
+            echo "    elm search ${slug}"
+            echo "    elm add cf:alternate-slug"
+            echo "    elm add url:https://direct-link.jar"
+            echo "    elm add file:/path/to/mod.jar"
             echo ""
         fi
     done
@@ -2931,7 +2927,7 @@ cmd_remove() {
     check_packwiz; check_pack_init
 
     if [[ -z "${1:-}" ]]; then
-        echo "Usage: pm remove <query>"
+        echo "Usage: elm rm <query>"
         echo "  Query can be a partial name — matching .pw.toml files will be shown."
         return 1
     fi
@@ -2966,7 +2962,7 @@ cmd_remove() {
     # ── No matches ───────────────────────────────────────────────────
     if [[ ${#match_slugs[@]} -eq 0 ]]; then
         log FAIL "No installed mods matching '${query}'"
-        echo -e "  ${DIM}Tip: Run ${CYAN}pm list${NC} ${DIM}to see all installed mods${NC}"
+        echo -e "  ${DIM}Tip: Run ${CYAN}elm ls${NC} ${DIM}to see all installed mods${NC}"
         return 1
     fi
 
@@ -3086,6 +3082,7 @@ cmd_list() {
     # Parse flags
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --deps)          cmd_deps; return ;;
             --side|-s)       side_filter="$2"; shift 2 ;;
             --version|-v)    show_version=true; shift ;;
             --native|-n)     use_native=true; shift ;;
@@ -3218,17 +3215,23 @@ cmd_deps() {
 }
 
 cmd_search() {
+    # Handle --open flag
+    if [[ "${1:-}" == "--open" ]]; then
+        shift
+        cmd_open "${1:-}"; return
+    fi
+
     local query="${1:-}"
 
     if [[ -z "$query" ]]; then
-        echo -e "${RED}Usage: pm search <query>${NC}"
+        echo -e "${RED}Usage: elm search <query>${NC}"
         echo ""
         echo -e "  Search Modrinth (and CurseForge if API key is set) for mods."
         echo ""
         echo -e "  ${BOLD}Examples:${NC}"
-        echo -e "    ${CYAN}pm search jei${NC}            # search for Just Enough Items"
-        echo -e "    ${CYAN}pm search \"applied ener\"${NC}  # fuzzy search"
-        echo -e "    ${CYAN}pm search optifine${NC}        # find alternatives"
+        echo -e "    ${CYAN}elm search jei${NC}            # search for Just Enough Items"
+        echo -e "    ${CYAN}elm search \"applied ener\"${NC}  # fuzzy search"
+        echo -e "    ${CYAN}elm search optifine${NC}        # find alternatives"
         echo ""
         echo -e "  ${DIM}Results are filtered by MC ${MC_VERSION} / ${LOADER}${NC}"
         [[ -z "$CURSEFORGE_API_KEY" ]] && echo -e "  ${DIM}Set CURSEFORGE_API_KEY in config to also search CurseForge${NC}"
@@ -3270,7 +3273,7 @@ cmd_search() {
             a|A)
                 is_in_modlist "${selected#*:}" || {
                     append_to_modlist "$selected"
-                    log OK "Added ${selected} to mods.txt (run 'pm sync' to install)"
+                    log OK "Added ${selected} to mods.txt (run 'elm sync' to install)"
                 }
                 ;;
             *)
@@ -3299,7 +3302,7 @@ cmd_doctor() {
     pw refresh 2>>"$RUN_LOG" && log OK "Index clean" || { log WARN "Index issues"; (( issues++ )); }
 
     echo ""
-    (( issues == 0 )) && echo -e "  ${GREEN}${BOLD}All good!${NC}" || echo -e "  ${YELLOW}${issues} issue(s). Run 'pm sync' to fix.${NC}"
+    (( issues == 0 )) && echo -e "  ${GREEN}${BOLD}All good!${NC}" || echo -e "  ${YELLOW}${issues} issue(s). Run 'elm sync' to fix.${NC}"
 
     # Run the full verification audit
     verify_all_mods
@@ -3347,7 +3350,7 @@ cmd_netcheck() {
             log OK "cdn/pack.toml exists locally"
         else
             log FAIL "cdn/pack.toml NOT FOUND at ${cdn_dir}/"
-            echo -e "    ${DIM}Run: pm deploy cdn --target ${target_name}${NC}"
+            echo -e "    ${DIM}Run: elm deploy cdn --target ${target_name}${NC}"
             (( issues++ ))
             continue
         fi
@@ -3376,8 +3379,8 @@ cmd_netcheck() {
                 caddy_running=true
             else
                 log FAIL "Caddy container not found/not running"
-                echo -e "    ${DIM}Run: pm deploy create --target ${target_name}${NC}"
-                echo -e "    ${DIM}Then: pm start ${target_name}${NC}"
+                echo -e "    ${DIM}Run: elm deploy create --target ${target_name}${NC}"
+                echo -e "    ${DIM}Then: elm deploy start ${target_name}${NC}"
                 (( issues++ ))
             fi
         else
@@ -3577,7 +3580,7 @@ cmd_netcheck() {
     if (( issues == 0 )); then
         echo -e "  ${GREEN}${BOLD}All checks passed!${NC} Clients should be able to connect."
     else
-        echo -e "  ${RED}${BOLD}${issues} issue(s) found.${NC} Fix the above and re-run ${CYAN}pm netcheck${NC}."
+        echo -e "  ${RED}${BOLD}${issues} issue(s) found.${NC} Fix the above and re-run ${CYAN}elm net${NC}."
     fi
     echo ""
 
@@ -3699,9 +3702,42 @@ cmd_diff() {
         ur_count=$(grep -cvE '^\s*(#|$)' "$UNRESOLVED_FILE" 2>/dev/null || echo 0)
         if (( ur_count > 0 )); then
             echo -e "  ${YELLOW}${BOLD}Unresolved mods: ${ur_count}${NC}"
-            echo -e "  ${DIM}Fix with: pm unresolved search  or  pm stage${NC}"
+            echo -e "  ${DIM}Fix with: elm resolve search  or  elm add --stage${NC}"
             echo ""
         fi
+    fi
+}
+
+# ============================================================================
+# CONSOLIDATED CHECK (replaces doctor/verify/diff/status)
+# ============================================================================
+cmd_check() {
+    local do_diff=false do_refresh=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --diff)    do_diff=true; shift ;;
+            --refresh) do_refresh=true; shift ;;
+            *)         shift ;;
+        esac
+    done
+
+    # Run status overview
+    cmd_status
+
+    # Run doctor checks
+    cmd_doctor
+
+    # Run verify audit
+    cmd_verify
+
+    # Optional: show diff
+    if $do_diff; then
+        cmd_diff
+    fi
+
+    # Optional: refresh index
+    if $do_refresh; then
+        cmd_refresh ""
     fi
 }
 
@@ -3725,8 +3761,11 @@ cmd_export() {
         curseforge|cf)
             pw curseforge export $side_flag 2>>"$RUN_LOG" && log OK "CurseForge .zip created" || log FAIL "Export failed"
             ;;
+        md|markdown)
+            cmd_markdown; return
+            ;;
         *)
-            echo -e "${RED}Usage: pm export [mr|cf] [client|server]${NC}"
+            echo -e "${RED}Usage: elm export [mr|cf|md] [client|server]${NC}"
             exit 1
             ;;
     esac
@@ -3748,7 +3787,7 @@ cmd_serve() {
 
 cmd_pin() {
     check_packwiz; check_pack_init
-    local slug="${1:?Usage: pm pin <slug>}"
+    local slug="${1:?Usage: elm pin <slug>}"
     header "Pinning: ${slug}"
     # Native packwiz pin — adds [pin] section to .pw.toml
     pw pin "$slug" 2>>"$RUN_LOG" && log OK "Pinned (won't receive updates)" || log FAIL "Pin failed"
@@ -3756,14 +3795,14 @@ cmd_pin() {
 
 cmd_unpin() {
     check_packwiz; check_pack_init
-    local slug="${1:?Usage: pm unpin <slug>}"
+    local slug="${1:?Usage: elm unpin <slug>}"
     header "Unpinning: ${slug}"
     pw unpin "$slug" 2>>"$RUN_LOG" && log OK "Unpinned (will receive updates)" || log FAIL "Unpin failed"
 }
 
 cmd_migrate() {
     check_packwiz; check_pack_init
-    local target="${1:?Usage: pm migrate <minecraft|loader> [version]}"
+    local target="${1:?Usage: elm migrate <minecraft|loader> [version]}"
     local version="${2:-}"
 
     case "$target" in
@@ -3788,9 +3827,9 @@ cmd_migrate() {
             fi
             ;;
         *)
-            echo -e "${RED}Usage: pm migrate <minecraft|loader> [version]${NC}"
-            echo "  pm migrate minecraft 1.21.1"
-            echo "  pm migrate loader 47.2.0"
+            echo -e "${RED}Usage: elm migrate <minecraft|loader> [version]${NC}"
+            echo "  elm migrate minecraft 1.21.1"
+            echo "  elm migrate loader 47.2.0"
             exit 1
             ;;
     esac
@@ -3819,7 +3858,7 @@ cmd_settings() {
                     echo -e "  ${DIM}None set (only exact MC version accepted)${NC}"
                 fi
                 echo ""
-                echo -e "  ${DIM}Set with: pm settings versions 1.20,1.20.1,1.20.2${NC}"
+                echo -e "  ${DIM}Set with: elm config versions 1.20,1.20.1,1.20.2${NC}"
             fi
             ;;
         show|"")
@@ -3829,9 +3868,9 @@ cmd_settings() {
             echo ""
             ;;
         *)
-            echo -e "${RED}Usage: pm settings <versions|show> [values]${NC}"
-            echo "  pm settings versions 1.20,1.20.1"
-            echo "  pm settings show"
+            echo -e "${RED}Usage: elm config <versions|show> [values]${NC}"
+            echo "  elm config versions 1.20,1.20.1"
+            echo "  elm config show"
             ;;
     esac
 }
@@ -3946,7 +3985,7 @@ cmd_stage() {
     if (( ${#jars[@]} == 0 )); then
         echo -e "  ${DIM}No JAR files found in:${NC} ${CYAN}${STAGING_DIR}/${NC}"
         echo ""
-        echo -e "  Drop .jar files into that directory, then run ${BOLD}pm stage${NC} again."
+        echo -e "  Drop .jar files into that directory, then run ${BOLD}elm add --stage${NC} again."
         echo -e "  JARs are fuzzy-matched against your unresolved mods list."
         echo ""
         return 0
@@ -4078,8 +4117,8 @@ cmd_stage() {
 # ============================================================================
 # ADD FILE — import a single JAR as a self-hosted mod
 # ============================================================================
-#   pm add file:/path/to/my-mod.jar
-#   pm add file:/path/to/my-mod.jar --slug custom-name
+#   elm add file:/path/to/my-mod.jar
+#   elm add file:/path/to/my-mod.jar --slug custom-name
 
 cmd_add_file() {
     check_packwiz; check_pack_init
@@ -4091,7 +4130,7 @@ cmd_add_file() {
 
     if [[ ! -f "$jar_path" ]]; then
         log FAIL "File not found: ${jar_path}"
-        echo -e "  ${DIM}Usage: pm add file:/path/to/mod.jar${NC}"
+        echo -e "  ${DIM}Usage: elm add file:/path/to/mod.jar${NC}"
         return 1
     fi
 
@@ -4133,7 +4172,7 @@ cmd_add_file() {
 
 cmd_cf_import() {
     check_packwiz; check_pack_init
-    local path="${1:?Usage: pm import <path-to-zip>}"
+    local path="${1:?Usage: elm add --import <path-to-zip>}"
     header "Importing CurseForge Pack"
 
     if [[ ! -f "$path" ]]; then
@@ -4161,7 +4200,7 @@ cmd_detect() {
 
 cmd_open() {
     check_packwiz; check_pack_init
-    local slug="${1:?Usage: pm open <slug>}"
+    local slug="${1:?Usage: elm search --open <slug>}"
 
     # Check if it has a CurseForge or Modrinth source
     local toml="${PACK_DIR}/mods/${slug}.pw.toml"
@@ -4253,13 +4292,13 @@ cmd_aliases() {
             echo ""
             echo -e "  ${BOLD}${count} alias(es)${NC}"
             echo ""
-            echo -e "  ${DIM}Remove: pm aliases remove <requested-slug>${NC}"
-            echo -e "  ${DIM}Clear:  pm aliases clear${NC}"
+            echo -e "  ${DIM}Remove: elm config alias remove <requested-slug>${NC}"
+            echo -e "  ${DIM}Clear:  elm config alias clear${NC}"
             echo ""
             ;;
 
         remove|rm)
-            local slug="${1:?Usage: pm aliases remove <requested-slug>}"
+            local slug="${1:?Usage: elm config alias remove <requested-slug>}"
             init_aliases_file
 
             local resolved
@@ -4330,11 +4369,11 @@ cmd_aliases() {
 
         help|*)
             echo ""
-            echo -e "  ${BOLD}pm aliases${NC} — Manage Mod Aliases"
+            echo -e "  ${BOLD}elm config alias${NC} — Manage Mod Aliases"
             echo ""
-            echo -e "  ${CYAN}pm aliases list${NC}             Show all tracked aliases"
-            echo -e "  ${CYAN}pm aliases remove <slug>${NC}    Remove alias (option to uninstall mod)"
-            echo -e "  ${CYAN}pm aliases clear${NC}            Clear all alias tracking"
+            echo -e "  ${CYAN}elm config alias list${NC}             Show all tracked aliases"
+            echo -e "  ${CYAN}elm config alias remove <slug>${NC}    Remove alias (option to uninstall mod)"
+            echo -e "  ${CYAN}elm config alias clear${NC}            Clear all alias tracking"
             echo ""
             echo -e "  Aliases are created when packwiz installs a mod under a"
             echo -e "  different slug than what you requested (e.g. ae2 → applied-energistics-2)."
@@ -4349,6 +4388,12 @@ cmd_aliases() {
 # ============================================================================
 
 cmd_resolve() {
+    # Route unresolved management subcommands
+    case "${1:-}" in
+        list|search|edit|remove)
+            cmd_unresolved "$@"; return ;;
+    esac
+
     local mode="${1:-auto}"   # auto | interactive | <specific-slug>
 
     if [[ ! -f "$UNRESOLVED_FILE" ]]; then
@@ -4466,10 +4511,10 @@ cmd_resolve() {
         done
         echo ""
         echo -e "  ${DIM}Tips:${NC}"
-        echo -e "    ${DIM}• Run ${CYAN}pm resolve -i${NC} ${DIM}for interactive mode (pick from search results)${NC}"
-        echo -e "    ${DIM}• Run ${CYAN}pm search <name>${NC} ${DIM}to find alternative slugs manually${NC}"
+        echo -e "    ${DIM}• Run ${CYAN}elm resolve -i${NC} ${DIM}for interactive mode (pick from search results)${NC}"
+        echo -e "    ${DIM}• Run ${CYAN}elm search <name>${NC} ${DIM}to find alternative slugs manually${NC}"
         echo -e "    ${DIM}• Add ${CYAN}url:https://...${NC} ${DIM}binding in mods.txt for direct-download mods${NC}"
-        echo -e "    ${DIM}• Drop JARs in staging/ and run ${CYAN}pm stage${NC}${NC}"
+        echo -e "    ${DIM}• Drop JARs in staging/ and run ${CYAN}elm add --stage${NC}${NC}"
     fi
 
     return 0
@@ -4515,7 +4560,7 @@ cmd_unresolved() {
                 echo -e "  ${DIM}To resolve, edit unresolved.txt and add a URL or local prefix:${NC}"
                 echo -e "    ${CYAN}url:https://example.com/my-mod.jar${NC}"
                 echo -e "    ${CYAN}local:my-mod${NC}"
-                echo -e "  ${DIM}Then move the line to mods.txt and run: pm sync${NC}"
+                echo -e "  ${DIM}Then move the line to mods.txt and run: elm sync${NC}"
             fi
             echo ""
             ;;
@@ -4531,8 +4576,8 @@ cmd_unresolved() {
             ;;
 
         resolve)
-            local slug="${1:?Usage: pm unresolved resolve <slug> <url-or-local-path>}"
-            local binding="${2:?Usage: pm unresolved resolve <slug> <url|local:name>}"
+            local slug="${1:?Usage: elm resolve resolve <slug> <url-or-local-path>}"
+            local binding="${2:?Usage: elm resolve resolve <slug> <url|local:name>}"
 
             if ! is_unresolved "$slug"; then
                 log FAIL "${slug} is not in unresolved.txt"
@@ -4557,11 +4602,11 @@ cmd_unresolved() {
             # Add to mods.txt
             append_to_modlist "$entry" "resolved from unresolved.txt (was: ${slug})"
             log OK "${slug} → ${entry} (moved to mods.txt)"
-            echo -e "  ${DIM}Run 'pm sync' to install.${NC}"
+            echo -e "  ${DIM}Run 'elm sync' to install.${NC}"
             ;;
 
         remove|rm)
-            local slug="${1:?Usage: pm unresolved remove <slug>}"
+            local slug="${1:?Usage: elm resolve remove <slug>}"
             if [[ ! -f "$UNRESOLVED_FILE" ]]; then
                 log FAIL "No unresolved.txt"
                 return 1
@@ -4599,7 +4644,7 @@ cmd_unresolved() {
                     mv "$tmp" "$UNRESOLVED_FILE"
                     append_to_modlist "$selected" "resolved via search (was: ${slug})"
                     log OK "${slug} → ${selected} (moved to mods.txt)"
-                    echo -e "  ${DIM}Run 'pm sync' to install.${NC}"
+                    echo -e "  ${DIM}Run 'elm sync' to install.${NC}"
                 fi
                 return
             fi
@@ -4636,7 +4681,7 @@ cmd_unresolved() {
             echo ""
             if (( resolved_count > 0 )); then
                 echo -e "  ${GREEN}${BOLD}Resolved ${resolved_count}/${count} mod(s).${NC}"
-                echo -e "  ${DIM}Run 'pm sync' to install them.${NC}"
+                echo -e "  ${DIM}Run 'elm sync' to install them.${NC}"
             else
                 echo -e "  ${DIM}No mods resolved.${NC}"
             fi
@@ -4657,20 +4702,20 @@ cmd_unresolved() {
 
         help|*)
             echo ""
-            echo -e "  ${BOLD}pm unresolved${NC} — Manage Mods Not Found on MR/CF"
+            echo -e "  ${BOLD}elm resolve${NC} — Manage Mods Not Found on MR/CF"
             echo ""
-            echo -e "  ${CYAN}pm unresolved list${NC}                     Show pending mods"
-            echo -e "  ${CYAN}pm unresolved search [slug]${NC}            Search APIs for matches"
-            echo -e "  ${CYAN}pm unresolved edit${NC}                     Open unresolved.txt in editor"
-            echo -e "  ${CYAN}pm unresolved resolve <slug> <url>${NC}     Bind a URL and move to mods.txt"
-            echo -e "  ${CYAN}pm unresolved remove <slug>${NC}            Remove from unresolved list"
-            echo -e "  ${CYAN}pm unresolved clear${NC}                    Delete unresolved.txt"
+            echo -e "  ${CYAN}elm resolve list${NC}                     Show pending mods"
+            echo -e "  ${CYAN}elm resolve search [slug]${NC}            Search APIs for matches"
+            echo -e "  ${CYAN}elm resolve edit${NC}                     Open unresolved.txt in editor"
+            echo -e "  ${CYAN}elm resolve resolve <slug> <url>${NC}     Bind a URL and move to mods.txt"
+            echo -e "  ${CYAN}elm resolve remove <slug>${NC}            Remove from unresolved list"
+            echo -e "  ${CYAN}elm resolve clear${NC}                    Delete unresolved.txt"
             echo ""
             echo -e "  ${BOLD}Example:${NC}"
-            echo "    pm unresolved search               # search all unresolved mods"
-            echo "    pm unresolved search my-mod         # search one specific mod"
-            echo "    pm unresolved resolve my-mod url:https://example.com/my-mod-1.0.jar"
-            echo "    pm sync                             # installs the resolved mods"
+            echo "    elm resolve search               # search all unresolved mods"
+            echo "    elm resolve search my-mod         # search one specific mod"
+            echo "    elm resolve resolve my-mod url:https://example.com/my-mod-1.0.jar"
+            echo "    elm sync                             # installs the resolved mods"
             echo ""
             ;;
     esac
@@ -4690,7 +4735,7 @@ cmd_targets() {
             header "Server Targets"
 
             local targets; targets=$(target_list)
-            [[ -z "$targets" ]] && { echo -e "  ${DIM}No targets. Run: pm targets add <name>${NC}"; return; }
+            [[ -z "$targets" ]] && { echo -e "  ${DIM}No targets. Run: elm target add <name>${NC}"; return; }
 
             while IFS= read -r t; do
                 local domain port ram desc pack_dir rcon_port
@@ -4712,7 +4757,7 @@ cmd_targets() {
             ;;
 
         add|new)
-            local name="${1:?Usage: pm targets add <name> [key=value...]}"
+            local name="${1:?Usage: elm target add <name> [key=value...]}"
             shift || true
 
             header "Adding Target: ${name}"
@@ -4720,7 +4765,7 @@ cmd_targets() {
             local existing_port; existing_port=$(target_get "$name" "port")
             if [[ -n "$existing_port" ]]; then
                 log WARN "Target '${name}' already exists (port: ${existing_port})"
-                echo -e "  Use ${CYAN}pm targets set ${name} key=value${NC} to update"
+                echo -e "  Use ${CYAN}elm target set ${name} key=value${NC} to update"
                 return 1
             fi
 
@@ -4748,23 +4793,23 @@ cmd_targets() {
             elif [[ -z "$domain" ]]; then
                 echo ""
                 echo -e "  ${YELLOW}Set a domain:${NC}"
-                echo -e "  ${CYAN}pm targets set ${name} domain=${name}.enviouslabs.com${NC}"
+                echo -e "  ${CYAN}elm target set ${name} domain=${name}.enviouslabs.com${NC}"
             fi
 
             echo ""
-            echo -e "  Next: ${CYAN}pm deploy create --target ${name}${NC}"
+            echo -e "  Next: ${CYAN}elm deploy create --target ${name}${NC}"
             echo ""
             ;;
 
         set|update)
-            local name="${1:?Usage: pm targets set <name> key=value [key=value...]}"
+            local name="${1:?Usage: elm target set <name> key=value [key=value...]}"
             shift || true
             target_set "$name" "$@"
             log OK "Updated target: ${name}"
             ;;
 
         remove|rm|delete)
-            local name="${1:?Usage: pm targets remove <name>}"
+            local name="${1:?Usage: elm target remove <name>}"
             echo -e "  ${YELLOW}Remove target '${name}'? (y/N)${NC}"
             read -r confirm
             [[ "$confirm" != [yY] ]] && return
@@ -4775,7 +4820,7 @@ cmd_targets() {
             ;;
 
         show|info)
-            local name="${1:?Usage: pm targets show <name>}"
+            local name="${1:?Usage: elm target show <name>}"
             init_targets_file
             local raw; raw=$(jq --arg n "$name" '.[$n] // empty' "$TARGETS_FILE" 2>/dev/null)
             if [[ -z "$raw" || "$raw" == "null" ]]; then
@@ -4792,21 +4837,21 @@ cmd_targets() {
 
         help|*)
             echo ""
-            echo -e "  ${BOLD}pm targets${NC} — Multi-Server Management"
+            echo -e "  ${BOLD}elm target${NC} — Multi-Server Management"
             echo ""
-            echo -e "  ${CYAN}pm targets list${NC}                 Show all targets"
-            echo -e "  ${CYAN}pm targets add <n> [k=v...]${NC}  Register a new target"
-            echo -e "  ${CYAN}pm targets set <n> k=v ...${NC}   Update target settings"
-            echo -e "  ${CYAN}pm targets show <n>${NC}          Full target details"
-            echo -e "  ${CYAN}pm targets remove <n>${NC}        Remove a target"
-            echo -e "  ${CYAN}pm targets dns [n]${NC}           Show SRV record setup"
+            echo -e "  ${CYAN}elm target list${NC}                 Show all targets"
+            echo -e "  ${CYAN}elm target add <n> [k=v...]${NC}  Register a new target"
+            echo -e "  ${CYAN}elm target set <n> k=v ...${NC}   Update target settings"
+            echo -e "  ${CYAN}elm target show <n>${NC}          Full target details"
+            echo -e "  ${CYAN}elm target remove <n>${NC}        Remove a target"
+            echo -e "  ${CYAN}elm target dns [n]${NC}           Show SRV record setup"
             echo ""
             echo -e "  ${BOLD}Fields:${NC} domain, port, rcon_port, pack_dir, ram, cpu, description"
             echo ""
             echo -e "  ${BOLD}Example:${NC}"
-            echo "    pm targets add survival domain=survival.enviouslabs.com ram=8192"
-            echo "    pm targets add creative domain=creative.enviouslabs.com ram=4096"
-            echo "    pm targets dns                  # show SRV records for Cloudflare"
+            echo "    elm target add survival domain=survival.enviouslabs.com ram=8192"
+            echo "    elm target add creative domain=creative.enviouslabs.com ram=4096"
+            echo "    elm target dns                  # show SRV records for Cloudflare"
             echo ""
             ;;
     esac
@@ -4848,7 +4893,7 @@ cmd_deploy() {
 
             local port; port=$(target_get "$target_name" "port")
             [[ -z "$port" ]] && {
-                log FAIL "Target '${target_name}' has no port. Run: pm targets add ${target_name}"
+                log FAIL "Target '${target_name}' has no port. Run: elm target add ${target_name}"
                 exit 1
             }
 
@@ -4868,8 +4913,15 @@ cmd_deploy() {
             generate_compose
 
             log OK "Compose generated for ${target_name}"
+
+            # Auto-update DDNS if configured
+            if [[ "${ELM_DNS_AUTO_UPDATE:-false}" == "true" && -n "${ELM_DNS_PROVIDER:-}" ]]; then
+                echo ""
+                _dns_force_update
+            fi
+
             echo ""
-            echo -e "  Start with:  ${CYAN}pm start ${target_name}${NC}"
+            echo -e "  Start with:  ${CYAN}elm deploy start${NC}"
             if [[ -n "$CDN_DOMAIN" ]]; then
                 echo -e "  Pack URL:    ${CYAN}https://${CDN_DOMAIN}/${target_name}/pack.toml${NC}"
             else
@@ -4894,6 +4946,10 @@ cmd_deploy() {
 
         start|up)
             docker_start_target "$target_name"
+            # Auto-update DDNS if configured
+            if [[ "${ELM_DNS_AUTO_UPDATE:-false}" == "true" && -n "${ELM_DNS_PROVIDER:-}" ]]; then
+                _dns_force_update
+            fi
             ;;
 
         stop|down)
@@ -4909,7 +4965,7 @@ cmd_deploy() {
             ;;
 
         console|cmd|rcon)
-            local command="${1:?Usage: pm deploy console <command> --target <n>}"
+            local command="${1:?Usage: elm deploy console <command> --target <n>}"
             docker_send_command "$target_name" "$command"
             ;;
 
@@ -4972,7 +5028,7 @@ cmd_deploy() {
         caddy)
             header "Regenerating Caddyfile"
             generate_caddyfile
-            echo -e "  ${DIM}Apply changes with: pm deploy regenerate${NC}"
+            echo -e "  ${DIM}Apply changes with: elm deploy regenerate${NC}"
             echo ""
             ;;
 
@@ -5003,43 +5059,47 @@ cmd_deploy() {
             echo -e "  ${GREEN}${BOLD}Server is starting!${NC}"
             [[ -n "$domain" ]] && echo -e "  Game:    ${CYAN}${domain}${NC}"
             echo -e "  Pack:    ${CYAN}${cdn_url}/pack.toml${NC}"
-            echo -e "  Status:  ${CYAN}pm deploy status${NC}"
-            echo -e "  Logs:    ${CYAN}pm logs ${target_name}${NC}"
+            echo -e "  Status:  ${CYAN}elm deploy status${NC}"
+            echo -e "  Logs:    ${CYAN}elm deploy logs ${target_name}${NC}"
             echo ""
+            ;;
+
+        serve)
+            check_packwiz; check_pack_init
+            cmd_serve
             ;;
 
         help|*)
             echo ""
-            echo -e "  ${BOLD}pm deploy${NC} — Docker Server Management"
+            echo -e "  ${BOLD}elm deploy${NC} — Docker Server Management"
             echo ""
             echo -e "  All commands accept ${CYAN}--target <name>${NC} (auto-resolves if only one)"
-            echo -e "  ${DIM}Tip: Use shortcuts for common ops: pm start/stop/restart/logs <name>${NC}"
             echo ""
             echo -e "  ${BOLD}Setup:${NC}"
-            echo -e "  ${CYAN}pm deploy create${NC}           Publish pack + generate compose (auto-HTTPS)"
-            echo -e "  ${CYAN}pm deploy full${NC}             Pipeline: sync → publish → compose → start"
-            echo -e "  ${CYAN}pm deploy remove${NC}           Tear down a deployment (containers, volumes, registry)"
+            echo -e "  ${CYAN}elm deploy create${NC}          Publish pack + generate compose (auto-HTTPS)"
+            echo -e "  ${CYAN}elm deploy full${NC}            Pipeline: sync → publish → compose → start"
+            echo -e "  ${CYAN}elm deploy remove${NC}          Tear down deployment"
             echo ""
             echo -e "  ${BOLD}Server:${NC}"
-            echo -e "  ${CYAN}pm start <name>${NC}            Start the server"
-            echo -e "  ${CYAN}pm stop <name>${NC}             Stop the server"
-            echo -e "  ${CYAN}pm restart <name>${NC}          Restart the server"
-            echo -e "  ${CYAN}pm deploy status${NC}           All servers (or --target for one)"
-            echo -e "  ${CYAN}pm console <name> <cmd>${NC}    Send RCON command"
-            echo -e "  ${CYAN}pm logs <name>${NC}             Tail server logs"
-            echo -e "  ${CYAN}pm backup <name>${NC}           Backup server world"
-            echo -e "  ${CYAN}pm destroy <name>${NC}          Tear down deployment"
+            echo -e "  ${CYAN}elm deploy start${NC}           Start the server"
+            echo -e "  ${CYAN}elm deploy stop${NC}            Stop the server"
+            echo -e "  ${CYAN}elm deploy restart${NC}         Restart the server"
+            echo -e "  ${CYAN}elm deploy status${NC}          Show all servers"
+            echo -e "  ${CYAN}elm deploy console <cmd>${NC}   Send RCON command"
+            echo -e "  ${CYAN}elm deploy logs${NC}            Tail server logs"
+            echo -e "  ${CYAN}elm deploy backup${NC}          Backup server world"
             echo ""
             echo -e "  ${BOLD}Updates:${NC}"
-            echo -e "  ${CYAN}pm deploy push${NC}             Re-publish pack after changes"
-            echo -e "  ${CYAN}pm deploy mods${NC}             Download mod JARs into server/mods/"
-            echo -e "  ${CYAN}pm deploy regenerate${NC}       Rebuild docker-compose.yml + Caddyfile"
+            echo -e "  ${CYAN}elm deploy push${NC}            Re-publish pack after changes"
+            echo -e "  ${CYAN}elm deploy mods${NC}            Download mod JARs into server/mods/"
+            echo -e "  ${CYAN}elm deploy regen${NC}           Rebuild docker-compose.yml + Caddyfile"
+            echo -e "  ${CYAN}elm deploy serve${NC}           Local HTTP dev server"
             echo ""
             echo -e "  ${BOLD}Quick start:${NC}"
-            echo "    pm targets add survival domain=survival.enviouslabs.com ram=8192"
-            echo "    pm config edit   # set CDN_DOMAIN=pack.enviouslabs.com for HTTPS"
-            echo "    pm deploy create --target survival"
-            echo "    pm start survival"
+            echo "    elm target add survival domain=survival.enviouslabs.com ram=8192"
+            echo "    elm config edit   # set CDN_DOMAIN=pack.enviouslabs.com for HTTPS"
+            echo "    elm deploy create --target survival"
+            echo "    elm deploy start"
             echo ""
             echo -e "  ${DIM}Caddy handles HTTPS automatically when CDN_DOMAIN is set.${NC}"
             echo -e "  ${DIM}Without CDN_DOMAIN, pack files are served on http://server-ip:8080${NC}"
@@ -5062,7 +5122,7 @@ cmd_config() {
             if [[ -f "$LOCAL_CONF" ]]; then
                 echo -e "    ${GREEN}1.${NC} ${LOCAL_CONF} ${GREEN}(active)${NC}"
             else
-                echo -e "    ${DIM}1. ./packmanager.conf (not found)${NC}"
+                echo -e "    ${DIM}1. ./elm.conf (not found)${NC}"
             fi
             if [[ -f "$GLOBAL_CONF" ]]; then
                 echo -e "    ${GREEN}2.${NC} ${GLOBAL_CONF} ${GREEN}(active)${NC}"
@@ -5129,8 +5189,401 @@ cmd_config() {
             echo -e "  Global: ${CYAN}${GLOBAL_CONF}${NC}"
             echo -e "  Local:  ${CYAN}${LOCAL_CONF}${NC}"
             ;;
+        alias)
+            shift 2>/dev/null || true
+            cmd_aliases "$@"
+            ;;
         *)
-            echo -e "${RED}Usage: pm config [show|edit|path]${NC}"
+            echo -e "${RED}Usage: elm config [show|edit|path|alias]${NC}"
+            ;;
+    esac
+}
+
+# ============================================================================
+# API KEY MANAGEMENT
+# ============================================================================
+
+_key_set() {
+    local varname="$1" value="$2"
+    mkdir -p "$(dirname "$KEYS_FILE")"
+    touch "$KEYS_FILE"
+    chmod 600 "$KEYS_FILE"
+    # Remove existing line for this var, then append
+    grep -v "^${varname}=" "$KEYS_FILE" > "${KEYS_FILE}.tmp" 2>/dev/null || true
+    echo "${varname}=\"${value}\"" >> "${KEYS_FILE}.tmp"
+    mv "${KEYS_FILE}.tmp" "$KEYS_FILE"
+    chmod 600 "$KEYS_FILE"
+    # Export to current session
+    export "$varname"="$value"
+}
+
+_key_remove() {
+    local varname="$1"
+    if [[ -f "$KEYS_FILE" ]]; then
+        grep -v "^${varname}=" "$KEYS_FILE" > "${KEYS_FILE}.tmp" 2>/dev/null || true
+        mv "${KEYS_FILE}.tmp" "$KEYS_FILE"
+        chmod 600 "$KEYS_FILE"
+        unset "$varname" 2>/dev/null || true
+    fi
+}
+
+_key_show() {
+    local varname="$1" label="${2:-$1}"
+    local val="${!varname:-}"
+    if [[ -n "$val" ]]; then
+        local len=${#val}
+        if (( len > 8 )); then
+            local masked="${val:0:4}****${val: -4}"
+        else
+            local masked="****"
+        fi
+        echo -e "  ${GREEN}✓${NC} ${label}: ${masked}"
+    else
+        echo -e "  ${DIM}○ ${label}: not set${NC}"
+    fi
+}
+
+cmd_key() {
+    local subcmd="${1:-list}"
+    shift || true
+
+    case "$subcmd" in
+        curseforge|cf)
+            local key="${1:?Usage: elm key curseforge <API_KEY>}"
+            _key_set "CURSEFORGE_API_KEY" "$key"
+            echo -e "  ${GREEN}✓${NC} CurseForge API key saved"
+            ;;
+        noip)
+            local user="${1:?Usage: elm key noip <username> <password>}"
+            local pass="${2:?Usage: elm key noip <username> <password>}"
+            _key_set "NOIP_USERNAME" "$user"
+            _key_set "NOIP_PASSWORD" "$pass"
+            echo -e "  ${GREEN}✓${NC} No-IP credentials saved"
+            ;;
+        duckdns)
+            local token="${1:?Usage: elm key duckdns <TOKEN>}"
+            _key_set "DUCKDNS_TOKEN" "$token"
+            echo -e "  ${GREEN}✓${NC} DuckDNS token saved"
+            ;;
+        dynu)
+            local user="${1:?Usage: elm key dynu <username> <password>}"
+            local pass="${2:?Usage: elm key dynu <username> <password>}"
+            _key_set "DYNU_USERNAME" "$user"
+            _key_set "DYNU_PASSWORD" "$pass"
+            echo -e "  ${GREEN}✓${NC} Dynu credentials saved"
+            ;;
+        cloudflare)
+            local token="${1:?Usage: elm key cloudflare <API_TOKEN>}"
+            _key_set "CLOUDFLARE_API_TOKEN" "$token"
+            echo -e "  ${GREEN}✓${NC} Cloudflare API token saved"
+            ;;
+        list|ls)
+            header "Configured API Keys"
+            echo -e "  ${DIM}Keys stored in: ${KEYS_FILE}${NC}"
+            echo ""
+            _key_show "CURSEFORGE_API_KEY" "CurseForge"
+            _key_show "NOIP_USERNAME" "No-IP (user)"
+            _key_show "NOIP_PASSWORD" "No-IP (pass)"
+            _key_show "DUCKDNS_TOKEN" "DuckDNS"
+            _key_show "DYNU_USERNAME" "Dynu (user)"
+            _key_show "DYNU_PASSWORD" "Dynu (pass)"
+            _key_show "CLOUDFLARE_API_TOKEN" "Cloudflare"
+            echo ""
+            ;;
+        rm|remove)
+            local provider="${1:?Usage: elm key rm <provider>}"
+            case "$provider" in
+                curseforge|cf)
+                    _key_remove "CURSEFORGE_API_KEY"
+                    echo -e "  ${GREEN}✓${NC} CurseForge key removed"
+                    ;;
+                noip)
+                    _key_remove "NOIP_USERNAME"
+                    _key_remove "NOIP_PASSWORD"
+                    echo -e "  ${GREEN}✓${NC} No-IP credentials removed"
+                    ;;
+                duckdns)
+                    _key_remove "DUCKDNS_TOKEN"
+                    echo -e "  ${GREEN}✓${NC} DuckDNS token removed"
+                    ;;
+                dynu)
+                    _key_remove "DYNU_USERNAME"
+                    _key_remove "DYNU_PASSWORD"
+                    echo -e "  ${GREEN}✓${NC} Dynu credentials removed"
+                    ;;
+                cloudflare)
+                    _key_remove "CLOUDFLARE_API_TOKEN"
+                    echo -e "  ${GREEN}✓${NC} Cloudflare token removed"
+                    ;;
+                *)
+                    echo -e "${RED}Unknown provider: ${provider}${NC}"
+                    echo "  Providers: curseforge, noip, duckdns, dynu, cloudflare"
+                    ;;
+            esac
+            ;;
+        *)
+            echo -e "${BOLD}Usage:${NC} elm key <provider> <value>"
+            echo ""
+            echo "  elm key curseforge <API_KEY>       Set CurseForge API key"
+            echo "  elm key noip <user> <pass>         Set No-IP credentials"
+            echo "  elm key duckdns <TOKEN>             Set DuckDNS token"
+            echo "  elm key dynu <user> <pass>         Set Dynu credentials"
+            echo "  elm key cloudflare <API_TOKEN>     Set Cloudflare API token"
+            echo ""
+            echo "  elm key list                       Show configured keys"
+            echo "  elm key rm <provider>              Remove a key"
+            echo ""
+            echo -e "  ${DIM}Keys are stored in ${KEYS_FILE} (chmod 600)${NC}"
+            ;;
+    esac
+}
+
+# ============================================================================
+# DDNS PROVIDER SUPPORT
+# ============================================================================
+
+_dns_set() {
+    local varname="$1" value="$2"
+    mkdir -p "$(dirname "$DNS_CONF")"
+    touch "$DNS_CONF"
+    grep -v "^${varname}=" "$DNS_CONF" > "${DNS_CONF}.tmp" 2>/dev/null || true
+    echo "${varname}=\"${value}\"" >> "${DNS_CONF}.tmp"
+    mv "${DNS_CONF}.tmp" "$DNS_CONF"
+    export "$varname"="$value"
+}
+
+_ddns_update_noip() {
+    local hostname="$1" ip="$2"
+    local result
+    result=$(curl -s -u "${NOIP_USERNAME}:${NOIP_PASSWORD}" \
+        "http://dynupdate.no-ip.com/nic/update?hostname=${hostname}&myip=${ip}" 2>&1)
+    echo "$result"
+    [[ "$result" == *"good"* || "$result" == *"nochg"* ]]
+}
+
+_ddns_update_duckdns() {
+    local domain="$1" ip="$2"
+    local result
+    result=$(curl -s "https://www.duckdns.org/update?domains=${domain}&token=${DUCKDNS_TOKEN}&ip=${ip}" 2>&1)
+    echo "$result"
+    [[ "$result" == "OK" ]]
+}
+
+_ddns_update_dynu() {
+    local hostname="$1" ip="$2"
+    local result
+    result=$(curl -s -u "${DYNU_USERNAME}:${DYNU_PASSWORD}" \
+        "https://api.dynu.com/nic/update?hostname=${hostname}&myip=${ip}" 2>&1)
+    echo "$result"
+    [[ "$result" == *"good"* || "$result" == *"nochg"* ]]
+}
+
+_ddns_update_cloudflare() {
+    local hostname="$1" ip="$2"
+    local zone_id="${ELM_CF_ZONE_ID:-}"
+    local record_id="${ELM_CF_RECORD_ID:-}"
+
+    if [[ -z "$zone_id" || -z "$record_id" ]]; then
+        echo -e "  ${RED}Cloudflare requires zone_id and record_id.${NC}"
+        echo -e "  Run ${CYAN}elm dns set cloudflare${NC} to configure."
+        return 1
+    fi
+
+    local result
+    result=$(curl -s -X PUT \
+        "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${record_id}" \
+        -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+        -H "Content-Type: application/json" \
+        --data "{\"type\":\"A\",\"name\":\"${hostname}\",\"content\":\"${ip}\",\"ttl\":120}" 2>&1)
+    echo "$result" | jq -r '.success // "false"' 2>/dev/null
+    echo "$result" | jq -r '.success' 2>/dev/null | grep -q 'true'
+}
+
+_dns_detect_ip() {
+    # Prefer SERVER_VM_IP if set, otherwise auto-detect public IP
+    if [[ -n "${SERVER_VM_IP:-}" ]]; then
+        echo "$SERVER_VM_IP"
+    else
+        curl -s https://api.ipify.org 2>/dev/null || curl -s https://ifconfig.me 2>/dev/null || echo ""
+    fi
+}
+
+_dns_force_update() {
+    local provider="${ELM_DNS_PROVIDER:-}"
+    local hostname="${ELM_DNS_HOSTNAME:-}"
+
+    if [[ -z "$provider" ]]; then
+        echo -e "  ${RED}No DDNS provider configured.${NC}"
+        echo -e "  Run ${CYAN}elm dns set <provider>${NC} first."
+        return 1
+    fi
+
+    if [[ -z "$hostname" ]]; then
+        echo -e "  ${RED}No hostname configured.${NC}"
+        echo -e "  Run ${CYAN}elm dns set ${provider}${NC} first."
+        return 1
+    fi
+
+    local ip
+    ip=$(_dns_detect_ip)
+    if [[ -z "$ip" ]]; then
+        echo -e "  ${RED}Could not detect public IP.${NC}"
+        return 1
+    fi
+
+    echo -e "  Updating ${CYAN}${hostname}${NC} → ${BOLD}${ip}${NC} via ${provider}..."
+
+    case "$provider" in
+        noip)
+            if [[ -z "${NOIP_USERNAME:-}" || -z "${NOIP_PASSWORD:-}" ]]; then
+                echo -e "  ${RED}No-IP credentials not set. Run: elm key noip <user> <pass>${NC}"
+                return 1
+            fi
+            if _ddns_update_noip "$hostname" "$ip"; then
+                echo -e "  ${GREEN}✓${NC} DNS updated successfully"
+            else
+                echo -e "  ${RED}✗ DNS update failed${NC}"
+                return 1
+            fi
+            ;;
+        duckdns)
+            if [[ -z "${DUCKDNS_TOKEN:-}" ]]; then
+                echo -e "  ${RED}DuckDNS token not set. Run: elm key duckdns <TOKEN>${NC}"
+                return 1
+            fi
+            if _ddns_update_duckdns "$hostname" "$ip"; then
+                echo -e "  ${GREEN}✓${NC} DNS updated successfully"
+            else
+                echo -e "  ${RED}✗ DNS update failed${NC}"
+                return 1
+            fi
+            ;;
+        dynu)
+            if [[ -z "${DYNU_USERNAME:-}" || -z "${DYNU_PASSWORD:-}" ]]; then
+                echo -e "  ${RED}Dynu credentials not set. Run: elm key dynu <user> <pass>${NC}"
+                return 1
+            fi
+            if _ddns_update_dynu "$hostname" "$ip"; then
+                echo -e "  ${GREEN}✓${NC} DNS updated successfully"
+            else
+                echo -e "  ${RED}✗ DNS update failed${NC}"
+                return 1
+            fi
+            ;;
+        cloudflare)
+            if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+                echo -e "  ${RED}Cloudflare token not set. Run: elm key cloudflare <TOKEN>${NC}"
+                return 1
+            fi
+            if _ddns_update_cloudflare "$hostname" "$ip"; then
+                echo -e "  ${GREEN}✓${NC} DNS updated successfully"
+            else
+                echo -e "  ${RED}✗ DNS update failed${NC}"
+                return 1
+            fi
+            ;;
+        *)
+            echo -e "  ${RED}Unknown provider: ${provider}${NC}"
+            return 1
+            ;;
+    esac
+}
+
+cmd_dns() {
+    local subcmd="${1:-status}"
+    shift || true
+
+    case "$subcmd" in
+        set)
+            local provider="${1:?Usage: elm dns set <noip|duckdns|dynu|cloudflare>}"
+            shift || true
+
+            case "$provider" in
+                noip|duckdns|dynu|cloudflare)
+                    _dns_set "ELM_DNS_PROVIDER" "$provider"
+                    echo -e "  ${GREEN}✓${NC} DDNS provider set to: ${BOLD}${provider}${NC}"
+
+                    local hostname
+                    if [[ -n "${1:-}" ]]; then
+                        hostname="$1"
+                    else
+                        echo -n "  Hostname to update (e.g. myserver.ddns.net): "
+                        read -r hostname
+                    fi
+                    if [[ -n "$hostname" ]]; then
+                        _dns_set "ELM_DNS_HOSTNAME" "$hostname"
+                        echo -e "  ${GREEN}✓${NC} Hostname set to: ${BOLD}${hostname}${NC}"
+                    fi
+
+                    # Cloudflare needs extra config
+                    if [[ "$provider" == "cloudflare" ]]; then
+                        if [[ -n "${2:-}" ]]; then
+                            _dns_set "ELM_CF_ZONE_ID" "$2"
+                            _dns_set "ELM_CF_RECORD_ID" "${3:-}"
+                        else
+                            echo -n "  Cloudflare Zone ID: "
+                            read -r zone_id
+                            echo -n "  Cloudflare DNS Record ID: "
+                            read -r record_id
+                            [[ -n "$zone_id" ]] && _dns_set "ELM_CF_ZONE_ID" "$zone_id"
+                            [[ -n "$record_id" ]] && _dns_set "ELM_CF_RECORD_ID" "$record_id"
+                        fi
+                    fi
+
+                    echo ""
+                    echo -e "  ${DIM}Make sure your API key is set: elm key ${provider} ...${NC}"
+                    echo -e "  ${DIM}Enable auto-update on deploy:  elm dns auto on${NC}"
+                    ;;
+                *)
+                    echo -e "${RED}Unknown provider: ${provider}${NC}"
+                    echo "  Supported: noip, duckdns, dynu, cloudflare"
+                    ;;
+            esac
+            ;;
+        update)
+            header "DDNS Update"
+            _dns_force_update
+            ;;
+        status)
+            header "DNS Configuration"
+            echo -e "  Provider:    ${ELM_DNS_PROVIDER:-${DIM}not set${NC}}"
+            echo -e "  Hostname:    ${ELM_DNS_HOSTNAME:-${DIM}not set${NC}}"
+            echo -e "  Auto-update: ${ELM_DNS_AUTO_UPDATE:-false}"
+            echo -e "  Server IP:   ${SERVER_VM_IP:-${DIM}auto-detect${NC}}"
+            if [[ "${ELM_DNS_PROVIDER:-}" == "cloudflare" ]]; then
+                echo -e "  CF Zone ID:  ${ELM_CF_ZONE_ID:-${DIM}not set${NC}}"
+                echo -e "  CF Record:   ${ELM_CF_RECORD_ID:-${DIM}not set${NC}}"
+            fi
+            echo ""
+            echo -e "  ${DIM}Config: ${DNS_CONF}${NC}"
+            echo ""
+            ;;
+        auto)
+            local toggle="${1:-}"
+            case "$toggle" in
+                on)
+                    _dns_set "ELM_DNS_AUTO_UPDATE" "true"
+                    echo -e "  ${GREEN}✓${NC} Auto DDNS update enabled (triggers on deploy create/start)"
+                    ;;
+                off)
+                    _dns_set "ELM_DNS_AUTO_UPDATE" "false"
+                    echo -e "  ${GREEN}✓${NC} Auto DDNS update disabled"
+                    ;;
+                *)
+                    echo -e "  Auto-update: ${ELM_DNS_AUTO_UPDATE:-false}"
+                    echo -e "  ${DIM}Usage: elm dns auto [on|off]${NC}"
+                    ;;
+            esac
+            ;;
+        *)
+            echo -e "${BOLD}Usage:${NC} elm dns <set|update|status|auto>"
+            echo ""
+            echo "  elm dns set <provider> [hostname]   Configure DDNS provider"
+            echo "  elm dns update                      Force DNS update now"
+            echo "  elm dns status                      Show DNS configuration"
+            echo "  elm dns auto [on|off]               Toggle auto-update on deploy"
+            echo ""
+            echo "  Providers: noip, duckdns, dynu, cloudflare"
             ;;
     esac
 }
@@ -5138,20 +5591,26 @@ cmd_config() {
 # ============================================================================
 # SELF-UPDATE (GitHub)
 # ============================================================================
-# Downloads the latest version of PackManager files from a GitHub repo.
-# Requires PM_GITHUB_REPO to be set (e.g. "yourusername/envious-mc").
-# Uses raw.githubusercontent.com to fetch files from PM_GITHUB_BRANCH.
+# Downloads the latest version of ELM files from a GitHub repo.
+# Requires ELM_GITHUB_REPO to be set (e.g. "yourusername/envious-mc").
+# Uses raw.githubusercontent.com to fetch files from ELM_GITHUB_BRANCH.
 # Backs up existing files before overwriting.
 
 cmd_self_update() {
+    # Handle --check flag (replaces old update-status command)
+    if [[ "${1:-}" == "--check" ]]; then
+        cmd_self_update_status
+        return
+    fi
+
     header "Self-Update"
 
     # Validate config
-    if [[ -z "$PM_GITHUB_REPO" ]]; then
-        echo -e "  ${RED}PM_GITHUB_REPO not set.${NC}"
+    if [[ -z "$ELM_GITHUB_REPO" ]]; then
+        echo -e "  ${RED}ELM_GITHUB_REPO not set.${NC}"
         echo ""
-        echo -e "  Set it in your config (${CYAN}pm config edit${NC}):"
-        echo -e "    ${CYAN}PM_GITHUB_REPO=\"yourusername/envious-mc\"${NC}"
+        echo -e "  Set it in your config (${CYAN}elm config edit${NC}):"
+        echo -e "    ${CYAN}ELM_GITHUB_REPO=\"yourusername/envious-mc\"${NC}"
         echo ""
         exit 1
     fi
@@ -5162,33 +5621,33 @@ cmd_self_update() {
     fi
 
     # Sanitize: strip trailing/leading slashes and whitespace
-    local repo_clean="${PM_GITHUB_REPO#/}"; repo_clean="${repo_clean%/}"; repo_clean="$(echo "$repo_clean" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    local branch_clean="${PM_GITHUB_BRANCH#/}"; branch_clean="${branch_clean%/}"; branch_clean="$(echo "$branch_clean" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    local repo_clean="${ELM_GITHUB_REPO#/}"; repo_clean="${repo_clean%/}"; repo_clean="$(echo "$repo_clean" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    local branch_clean="${ELM_GITHUB_BRANCH#/}"; branch_clean="${branch_clean%/}"; branch_clean="$(echo "$branch_clean" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     local path_clean=""
-    if [[ -n "$PM_GITHUB_PATH" ]]; then
-        path_clean="${PM_GITHUB_PATH#/}"; path_clean="${path_clean%/}"; path_clean="$(echo "$path_clean" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ -n "$ELM_GITHUB_PATH" ]]; then
+        path_clean="${ELM_GITHUB_PATH#/}"; path_clean="${path_clean%/}"; path_clean="$(echo "$path_clean" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     fi
 
     # Build base URL: repo/branch[/path]
     local raw_base="https://raw.githubusercontent.com/${repo_clean}/${branch_clean}"
     [[ -n "$path_clean" ]] && raw_base="${raw_base}/${path_clean}"
     local install_dir="${HOME}/.local/bin"
-    local config_dir="${HOME}/.config/packmanager"
+    local config_dir="${HOME}/.config/elm"
     local backup_dir="${config_dir}/backups/$(date +%Y%m%d_%H%M%S)"
 
     # --- Check connectivity & repo existence ---
     log INFO "Checking ${repo_clean} (branch: ${branch_clean})..."
 
     local http_code
-    http_code=$(curl -sL -o /dev/null -w "%{http_code}" "${raw_base}/packmanager.sh" 2>/dev/null || echo "000")
+    http_code=$(curl -sL -o /dev/null -w "%{http_code}" "${raw_base}/elm.sh" 2>/dev/null || echo "000")
 
     if [[ "$http_code" == "404" ]]; then
         echo -e "  ${RED}Repository or branch not found.${NC}"
-        echo -e "  Checked: ${DIM}${raw_base}/packmanager.sh${NC}"
+        echo -e "  Checked: ${DIM}${raw_base}/elm.sh${NC}"
         echo ""
         echo -e "  Verify:"
-        echo -e "    • PM_GITHUB_REPO is correct: ${CYAN}${PM_GITHUB_REPO}${NC}"
-        echo -e "    • PM_GITHUB_BRANCH is correct: ${CYAN}${PM_GITHUB_BRANCH}${NC}"
+        echo -e "    • ELM_GITHUB_REPO is correct: ${CYAN}${ELM_GITHUB_REPO}${NC}"
+        echo -e "    • ELM_GITHUB_BRANCH is correct: ${CYAN}${ELM_GITHUB_BRANCH}${NC}"
         echo -e "    • The repo is accessible (public, or use a token)"
         exit 1
     elif [[ "$http_code" == "000" ]]; then
@@ -5226,7 +5685,7 @@ cmd_self_update() {
     local tmp_dir; tmp_dir=$(mktemp -d)
     trap "rm -rf '$tmp_dir'" EXIT
 
-    local files_to_update=($PM_UPDATE_FILES)
+    local files_to_update=($ELM_UPDATE_FILES)
     local downloaded=0
     local skipped=0
 
@@ -5264,15 +5723,15 @@ cmd_self_update() {
     log INFO "Backing up current files → ${backup_dir}/"
     mkdir -p "$backup_dir"
 
-    # Backup pm binary
-    if [[ -f "${install_dir}/pm" ]]; then
-        cp "${install_dir}/pm" "${backup_dir}/packmanager.sh.bak"
-        log OK "Backed up pm binary"
+    # Backup elm binary
+    if [[ -f "${install_dir}/elm" ]]; then
+        cp "${install_dir}/elm" "${backup_dir}/elm.sh.bak"
+        log OK "Backed up elm binary"
     fi
 
     # Backup install.sh if it exists somewhere known
     local script_dir=""
-    # Try to find where the original install was (check if pm is a symlink or has a comment)
+    # Try to find where the original install was (check if elm is a symlink or has a comment)
     if [[ -f "${config_dir}/install.sh" ]]; then
         cp "${config_dir}/install.sh" "${backup_dir}/install.sh.bak"
     fi
@@ -5281,21 +5740,21 @@ cmd_self_update() {
     separator
     log INFO "Applying updates..."
 
-    # 1. Update the pm binary (packmanager.sh)
-    #    If pm is a symlink, update the file it points at (the source repo copy)
+    # 1. Update the elm binary (elm.sh)
+    #    If elm is a symlink, update the file it points at (the source repo copy)
     #    Otherwise, overwrite the binary directly
-    if [[ -f "${tmp_dir}/packmanager.sh" ]]; then
-        local pm_target="${install_dir}/pm"
-        if [[ -L "$pm_target" ]]; then
+    if [[ -f "${tmp_dir}/elm.sh" ]]; then
+        local elm_target="${install_dir}/elm"
+        if [[ -L "$elm_target" ]]; then
             local link_dest
-            link_dest=$(readlink -f "$pm_target")
-            cp "${tmp_dir}/packmanager.sh" "$link_dest"
+            link_dest=$(readlink -f "$elm_target")
+            cp "${tmp_dir}/elm.sh" "$link_dest"
             chmod +x "$link_dest"
-            log OK "Updated source → ${link_dest} (symlinked from pm)"
+            log OK "Updated source → ${link_dest} (symlinked from elm)"
         else
-            cp "${tmp_dir}/packmanager.sh" "$pm_target"
-            chmod +x "$pm_target"
-            log OK "Updated pm → ${pm_target}"
+            cp "${tmp_dir}/elm.sh" "$elm_target"
+            chmod +x "$elm_target"
+            log OK "Updated elm → ${elm_target}"
         fi
     fi
 
@@ -5307,11 +5766,11 @@ cmd_self_update() {
     fi
 
     # 3. Update default config template (NOT the user's active config)
-    if [[ -f "${tmp_dir}/packmanager.conf" ]]; then
-        cp "${tmp_dir}/packmanager.conf" "${config_dir}/packmanager.conf.default"
-        log OK "Updated config template → packmanager.conf.default"
+    if [[ -f "${tmp_dir}/elm.conf" ]]; then
+        cp "${tmp_dir}/elm.conf" "${config_dir}/elm.conf.default"
+        log OK "Updated config template → elm.conf.default"
         echo -e "    ${DIM}Your active config was NOT overwritten.${NC}"
-        echo -e "    ${DIM}Compare with: diff ${config_dir}/packmanager.conf ${config_dir}/packmanager.conf.default${NC}"
+        echo -e "    ${DIM}Compare with: diff ${config_dir}/elm.conf ${config_dir}/elm.conf.default${NC}"
     fi
 
     # 4. Update mods.txt template (only if no local mods.txt exists in the pack dir)
@@ -5348,26 +5807,26 @@ cmd_self_update() {
     fi
     echo ""
     echo -e "  ${DIM}If something broke, restore with:${NC}"
-    echo -e "  ${CYAN}cp ${backup_dir}/packmanager.sh.bak ${install_dir}/pm${NC}"
+    echo -e "  ${CYAN}cp ${backup_dir}/elm.sh.bak ${install_dir}/elm${NC}"
     echo ""
 }
 
 cmd_self_update_status() {
     header "Update Status"
 
-    if [[ -z "$PM_GITHUB_REPO" ]]; then
-        echo -e "  ${YELLOW}PM_GITHUB_REPO not configured.${NC}"
-        echo -e "  Set it in your config: ${CYAN}pm config edit${NC}"
+    if [[ -z "$ELM_GITHUB_REPO" ]]; then
+        echo -e "  ${YELLOW}ELM_GITHUB_REPO not configured.${NC}"
+        echo -e "  Set it in your config: ${CYAN}elm config edit${NC}"
         echo ""
         return
     fi
 
-    local config_dir="${HOME}/.config/packmanager"
+    local config_dir="${HOME}/.config/elm"
     local local_sha_file="${config_dir}/.last_update_sha"
 
     # Sanitize repo/branch
-    local repo_clean="${PM_GITHUB_REPO#/}"; repo_clean="${repo_clean%/}"; repo_clean="$(echo "$repo_clean" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    local branch_clean="${PM_GITHUB_BRANCH#/}"; branch_clean="${branch_clean%/}"; branch_clean="$(echo "$branch_clean" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    local repo_clean="${ELM_GITHUB_REPO#/}"; repo_clean="${repo_clean%/}"; repo_clean="$(echo "$repo_clean" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    local branch_clean="${ELM_GITHUB_BRANCH#/}"; branch_clean="${branch_clean%/}"; branch_clean="$(echo "$branch_clean" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 
     echo -e "  Repo:    ${CYAN}${repo_clean}${NC}"
     echo -e "  Branch:  ${branch_clean}"
@@ -5394,10 +5853,10 @@ cmd_self_update_status() {
             else
                 echo -e "  Status:  ${YELLOW}Update available${NC}"
                 echo ""
-                echo -e "  Run: ${CYAN}pm self-update${NC}"
+                echo -e "  Run: ${CYAN}elm update${NC}"
             fi
         else
-            echo -e "  Status:  ${YELLOW}Unknown (run pm self-update to sync)${NC}"
+            echo -e "  Status:  ${YELLOW}Unknown (run elm update to sync)${NC}"
         fi
     else
         echo -e "  Remote:  ${DIM}could not check (network/rate limit)${NC}"
@@ -5412,89 +5871,66 @@ cmd_self_update_status() {
 cmd_help() {
     cat << 'HELP'
 
-  PackManager v4 — PackWiz + Docker Compose Server Management
+  ELM v1.0.0 — EnviousLabs Minecraft CLI
 
-  PACK MANAGEMENT:
-    init                           Initialize pack.toml + mods.txt
-    organize [dir]                 Sort flat dir into pack/ server/ cdn/
-    sync                           Install all mods from mods.txt
-    update                         Update all non-pinned mods
-    add [slug...]                  Add mods (no args = interactive)
-    add file:/path/to/mod.jar      Add a single JAR as self-hosted mod
-    remove <slug>                  Remove a mod from pack + mods.txt
-    list [--side <s>] [--version]  Show installed mods (--native for raw packwiz)
-    status                         Pack health overview
-    deps                           Show auto-pulled dependencies
-    search <query>                 Search Modrinth/CurseForge by name/slug
-    stage                          Batch-match JARs in staging/ vs unresolved
-    refresh [--build]              Refresh index (--build for distribution)
-    serve                          Local HTTP dev server (localhost:8080)
+  CORE PACK:
+    elm init                       Initialize pack.toml + mods.txt
+    elm add [slug...]              Add mods (no args = interactive)
+    elm add file:/path/to.jar      Add JAR as self-hosted mod
+    elm add --stage                Batch-match JARs in staging/
+    elm add --import <zip>         Import CurseForge modpack .zip
+    elm rm <slug>                  Remove a mod
+    elm ls [--side s] [--deps]     List mods (--deps for dependencies)
+    elm sync                       Install all mods from mods.txt
+    elm up                         Update non-pinned mods
+    elm search <query>             Search Modrinth/CurseForge
+    elm search --open <slug>       Open mod page in browser
+    elm pin/unpin <slug>           Pin/unpin mod version
+    elm export [mr|cf|md]          Export pack (.mrpack, .zip, or markdown)
 
-  PACKWIZ NATIVE:
-    pin <slug>                     Pin mod version (prevent updates)
-    unpin <slug>                   Unpin (allow updates again)
-    migrate <minecraft|loader> [v] Migrate MC or loader version
-    settings versions [v1,v2,...]  View/set acceptable game versions
-    import <zip>                   Import a CurseForge modpack .zip
-    detect                         Detect installed JARs on CurseForge
-    open <slug>                    Open mod page on Modrinth/CurseForge
-    export [mr|cf] [client|server] Export pack (.mrpack or .zip)
-    markdown                       Generate mod list as Markdown
+  SERVER (all via deploy, use --target <name>):
+    elm deploy create              Publish + generate compose (auto-HTTPS)
+    elm deploy full                Pipeline: sync → publish → compose → start
+    elm deploy start/stop/restart  Control server
+    elm deploy status              Show all servers
+    elm deploy console <cmd>       Send RCON command
+    elm deploy logs                Tail server logs
+    elm deploy backup              Backup server world
+    elm deploy push                Re-publish pack after changes
+    elm deploy mods                Download mod JARs into server/mods/
+    elm deploy regen               Rebuild docker-compose.yml + Caddyfile
+    elm deploy serve               Local HTTP dev server
+    elm deploy remove              Tear down deployment
+    elm target [list|add|set|show|rm|dns]   Manage server targets
 
-  VERIFICATION:
-    verify                         Full audit: mods.txt ↔ installed .pw.toml
-    diff                           Side-by-side modlist vs packwiz state
-    doctor                         All checks + verify + refresh
-    netcheck                       Test pack serving: local → LAN → public
-    resolve                        Re-attempt all unresolved mods (auto mode)
-    resolve -i                     Re-attempt interactively (pick from search)
-    resolve <slug>                 Re-attempt a single unresolved mod
-    aliases list                   Show all tracked mod aliases
-    aliases remove <slug>          Remove alias (option to uninstall mod)
-    aliases clear                  Clear all alias tracking
-    unresolved list                Show mods pending URL/JAR binding
-    unresolved search [slug]       Search APIs to find & resolve unresolved mods
-    unresolved resolve <slug> <u>  Bind a URL/local path and move to mods.txt
-    unresolved edit                Open unresolved.txt in editor
-    unresolved remove <slug>       Remove from unresolved list
+  DIAGNOSTICS:
+    elm check [--diff] [--refresh] Full audit (status + doctor + verify)
+    elm net                        Network check: can clients reach pack?
 
-  SERVER SHORTCUTS (name auto-resolves if only one target):
-    start <name>                   Start a server
-    stop <name>                    Stop a server
-    restart <name>                 Restart a server
-    logs <name>                    Tail server logs
-    console <name> <cmd>           Send RCON command
-    backup <name>                  Backup server world
-    destroy <name>                 Tear down deployment (containers + data)
+  CONFIG & KEYS:
+    elm config [show|edit|path]    Manage configuration
+    elm config alias               Manage mod aliases
+    elm key <provider> <value>     Set API key (copy-paste friendly)
+    elm key list                   Show configured keys (masked)
+    elm key rm <provider>          Remove a key
 
-  SERVER MANAGEMENT (Docker Compose — accept --target <n>):
-    targets list                   Show all server targets
-    targets add <n> [k=v...]    Register a new target (auto-assigns port)
-    targets set <n> k=v ...     Update target settings
-    targets show <n>            Full target details
-    targets dns [n]                Show SRV records for Cloudflare
-    targets remove <n>          Remove a target
-    deploy create               Generate compose service for target
-    deploy full                    Pipeline: sync → publish → create → start
-    deploy push                    Publish pack for auto-update
-    deploy status                  All servers (or --target for one)
-    deploy remove                  Tear down deployment (containers, volumes)
-    deploy cdn                     Publish pack + JARs to cdn/ directory
-    deploy mods                    Download mod JARs into server/mods/
-    deploy regenerate              Rebuild docker-compose.yml + Caddyfile
+  DNS (DDNS auto-update on deploy):
+    elm dns set <provider> [host]  Configure DDNS (noip/duckdns/dynu/cloudflare)
+    elm dns update                 Force DNS update now
+    elm dns status                 Show DNS configuration
+    elm dns auto [on|off]          Toggle auto-update on deploy
 
-  CDN (Caddy — auto-HTTPS):
-    targets set <n> cdn_domain=x   Set per-target CDN domain
-    deploy cdn --target <n>        Publish pack files + self-hosted JARs
-    deploy mods [--target <n>]     Download mod JARs into server/mods/
+  SELF-UPDATE:
+    elm update                     Download latest from GitHub
+    elm update --check             Check if updates are available
 
-  CONFIG:
-    config show                    Print active configuration
-    config edit                    Open config in editor
-    config path                    Show config file locations
-
-  DANGER ZONE:
-    nuke                           Wipe entire setup (pack, server, cdn, configs)
+  MAINTENANCE:
+    elm resolve                    Re-attempt unresolved mods (auto)
+    elm resolve -i                 Re-attempt interactively
+    elm resolve list/search/edit   Manage unresolved mods
+    elm organize [dir]             Sort flat dir into pack/ server/ cdn/
+    elm migrate <mc|loader> [ver]  Migrate version
+    elm nuke                       Eagle 500KG — wipe everything
 
   MODS.TXT FORMAT:
     tinkers-construct              Auto-detect (Modrinth → CurseForge)
@@ -5502,43 +5938,24 @@ cmd_help() {
     cf:journeymap                  CurseForge only
     url:https://dl.com/mod.jar     Direct download URL
     local:my-custom-mod            Local JAR from LOCAL_MODS_DIR
-    file:/path/to/mod.jar          Import JAR file directly (auto-hashes)
-    !jei                           Pinned (skip updates in pm update)
-    https://modrinth.com/mod/slug  Full Modrinth URL
-    https://curseforge.com/...     Full CurseForge URL (page or file)
-
-  SELF-UPDATE:
-    self-update                    Download latest from GitHub
-    update-status                  Check if updates are available
+    !jei                           Pinned (skip in elm up)
 
   EXAMPLES:
-    pm add tinkers-construct mekanism ae2 ars-nouveau
-    pm add cf:journeymap mr:jade
-    pm add url:https://example.com/custom-mod.jar
-    pm add local:my-fork                       # from LOCAL_MODS_DIR
-    pm add file:~/Downloads/my-mod-1.0.jar     # import JAR directly
-    pm add file:/path/to/mod.jar --slug name   # import with custom slug
-    pm stage                                   # match staging/ JARs → unresolved
-    pm list --side server                      # server-only mods
-    pm export mr server                        # Modrinth server pack
-    pm pin jei                                 # lock JEI version
-    pm migrate minecraft 1.21.1                # version migration
-    pm settings versions 1.20,1.20.1,1.20.2   # accept multiple MC versions
-    pm import ~/Downloads/modpack.zip          # import CurseForge pack
-    pm targets add survival domain=survival.enviouslabs.com ram=8192
-    pm targets add creative domain=creative.enviouslabs.com ram=4096
-    pm deploy create --target survival     # generates compose
-    pm deploy create --target creative
-    pm start survival                      # docker compose up
-    pm deploy status                       # all servers at a glance
-    pm destroy survival                    # tear down deployment
-    pm targets dns                         # SRV records for Cloudflare
-    pm targets set survival cdn_domain=pack.enviouslabs.com
-    pm deploy cdn --target survival    # publish pack to cdn/survival/
-    pm deploy regenerate               # rebuild docker-compose.yml + Caddyfile
-    pm organize                        # sort flat dir → pack/ server/ cdn/
-    cd pack && pm sync                 # auto-publishes to cdn/
-    pm nuke                            # ⚠ Eagle 500KG — wipe everything
+    elm add tinkers-construct mekanism ae2
+    elm add cf:journeymap mr:jade
+    elm add file:~/Downloads/mod.jar --slug name
+    elm ls --side server
+    elm export mr server
+    elm key curseforge YOUR_API_KEY
+    elm key noip myuser mypass
+    elm dns set noip myserver.ddns.net
+    elm dns auto on
+    elm target add survival domain=survival.enviouslabs.com ram=8192
+    elm deploy create --target survival
+    elm deploy start
+    elm deploy status
+    elm check --diff
+    elm nuke
 
 HELP
 }
@@ -5596,9 +6013,9 @@ cmd_nuke() {
     fi
 
     # Config
-    if [[ -f "${parent}/packmanager.conf" ]]; then
-        targets+=("${parent}/packmanager.conf")
-        target_labels+=("packmanager.conf")
+    if [[ -f "${parent}/elm.conf" ]]; then
+        targets+=("${parent}/elm.conf")
+        target_labels+=("elm.conf")
     fi
 
     # Logs
@@ -5621,7 +6038,7 @@ cmd_nuke() {
     echo -e "  ${YELLOW}${BOLD}⚠  INCOMING ORBITAL PAYLOAD  ⚠${NC}"
     echo ""
     echo -e "  ${DIM}Super Earth High Command has received your request to deploy${NC}"
-    echo -e "  ${DIM}an Eagle 500KG bomb on your entire PackManager installation.${NC}"
+    echo -e "  ${DIM}an Eagle 500KG bomb on your entire ELM installation.${NC}"
     echo ""
     echo -e "  ${BOLD}The following will be permanently destroyed:${NC}"
     echo ""
@@ -5719,7 +6136,7 @@ cmd_nuke() {
             echo -e "  ${RED}${BOLD}WRONG INPUT!${NC} Expected $(_dir_to_arrow "${STRATAGEM[$step]}"), got $(_dir_to_arrow "$_SDIR")"
             echo ""
             echo -e "  ${GREEN}${BOLD}Eagle airstrike cancelled.${NC} Your modpack survives."
-            echo -e "  ${DIM}Even Helldivers mess up sometimes. Run ${CYAN}pm nuke${NC} ${DIM}to try again.${NC}"
+            echo -e "  ${DIM}Even Helldivers mess up sometimes. Run ${CYAN}elm nuke${NC} ${DIM}to try again.${NC}"
             return 0
         fi
     done
@@ -5757,7 +6174,7 @@ cmd_nuke() {
     echo -e "  ${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     echo -e "  ${DIM}How'd it feel, Helldiver?${NC}"
-    echo -e "  ${DIM}Your installation has been wiped. Run ${CYAN}pm init${NC} ${DIM}to start fresh.${NC}"
+    echo -e "  ${DIM}Your installation has been wiped. Run ${CYAN}elm init${NC} ${DIM}to start fresh.${NC}"
     echo -e "  ${DIM}For Super Earth. For democracy.${NC}"
     echo ""
 }
@@ -5770,67 +6187,43 @@ main() {
     local cmd="${1:-help}"; shift || true
 
     case "$cmd" in
-        # Pack management
+        # Core pack management
         init)              cmd_init ;;
-        organize|org)      cmd_organize "${1:-}" ;;
-        sync)              cmd_sync ;;
-        update|up)         cmd_update ;;
         add|a)             cmd_add "$@" ;;
-        remove|rm)         cmd_remove "${1:-}" ;;
-        list|ls)           cmd_list "$@" ;;
-        status|st)         cmd_status ;;
-        deps)              cmd_deps ;;
-        search|s)          cmd_search "${1:-}" ;;
-        export|ex)         cmd_export "${1:-modrinth}" "${2:-}" ;;
-        serve)             cmd_serve ;;
-        refresh)           cmd_refresh "${1:-}" ;;
-
-        # Packwiz native
+        rm)                cmd_remove "${1:-}" ;;
+        ls)                cmd_list "$@" ;;
+        sync)              cmd_sync ;;
+        up)                cmd_update ;;
+        search|s)          cmd_search "$@" ;;
         pin)               cmd_pin "${1:-}" ;;
         unpin)             cmd_unpin "${1:-}" ;;
-        migrate|mig)       cmd_migrate "$@" ;;
-        settings|set)      cmd_settings "$@" ;;
-        import)            cmd_cf_import "${1:-}" ;;
-        stage|staging)     cmd_stage ;;
-        detect)            cmd_detect ;;
-        open)              cmd_open "${1:-}" ;;
-        markdown|md)       cmd_markdown ;;
+        export|ex)         cmd_export "$@" ;;
 
-        # Verification & aliases
-        doctor|doc)        cmd_doctor ;;
-        verify|vf)         cmd_verify ;;
-        diff|df)           cmd_diff ;;
-        netcheck|net|nc)   cmd_netcheck ;;
-        resolve|res)       cmd_resolve "$@" ;;
-        aliases|al)        cmd_aliases "$@" ;;
-        unresolved|ur)     cmd_unresolved "$@" ;;
+        # Server & deploy
+        deploy)            cmd_deploy "$@" ;;
+        target|t)          cmd_targets "$@" ;;
 
-        # Server management
-        targets|t)         cmd_targets "$@" ;;
-        deploy|d)          cmd_deploy "$@" ;;
+        # Diagnostics
+        check)             cmd_check "$@" ;;
+        net)               cmd_netcheck ;;
+
+        # Config, keys & DNS
         config|cfg)        cmd_config "$@" ;;
-        publish)           publish_pack ;;
-
-        # Server shortcuts — pm start <name> instead of pm deploy start --target <name>
-        start)             cmd_deploy start --target "${1:-}" ;;
-        stop)              cmd_deploy stop --target "${1:-}" ;;
-        restart)           cmd_deploy restart --target "${1:-}" ;;
-        kill)              cmd_deploy kill --target "${1:-}" ;;
-        logs)              cmd_deploy logs --target "${1:-}" ;;
-        console|rcon)      cmd_deploy console "${2:-}" --target "${1:-}" ;;
-        backup)            cmd_deploy backup --target "${1:-}" ;;
-        destroy)           cmd_deploy remove --target "${1:-}" ;;
+        key)               cmd_key "$@" ;;
+        dns)               cmd_dns "$@" ;;
 
         # Self-update
-        self-update|selfupdate|su)  cmd_self_update ;;
-        update-status|us)           cmd_self_update_status ;;
+        update)            cmd_self_update "$@" ;;
 
-        # Nuclear option
+        # Maintenance
         nuke)              cmd_nuke ;;
+        resolve|res)       cmd_resolve "$@" ;;
+        organize)          cmd_organize "${1:-}" ;;
+        migrate|mig)       cmd_migrate "$@" ;;
 
         # Meta
         help|--help|-h)    cmd_help ;;
-        --version|-v)      echo "PackManager v4.1.0" ;;
+        --version|-v)      echo "ELM v1.0.0" ;;
         *)                 echo -e "${RED}Unknown: ${cmd}${NC}"; cmd_help; exit 1 ;;
     esac
 }
