@@ -5485,6 +5485,9 @@ cmd_help() {
     config edit                    Open config in editor
     config path                    Show config file locations
 
+  DANGER ZONE:
+    nuke                           Wipe entire setup (pack, server, cdn, configs)
+
   MODS.TXT FORMAT:
     tinkers-construct              Auto-detect (Modrinth → CurseForge)
     mr:ars-nouveau                 Modrinth only
@@ -5527,8 +5530,228 @@ cmd_help() {
     pm deploy regenerate               # rebuild docker-compose.yml + Caddyfile
     pm organize                        # sort flat dir → pack/ server/ cdn/
     cd pack && pm sync                 # auto-publishes to cdn/
+    pm nuke                            # ⚠ Eagle 500KG — wipe everything
 
 HELP
+}
+
+# ============================================================================
+# NUKE — Wipe everything and start fresh
+# ============================================================================
+
+cmd_nuke() {
+    local parent
+    parent=$(dirname "$PACK_DIR")
+
+    # ── Inventory what exists ────────────────────────────────────────
+    local -a targets=()
+    local -a target_labels=()
+
+    # Pack directory
+    if [[ -d "$PACK_DIR" ]]; then
+        targets+=("$PACK_DIR")
+        local mod_count=0
+        [[ -d "${PACK_DIR}/mods" ]] && mod_count=$(find "${PACK_DIR}/mods" -name "*.pw.toml" 2>/dev/null | wc -l)
+        target_labels+=("pack/          pack.toml, index.toml, ${mod_count} mod .pw.tomls, mods.txt, unresolved.txt")
+    fi
+
+    # Server directory
+    if [[ -d "${parent}/server" ]]; then
+        targets+=("${parent}/server")
+        target_labels+=("server/        server.properties, mods/, docker volumes, world data")
+    fi
+
+    # CDN directory
+    if [[ -d "${parent}/cdn" ]]; then
+        targets+=("${parent}/cdn")
+        target_labels+=("cdn/           Caddyfile, published packs, self-hosted JARs")
+    fi
+
+    # Staging directory
+    if [[ -d "${parent}/staging" ]]; then
+        targets+=("${parent}/staging")
+        target_labels+=("staging/       Staged JAR files awaiting import")
+    fi
+
+    # Docker compose
+    local compose_file="${parent}/docker-compose.yml"
+    if [[ -f "$compose_file" ]]; then
+        targets+=("$compose_file")
+        target_labels+=("docker-compose.yml")
+    fi
+
+    # Caddyfile at root
+    local caddyfile="${parent}/Caddyfile"
+    if [[ -f "$caddyfile" ]]; then
+        targets+=("$caddyfile")
+        target_labels+=("Caddyfile")
+    fi
+
+    # Config
+    if [[ -f "${parent}/packmanager.conf" ]]; then
+        targets+=("${parent}/packmanager.conf")
+        target_labels+=("packmanager.conf")
+    fi
+
+    # Logs
+    if [[ -d "$LOG_DIR" ]]; then
+        targets+=("$LOG_DIR")
+        target_labels+=(".logs/         Run logs and history")
+    fi
+
+    if [[ ${#targets[@]} -eq 0 ]]; then
+        log WARN "Nothing found to nuke. Directory is already clean."
+        return 0
+    fi
+
+    # ── Eagle 500KG Bomb confirmation ────────────────────────────────
+    echo ""
+    echo -e "  ${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${RED}${BOLD}        ✦ EAGLE 500KG BOMB — STRATAGEM REQUESTED ✦${NC}"
+    echo -e "  ${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  ${YELLOW}${BOLD}⚠  INCOMING ORBITAL PAYLOAD  ⚠${NC}"
+    echo ""
+    echo -e "  ${DIM}Super Earth High Command has received your request to deploy${NC}"
+    echo -e "  ${DIM}an Eagle 500KG bomb on your entire PackManager installation.${NC}"
+    echo ""
+    echo -e "  ${BOLD}The following will be permanently destroyed:${NC}"
+    echo ""
+    for i in "${!target_labels[@]}"; do
+        echo -e "    ${RED}💥${NC} ${target_labels[$i]}"
+    done
+    echo ""
+    echo -e "  ${RED}${BOLD}Root:${NC} ${parent}"
+    echo ""
+    echo -e "  ${RED}${BOLD}This cannot be undone. Everything dies. Even the bugs.${NC}"
+    echo -e "  ${DIM}(For a managed democracy, of course.)${NC}"
+    echo ""
+    echo -e "  ${YELLOW}${BOLD}Enter the stratagem sequence to deploy the Eagle 500KG:${NC}"
+    echo ""
+    echo -e "    ${BOLD}⬆ ➡ ⬇ ⬇ ⬇${NC}  ${DIM}(arrow keys or WASD — ESC to abort)${NC}"
+    echo ""
+
+    # ── Stratagem input reader ───────────────────────────────────────
+    # Eagle 500KG sequence: Up Right Down Down Down
+    local -a STRATAGEM=("up" "right" "down" "down" "down")
+    local -a STRAT_ARROWS=("⬆" "➡" "⬇" "⬇" "⬇")
+    local step=0 total=${#STRATAGEM[@]}
+
+    # Read a single directional keypress → sets _SDIR
+    _read_stratagem_key() {
+        _SDIR=""
+        local key
+        IFS= read -rsn1 key </dev/tty
+        case "$key" in
+            $'\x1b')
+                local s1 s2
+                IFS= read -rsn1 -t 0.1 s1 </dev/tty 2>/dev/null || true
+                if [[ "$s1" == "[" ]]; then
+                    IFS= read -rsn1 -t 0.1 s2 </dev/tty 2>/dev/null || true
+                    case "$s2" in
+                        A) _SDIR="up" ;; B) _SDIR="down" ;;
+                        C) _SDIR="right" ;; D) _SDIR="left" ;;
+                        *) _SDIR="bad" ;;
+                    esac
+                else
+                    _SDIR="abort"
+                fi
+                ;;
+            w|W) _SDIR="up" ;; a|A) _SDIR="left" ;;
+            s|S) _SDIR="down" ;; d|D) _SDIR="right" ;;
+            q|Q) _SDIR="abort" ;; *) _SDIR="bad" ;;
+        esac
+    }
+
+    _dir_to_arrow() {
+        case "$1" in
+            up) echo "⬆" ;; down) echo "⬇" ;; left) echo "⬅" ;; right) echo "➡" ;; *) echo "✗" ;;
+        esac
+    }
+
+    # Draw the progress line
+    _draw_strat() {
+        local filled=$1 fail=$2
+        printf "\r  ➤  "
+        local i
+        for (( i=0; i<total; i++ )); do
+            if (( i < filled )); then
+                printf "${GREEN}${BOLD}%s ${NC}" "${STRAT_ARROWS[$i]}"
+            elif (( i == filled )) && [[ "$fail" == "1" ]]; then
+                printf "${RED}${BOLD}✗ ${NC}"
+            else
+                printf "${DIM}%s ${NC}" "${STRAT_ARROWS[$i]}"
+            fi
+        done
+    }
+
+    _draw_strat 0 0
+
+    while (( step < total )); do
+        _read_stratagem_key
+
+        [[ "$_SDIR" == "bad" ]] && continue
+
+        if [[ "$_SDIR" == "abort" ]]; then
+            _draw_strat "$step" 0
+            echo ""
+            echo ""
+            echo -e "  ${GREEN}${BOLD}Stratagem aborted.${NC} Eagle returning to hangar."
+            echo -e "  ${DIM}Democracy is still safe. Your modpack lives another day.${NC}"
+            return 0
+        fi
+
+        if [[ "$_SDIR" == "${STRATAGEM[$step]}" ]]; then
+            (( step++ ))
+            _draw_strat "$step" 0
+        else
+            _draw_strat "$step" 1
+            echo ""
+            echo ""
+            echo -e "  ${RED}${BOLD}WRONG INPUT!${NC} Expected $(_dir_to_arrow "${STRATAGEM[$step]}"), got $(_dir_to_arrow "$_SDIR")"
+            echo ""
+            echo -e "  ${GREEN}${BOLD}Eagle airstrike cancelled.${NC} Your modpack survives."
+            echo -e "  ${DIM}Even Helldivers mess up sometimes. Run ${CYAN}pm nuke${NC} ${DIM}to try again.${NC}"
+            return 0
+        fi
+    done
+
+    echo ""
+    echo ""
+    echo -e "  ${RED}${BOLD}⚡ STRATAGEM ACTIVATED ⚡${NC}"
+    echo ""
+    sleep 1
+    echo -e "  ${RED}${BOLD}⬇  EAGLE 500KG INBOUND  ⬇${NC}"
+    echo ""
+
+    # ── Stop any running Docker containers first ─────────────────────
+    if [[ -f "$compose_file" ]]; then
+        echo -e "  ${YELLOW}Stopping Docker containers...${NC}"
+        (cd "$parent" && docker compose down --remove-orphans 2>/dev/null || docker-compose down --remove-orphans 2>/dev/null || true)
+        log OK "Containers stopped"
+    fi
+
+    # ── Destroy everything ───────────────────────────────────────────
+    for i in "${!targets[@]}"; do
+        local t="${targets[$i]}"
+        if [[ -d "$t" ]]; then
+            rm -rf "$t"
+            echo -e "    ${RED}✗${NC} Destroyed: $(basename "$t")/"
+        elif [[ -f "$t" ]]; then
+            rm -f "$t"
+            echo -e "    ${RED}✗${NC} Destroyed: $(basename "$t")"
+        fi
+    done
+
+    echo ""
+    echo -e "  ${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${GREEN}${BOLD}        ✦ IMPACT CONFIRMED — AREA NEUTRALIZED ✦${NC}"
+    echo -e "  ${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  ${DIM}How'd it feel, Helldiver?${NC}"
+    echo -e "  ${DIM}Your installation has been wiped. Run ${CYAN}pm init${NC} ${DIM}to start fresh.${NC}"
+    echo -e "  ${DIM}For Super Earth. For democracy.${NC}"
+    echo ""
 }
 
 # ============================================================================
@@ -5593,6 +5816,9 @@ main() {
         # Self-update
         self-update|selfupdate|su)  cmd_self_update ;;
         update-status|us)           cmd_self_update_status ;;
+
+        # Nuclear option
+        nuke)              cmd_nuke ;;
 
         # Meta
         help|--help|-h)    cmd_help ;;

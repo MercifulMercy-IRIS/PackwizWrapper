@@ -330,7 +330,7 @@ _pm_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    commands="init organize sync update add remove list status deps search stage refresh export serve pin unpin migrate settings import detect open markdown targets deploy doctor verify diff netcheck resolve aliases unresolved config publish self-update update-status start stop restart kill logs console backup destroy help"
+    commands="init organize sync update add remove list status deps search stage refresh export serve pin unpin migrate settings import detect open markdown targets deploy doctor verify diff netcheck resolve aliases unresolved config publish self-update update-status start stop restart kill logs console backup destroy nuke help"
 
     case "$prev" in
         pm)
