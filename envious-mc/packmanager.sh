@@ -12,6 +12,25 @@
 
 set -uo pipefail
 
+# ── Global error handler ─────────────────────────────────────────────────
+# Catches unhandled script exits and prints a clean FAIL message instead
+# of raw bash errors.  Uses EXIT trap (not ERR) to avoid false positives
+# from intentional non-zero returns in functions.
+_elm_exit_handler() {
+    local exit_code=$?
+    [[ "$exit_code" -eq 0 ]] && return 0
+    # Don't double-print if we already logged a FAIL
+    [[ "${_ELM_FAIL_LOGGED:-}" == "1" ]] && return 0
+    echo "" >&2
+    echo -e "  \033[0;31m\033[1mFAIL\033[0m: elm exited with code ${exit_code}" >&2
+    echo -e "  \033[2mLog: ${RUN_LOG:-/tmp/elm.log}\033[0m" >&2
+    echo "" >&2
+}
+trap '_elm_exit_handler' EXIT
+
+# Mark that we logged a failure (prevents duplicate output from trap)
+_ELM_FAIL_LOGGED=0
+
 # ============================================================================
 # CONFIG LOADING
 # ============================================================================
@@ -34,9 +53,7 @@ PREFER_SOURCE="mr"
 AUTO_PUBLISH=""                    # Target name to auto-publish to CDN after sync/update
                                    #   "" = disabled, "<target>" = auto-run publish_cdn after sync/update
 
-# Docker / Server defaults
-DOCKER_COMPOSE_DIR="${HOME}/.config/elm/servers"  # Where compose files live
-SERVER_IMAGE="itzg/minecraft-server:java17"
+# Server defaults
 SERVER_RAM="8192"
 SERVER_DISK="25600"
 SERVER_CPU="400"
@@ -44,6 +61,16 @@ SERVER_BASE_PORT=25565               # First server gets this, +1 for each after
 SERVER_RCON_BASE_PORT=25575          # RCON base port
 SERVER_DOMAIN=""                     # Base domain (e.g. enviouslabs.com)
 SERVER_VM_IP=""                      # Public/Tailscale IP of the Docker VM
+
+# Pelican Panel — game server management via API
+PELICAN_URL=""                       # e.g. "https://panel.enviouslabs.com"
+PELICAN_NODE_ID=""                   # Wings node ID for server placement
+PELICAN_EGG_ID=""                    # Minecraft egg ID (from panel)
+PELICAN_USER_ID=""                   # Panel user ID (server owner)
+PELICAN_NEST_ID=""                   # Nest ID (typically "minecraft")
+
+# CDN server config (Caddy — standalone container for pack file serving)
+CDN_COMPOSE_DIR="${HOME}/.config/elm/servers"  # Where Caddyfile + CDN data live
 
 # Pack hosting
 PACK_HOST_URL=""
@@ -213,6 +240,26 @@ pw() {
     (cd "$PACK_DIR" && "$PACKWIZ_BIN" "$@")
 }
 
+# ── safe_refresh — auto-hash index on every mod change ───────────────────
+# Replaces every scattered `pw refresh` call.  Logs clean OK/FAIL instead
+# of silently swallowing packwiz errors.
+safe_refresh() {
+    local build_flag=""
+    [[ "${1:-}" == "--build" ]] && build_flag="--build"
+
+    if pw refresh $build_flag 2>>"$RUN_LOG"; then
+        if [[ -n "$build_flag" ]]; then
+            log OK "Index built (sha256)"
+        else
+            log OK "Index updated (sha256)"
+        fi
+        return 0
+    else
+        log FAIL "Index refresh failed — see ${RUN_LOG}"
+        return 1
+    fi
+}
+
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
@@ -220,7 +267,7 @@ pw() {
 log()       { local l="$1"; shift; echo "$(date '+%H:%M:%S') [${l}] $*" >> "$RUN_LOG"
               case "$l" in
                 OK)   echo -e "  ${GREEN}✓${NC} $*" ;;
-                FAIL) echo -e "  ${RED}✗${NC} $*" ;;
+                FAIL) echo -e "  ${RED}✗${NC} $*"; _ELM_FAIL_LOGGED=1 ;;
                 WARN) echo -e "  ${YELLOW}⚠${NC} $*" ;;
                 INFO) echo -e "  ${BLUE}→${NC} $*" ;;
                 SKIP) echo -e "  ${CYAN}⊘${NC} $*" ;;
@@ -265,10 +312,6 @@ check_pack_init() {
 check_docker() {
     command -v docker &>/dev/null || {
         echo -e "${RED}Docker not found. Install: https://docs.docker.com/engine/install/${NC}"
-        exit 1
-    }
-    docker compose version &>/dev/null 2>&1 || docker-compose version &>/dev/null 2>&1 || {
-        echo -e "${RED}Docker Compose not found.${NC}"
         exit 1
     }
 }
@@ -468,7 +511,7 @@ verify_mod_install() {
 
     # Remove the wrong mod from the pack
     pw remove "$resolved_slug" --yes 2>>"$RUN_LOG" || rm -f "$toml_file"
-    pw refresh 2>>"$RUN_LOG" || true
+    safe_refresh || true
 
     # Save to unresolved for later resolution
     add_to_unresolved "$requested_slug" "got wrong mod: ${resolved_name} (${resolved_slug})"
@@ -734,7 +777,7 @@ TOML
     fi
 
     # Refresh index to pick up the new .pw.toml
-    pw refresh 2>>"$RUN_LOG" || true
+    safe_refresh || true
     return 0
 }
 
@@ -1357,13 +1400,14 @@ interactive_search() {
 # ============================================================================
 # TARGET REGISTRY
 # ============================================================================
-# Manages multiple Docker-based MC server instances. Each target has:
-#   name, pack_dir, domain, port, rcon_port, ram, cpu, description
+# Manages multiple MC server instances via Pelican Panel API. Each target has:
+#   name, pack_dir, domain, port, rcon_port, ram, cpu, description,
+#   pelican_server_id, pelican_server_uuid, pelican_allocation_id
 #
 # Stored as JSON at ~/.config/elm/targets.json
 #
 # Architecture:
-#   Docker VM (Rocky/Ubuntu)
+#   Pelican Panel (web UI) ← manages game servers via Wings daemon
 #     ├─ caddy container         ← serves pack files for all targets (auto-HTTPS)
 #     ├─ mc-survival  :25565     ← survival.enviouslabs.com (SRV record)
 #     ├─ mc-creative  :25566     ← creative.enviouslabs.com (SRV record)
@@ -1504,11 +1548,409 @@ next_available_rcon_port() {
 }
 
 # ============================================================================
-# DOCKER COMPOSE GENERATION
+# PELICAN PANEL API
+# ============================================================================
+# All game server management goes through Pelican's REST API.
+# Application API (/api/application) — admin operations (create/delete servers)
+# Client API     (/api/client)       — user operations (power/console/status)
+# Authentication: Bearer token via keys.conf → PELICAN_API_KEY
+
+check_pelican() {
+    if [[ -z "${PELICAN_URL:-}" ]]; then
+        log FAIL "PELICAN_URL not set. Run: elm deploy setup"
+        return 1
+    fi
+    if [[ -z "${PELICAN_API_KEY:-}" ]]; then
+        log FAIL "Pelican API key not set. Run: elm key pelican <token>"
+        return 1
+    fi
+    return 0
+}
+
+# ── Core API caller (Application API — admin) ────────────────────────────
+pelican_api() {
+    local method="$1" endpoint="$2"
+    shift 2
+    local data="${1:-}"
+
+    check_pelican || return 1
+
+    local url="${PELICAN_URL}/api/application${endpoint}"
+    local args=(-s -S -X "$method"
+        -H "Authorization: Bearer ${PELICAN_API_KEY}"
+        -H "Content-Type: application/json"
+        -H "Accept: application/json")
+    [[ -n "$data" ]] && args+=(-d "$data")
+
+    local response http_code
+    response=$(curl "${args[@]}" -w "\n%{http_code}" "$url" 2>>"$RUN_LOG") || {
+        log FAIL "Pelican API request failed: ${method} ${endpoint}"
+        return 1
+    }
+    http_code=$(echo "$response" | tail -1)
+    local body
+    body=$(echo "$response" | sed '$d')
+
+    if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
+        echo "$body"
+        return 0
+    else
+        log FAIL "Pelican API ${method} ${endpoint} → HTTP ${http_code}"
+        echo "$body" >> "$RUN_LOG"
+        return 1
+    fi
+}
+
+# ── Client API (power/console/status — uses server UUID) ─────────────────
+pelican_client_api() {
+    local method="$1" endpoint="$2"
+    shift 2
+    local data="${1:-}"
+
+    check_pelican || return 1
+
+    local url="${PELICAN_URL}/api/client${endpoint}"
+    local args=(-s -S -X "$method"
+        -H "Authorization: Bearer ${PELICAN_API_KEY}"
+        -H "Content-Type: application/json"
+        -H "Accept: application/json")
+    [[ -n "$data" ]] && args+=(-d "$data")
+
+    local response http_code
+    response=$(curl "${args[@]}" -w "\n%{http_code}" "$url" 2>>"$RUN_LOG") || {
+        log FAIL "Pelican client API request failed: ${method} ${endpoint}"
+        return 1
+    }
+    http_code=$(echo "$response" | tail -1)
+    local body
+    body=$(echo "$response" | sed '$d')
+
+    if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
+        echo "$body"
+        return 0
+    else
+        log FAIL "Pelican client API ${method} ${endpoint} → HTTP ${http_code}"
+        echo "$body" >> "$RUN_LOG"
+        return 1
+    fi
+}
+
+# ── Find allocation by port on configured node ───────────────────────────
+pelican_find_allocation() {
+    local wanted_port="$1"
+    [[ -z "${PELICAN_NODE_ID:-}" ]] && { log FAIL "PELICAN_NODE_ID not set. Run: elm deploy setup"; return 1; }
+
+    local allocs
+    allocs=$(pelican_api GET "/nodes/${PELICAN_NODE_ID}/allocations") || return 1
+
+    local alloc_id
+    alloc_id=$(echo "$allocs" | jq -r \
+        --argjson port "$wanted_port" \
+        '.data[] | select(.attributes.port == $port and .attributes.assigned == false) | .attributes.id' 2>/dev/null | head -1)
+
+    if [[ -n "$alloc_id" && "$alloc_id" != "null" ]]; then
+        echo "$alloc_id"
+    else
+        log FAIL "No available allocation for port ${wanted_port} on node ${PELICAN_NODE_ID}"
+        echo -e "  ${DIM}Create one in Pelican Panel: Nodes → Allocations → Add port ${wanted_port}${NC}"
+        return 1
+    fi
+}
+
+# ── Create a server on Pelican ────────────────────────────────────────────
+pelican_create_server() {
+    local target_name="$1"
+    local port domain ram
+    port=$(target_get "$target_name" "port")
+    domain=$(target_get "$target_name" "domain")
+    ram=$(target_get "$target_name" "ram")
+    ram="${ram:-$SERVER_RAM}"
+
+    [[ -z "${PELICAN_EGG_ID:-}" ]] && { log FAIL "PELICAN_EGG_ID not set. Run: elm deploy setup"; return 1; }
+    [[ -z "${PELICAN_USER_ID:-}" ]] && { log FAIL "PELICAN_USER_ID not set. Run: elm deploy setup"; return 1; }
+
+    # Check if already created
+    local existing_id
+    existing_id=$(target_get "$target_name" "pelican_server_id")
+    if [[ -n "$existing_id" ]]; then
+        log WARN "Target '${target_name}' already has Pelican server ID ${existing_id}"
+        echo -e "  ${DIM}Use ${CYAN}elm deploy remove${NC} ${DIM}first to recreate.${NC}"
+        return 1
+    fi
+
+    # Find allocation for port
+    local alloc_id
+    alloc_id=$(pelican_find_allocation "$port") || return 1
+
+    # Build CDN URL for PACKWIZ_URL env var
+    local cdn_base
+    cdn_base=$(resolve_cdn_base_url "$target_name" 2>/dev/null || echo "")
+    local packwiz_url=""
+    [[ -n "$cdn_base" ]] && packwiz_url="${cdn_base}/pack.toml"
+
+    local payload
+    payload=$(jq -n \
+        --arg name "elm-${target_name}" \
+        --arg desc "ELM server: ${domain:-$target_name}" \
+        --argjson user "$PELICAN_USER_ID" \
+        --argjson egg "$PELICAN_EGG_ID" \
+        --argjson alloc "$alloc_id" \
+        --argjson ram "$ram" \
+        --argjson disk "${SERVER_DISK:-25600}" \
+        --argjson cpu "${SERVER_CPU:-400}" \
+        --arg mc_version "$MC_VERSION" \
+        --arg loader "${LOADER^^}" \
+        --arg packwiz_url "$packwiz_url" \
+        --arg motd "${domain:-${target_name}} — ELM" \
+        '{
+            name: $name,
+            description: $desc,
+            user: $user,
+            egg: $egg,
+            docker_image: "ghcr.io/pelican-eggs/yolks:java_21",
+            startup: "java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar server.jar",
+            environment: {
+                MC_VERSION: $mc_version,
+                SERVER_JARFILE: "server.jar",
+                BUILD_TYPE: $loader,
+                PACKWIZ_URL: $packwiz_url,
+                MOTD: $motd
+            },
+            limits: {
+                memory: $ram,
+                swap: 0,
+                disk: $disk,
+                io: 500,
+                cpu: $cpu
+            },
+            feature_limits: {
+                databases: 0,
+                allocations: 1,
+                backups: 3
+            },
+            allocation: {
+                default: $alloc
+            },
+            start_on_completion: false
+        }') || { log FAIL "Failed to build server payload"; return 1; }
+
+    log INFO "Creating server on Pelican Panel..."
+    local result
+    result=$(pelican_api POST "/servers" "$payload") || return 1
+
+    local server_id server_uuid
+    server_id=$(echo "$result" | jq -r '.attributes.id // empty')
+    server_uuid=$(echo "$result" | jq -r '.attributes.uuid // empty')
+
+    if [[ -z "$server_id" || "$server_id" == "null" ]]; then
+        log FAIL "Server creation returned no ID"
+        echo "$result" >> "$RUN_LOG"
+        return 1
+    fi
+
+    target_set "$target_name" \
+        "pelican_server_id=${server_id}" \
+        "pelican_server_uuid=${server_uuid}" \
+        "pelican_allocation_id=${alloc_id}"
+
+    log OK "Created Pelican server: ${target_name} (ID: ${server_id})"
+}
+
+# ── Power control ─────────────────────────────────────────────────────────
+pelican_power() {
+    local target_name="$1" signal="$2"  # start|stop|restart|kill
+    local uuid
+    uuid=$(target_get "$target_name" "pelican_server_uuid")
+    [[ -z "$uuid" || "$uuid" == "null" ]] && {
+        log FAIL "No Pelican server for target '${target_name}'. Run: elm deploy create --target ${target_name}"
+        return 1
+    }
+    pelican_client_api POST "/servers/${uuid}/power" "{\"signal\":\"${signal}\"}" >/dev/null || return 1
+    log OK "${target_name}: ${signal}"
+}
+
+# ── Send console command ──────────────────────────────────────────────────
+pelican_command() {
+    local target_name="$1" command="$2"
+    local uuid
+    uuid=$(target_get "$target_name" "pelican_server_uuid")
+    [[ -z "$uuid" || "$uuid" == "null" ]] && { log FAIL "No Pelican server for '${target_name}'"; return 1; }
+    pelican_client_api POST "/servers/${uuid}/command" "{\"command\":\"${command}\"}" >/dev/null || return 1
+    log OK "Sent: ${command}"
+}
+
+# ── Get server resource usage / status ────────────────────────────────────
+pelican_resources() {
+    local target_name="$1"
+    local uuid
+    uuid=$(target_get "$target_name" "pelican_server_uuid")
+    [[ -z "$uuid" || "$uuid" == "null" ]] && { log FAIL "No Pelican server for '${target_name}'"; return 1; }
+    pelican_client_api GET "/servers/${uuid}/resources"
+}
+
+# ── Get server details from application API ───────────────────────────────
+pelican_server_details() {
+    local target_name="$1"
+    local server_id
+    server_id=$(target_get "$target_name" "pelican_server_id")
+    [[ -z "$server_id" || "$server_id" == "null" ]] && { log FAIL "No Pelican server ID for '${target_name}'"; return 1; }
+    pelican_api GET "/servers/${server_id}"
+}
+
+# ── Delete server ─────────────────────────────────────────────────────────
+pelican_delete_server() {
+    local target_name="$1"
+    local server_id
+    server_id=$(target_get "$target_name" "pelican_server_id")
+    [[ -z "$server_id" || "$server_id" == "null" ]] && { log FAIL "No Pelican server ID for '${target_name}'"; return 1; }
+
+    pelican_api DELETE "/servers/${server_id}" "" || return 1
+
+    target_set "$target_name" \
+        "pelican_server_id=" \
+        "pelican_server_uuid=" \
+        "pelican_allocation_id="
+
+    log OK "Deleted Pelican server: ${target_name}"
+}
+
+# ── Create backup via Pelican ─────────────────────────────────────────────
+pelican_backup() {
+    local target_name="$1"
+    local uuid
+    uuid=$(target_get "$target_name" "pelican_server_uuid")
+    [[ -z "$uuid" || "$uuid" == "null" ]] && { log FAIL "No Pelican server for '${target_name}'"; return 1; }
+
+    log INFO "Creating backup for ${target_name}..."
+    local result
+    result=$(pelican_client_api POST "/servers/${uuid}/backups" '{}') || return 1
+
+    local backup_uuid
+    backup_uuid=$(echo "$result" | jq -r '.attributes.uuid // empty')
+    log OK "Backup started: ${backup_uuid:-pending}"
+}
+
+# ── Display formatted server status ───────────────────────────────────────
+pelican_display_status() {
+    local target_filter="${1:-}"
+
+    local targets
+    targets=$(target_list)
+    [[ -z "$targets" ]] && { echo -e "  ${DIM}No targets. Run: elm target add <name>${NC}"; return; }
+
+    header "Server Status (Pelican)"
+
+    while IFS= read -r t; do
+        [[ -n "$target_filter" && "$t" != "$target_filter" ]] && continue
+
+        local domain port uuid
+        domain=$(target_get "$t" "domain")
+        port=$(target_get "$t" "port")
+        uuid=$(target_get "$t" "pelican_server_uuid")
+
+        echo -e "  ${BOLD}${t}${NC}  ${DIM}${domain:-?}:${port:-?}${NC}"
+
+        if [[ -z "$uuid" || "$uuid" == "null" ]]; then
+            echo -e "    ${DIM}Not deployed — run: elm deploy create --target ${t}${NC}"
+        else
+            local resources
+            if resources=$(pelican_client_api GET "/servers/${uuid}/resources" 2>/dev/null); then
+                local state mem_mb cpu_pct
+                state=$(echo "$resources" | jq -r '.attributes.current_state // "unknown"')
+                mem_mb=$(echo "$resources" | jq -r '(.attributes.resources.memory_bytes // 0) / 1048576 | floor')
+                cpu_pct=$(echo "$resources" | jq -r '.attributes.resources.cpu_absolute // 0 | floor')
+
+                local state_color="$RED"
+                [[ "$state" == "running" ]] && state_color="$GREEN"
+                [[ "$state" == "starting" ]] && state_color="$YELLOW"
+
+                echo -e "    State:  ${state_color}${state}${NC}"
+                echo -e "    CPU:    ${cpu_pct}%    RAM: ${mem_mb}MB"
+            else
+                echo -e "    ${YELLOW}⚠ Could not reach Pelican API${NC}"
+            fi
+        fi
+        echo ""
+    done <<< "$targets"
+}
+
+# ── Standalone Caddy CDN ─────────────────────────────────────────────────
+# Runs Caddy as a standalone Docker container for pack file serving.
+# Separate from Pelican — this is just a static file server.
+
+cdn_dir() {
+    echo "${CDN_COMPOSE_DIR}"
+}
+
+start_cdn_server() {
+    local cdir
+    cdir=$(cdn_dir)
+    mkdir -p "$cdir"
+
+    # Resolve CDN host directory
+    local cdn_host_dir=""
+    local parent
+    parent=$(dirname "$PACK_DIR")
+    if [[ -d "${parent}/cdn" ]]; then
+        cdn_host_dir="${parent}/cdn"
+    else
+        cdn_host_dir="${cdir}/packs"
+    fi
+    mkdir -p "$cdn_host_dir"
+
+    # Generate Caddyfile
+    generate_caddyfile "$cdn_host_dir"
+
+    # Determine ports
+    local cdn_ports
+    if [[ -n "$CDN_DOMAIN" ]]; then
+        cdn_ports="-p 80:80 -p 443:443"
+    else
+        cdn_ports="-p 8080:8080"
+    fi
+
+    # Stop old container if running
+    docker rm -f el-packserver 2>/dev/null || true
+
+    # Start Caddy
+    docker run -d \
+        --name el-packserver \
+        --restart unless-stopped \
+        -v "${cdir}/Caddyfile:/etc/caddy/Caddyfile:ro" \
+        -v "${cdn_host_dir}:/srv/packs:ro" \
+        -v caddy-data:/data \
+        -v caddy-config:/config \
+        $cdn_ports \
+        caddy:2-alpine 2>>"$RUN_LOG" || {
+        log FAIL "Failed to start Caddy CDN container"
+        return 1
+    }
+
+    log OK "CDN server started (el-packserver)"
+    if [[ -n "$CDN_DOMAIN" ]]; then
+        echo -e "  ${CYAN}https://${CDN_DOMAIN}${NC}"
+    else
+        echo -e "  ${CYAN}http://${SERVER_VM_IP:-localhost}:8080${NC}"
+    fi
+}
+
+stop_cdn_server() {
+    docker stop el-packserver 2>/dev/null && log OK "CDN server stopped" || log WARN "CDN server not running"
+}
+
+restart_cdn_server() {
+    docker restart el-packserver 2>/dev/null && log OK "CDN server restarted" || {
+        log WARN "CDN not running — starting fresh"
+        start_cdn_server
+    }
+}
+
+# ============================================================================
+# CADDYFILE GENERATION (for pack CDN)
 # ============================================================================
 
 compose_dir() {
-    echo "${DOCKER_COMPOSE_DIR}"
+    echo "${CDN_COMPOSE_DIR}"
 }
 
 # Generate a Caddyfile for pack serving — auto-HTTPS when CDN_DOMAIN is set
@@ -1565,412 +2007,25 @@ CADDYEOF
     log OK "Generated Caddyfile (${site_addr})"
 }
 
-# Generate docker-compose.yml from all registered targets
-generate_compose() {
-    local cdir; cdir=$(compose_dir)
-    mkdir -p "${cdir}"
-
-    local compose_file="${cdir}/docker-compose.yml"
-
-    # Resolve the CDN directory — local cdn/ sibling to pack/
-    local cdn_host_dir=""
-    local parent
-    parent=$(dirname "$PACK_DIR")
-    if [[ -d "${parent}/cdn" ]]; then
-        cdn_host_dir="${parent}/cdn"
-    else
-        # Fall back: create one next to the compose dir
-        cdn_host_dir="${cdir}/packs"
-    fi
-    mkdir -p "$cdn_host_dir"
-
-    # Generate Caddyfile for pack serving
-    generate_caddyfile "$cdn_host_dir"
-
-    # Header
-    cat > "$compose_file" << 'HEADER'
-# ============================================================================
-# ELM — Auto-generated Docker Compose
-# DO NOT EDIT — regenerated by `elm deploy create` and `elm deploy regenerate`
-# ============================================================================
-
-services:
-HEADER
-
-    # --- Pack file server (Caddy — auto-HTTPS when domain is set) ---
-    local caddy_ports
-    if [[ -n "$CDN_DOMAIN" ]]; then
-        # Caddy needs 80 (HTTP challenge) + 443 (HTTPS) when using a real domain
-        caddy_ports="\"80:80\"\n      - \"443:443\""
-    else
-        # No domain — serve plain HTTP on 8080
-        caddy_ports="\"8080:8080\""
-    fi
-
-    # Health check port must match what Caddy actually listens on
-    local healthcheck_port="8080"
-    if [[ -n "$CDN_DOMAIN" ]]; then
-        healthcheck_port="80"
-    fi
-
-    cat >> "$compose_file" << CADDY
-
-  # --- Pack file server (Caddy — serves packwiz packs for client auto-update) ---
-  packserver:
-    image: caddy:2-alpine
-    container_name: el-packserver
-    restart: unless-stopped
-    volumes:
-      - ${cdir}/Caddyfile:/etc/caddy/Caddyfile:ro
-      - ${cdn_host_dir}:/srv/packs:ro
-      - caddy-data:/data
-      - caddy-config:/config
-    ports:
-      - ${caddy_ports}
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:${healthcheck_port}/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-CADDY
-
-    # Add each target as a service
-    local targets; targets=$(target_list)
-    [[ -z "$targets" ]] && { log WARN "No targets to generate"; return; }
-
-    while IFS= read -r t; do
-        local port domain ram rcon_port pack_dir
-        port=$(target_get "$t" "port")
-        domain=$(target_get "$t" "domain")
-        ram=$(target_get "$t" "ram")
-        rcon_port=$(target_get "$t" "rcon_port")
-        pack_dir=$(target_get "$t" "pack_dir")
-
-        [[ -z "$port" ]] && continue
-
-        local ram_mb="${ram:-$SERVER_RAM}"
-        local motd="${domain:-${t}} — ELM"
-        local rcon_pass
-        rcon_pass=$(target_get "$t" "rcon_password")
-        [[ -z "$rcon_pass" ]] && rcon_pass="elm-${t}-$(openssl rand -hex 4 2>/dev/null || echo "change-me")"
-
-        # MC container fetches pack.toml from the Caddy container over the internal network
-        local packwiz_url=""
-        if [[ -d "${cdn_host_dir}/${t}" ]] || [[ -d "${cdn_host_dir}" && -f "${cdn_host_dir}/pack.toml" ]]; then
-            packwiz_url="http://packserver:${healthcheck_port}/${t}/pack.toml"
-        fi
-
-        cat >> "$compose_file" << SERVICE
-
-  # --- ${t} ---
-  mc-${t}:
-    image: ${SERVER_IMAGE}
-    container_name: el-mc-${t}
-    restart: unless-stopped
-    stdin_open: true
-    tty: true
-    depends_on:
-      packserver:
-        condition: service_healthy
-    ports:
-      - "${port}:25565"
-      - "${rcon_port}:25575"
-    environment:
-      EULA: "TRUE"
-      TYPE: "FORGE"
-      VERSION: "${MC_VERSION}"
-      MEMORY: "${ram_mb}M"
-      MOTD: "${motd}"
-      ENABLE_RCON: "true"
-      RCON_PASSWORD: "${rcon_pass}"
-      RCON_PORT: "25575"
-      SERVER_NAME: "${t}"
-      DIFFICULTY: "normal"
-      VIEW_DISTANCE: "12"
-      MAX_PLAYERS: "20"
-      PACKWIZ_URL: "${packwiz_url}"
-      USE_AIKAR_FLAGS: "true"
-    volumes:
-      - mc-${t}-data:/data
-    mem_limit: ${ram_mb}m
-    mem_reservation: $(( ram_mb / 2 ))m
-SERVICE
-
-        # Store the rcon password if we generated it
-        local existing_rcon; existing_rcon=$(target_get "$t" "rcon_password")
-        [[ -z "$existing_rcon" ]] && target_set "$t" "rcon_password=${rcon_pass}"
-
-    done <<< "$targets"
-
-    # Volumes section
-    cat >> "$compose_file" << 'VOLUMES'
-
-volumes:
-  caddy-data:
-  caddy-config:
-VOLUMES
-
-    while IFS= read -r t; do
-        local port; port=$(target_get "$t" "port")
-        [[ -z "$port" ]] && continue
-        echo "  mc-${t}-data:" >> "$compose_file"
-    done <<< "$targets"
-
-    log OK "Generated ${compose_file}"
+# [REMOVED] Docker Compose generation — replaced by Pelican Panel API
+# Legacy generate_compose(), dc(), docker_*_target() functions removed.
+# Game servers are now managed via Pelican. Caddy CDN is standalone.
+_legacy_docker_removed() {
+    log FAIL "Docker Compose server management has been replaced by Pelican Panel."
+    echo -e "  ${DIM}Run ${CYAN}elm deploy setup${NC} ${DIM}to configure Pelican.${NC}"
+    return 1
 }
-
-# Run docker compose command for specific targets or all
-dc() {
-    local cdir; cdir=$(compose_dir)
-    local compose_file="${cdir}/docker-compose.yml"
-
-    [[ -f "$compose_file" ]] || {
-        echo -e "${RED}No compose file. Run 'elm deploy create' first.${NC}"
-        exit 1
-    }
-
-    docker compose -f "$compose_file" "$@" 2>>"$RUN_LOG"
-}
-
-# ============================================================================
-# SERVER OPERATIONS (Docker-based)
-# ============================================================================
-
-docker_start_target() {
-    local target_name="$1"
-    check_docker
-    header "Starting: ${target_name}"
-    dc up -d "mc-${target_name}" "packserver"
-    log OK "${target_name} started"
-
-    local domain port
-    domain=$(target_get "$target_name" "domain")
-    port=$(target_get "$target_name" "port")
-    [[ -n "$domain" ]] && echo -e "  Connect: ${CYAN}${domain}${NC}"
-    echo ""
-}
-
-docker_stop_target() {
-    local target_name="$1"
-    check_docker
-    header "Stopping: ${target_name}"
-    dc stop "mc-${target_name}"
-    log OK "${target_name} stopped"
-}
-
-docker_restart_target() {
-    local target_name="$1"
-    check_docker
-    header "Restarting: ${target_name}"
-    dc restart "mc-${target_name}"
-    log OK "${target_name} restarted"
-}
-
-docker_server_status() {
-    local target_name="${1:-}"
-    check_docker
-
-    if [[ -z "$target_name" ]]; then
-        # Show all
-        header "All Servers"
-
-        local targets; targets=$(target_list)
-        [[ -z "$targets" ]] && { echo -e "  ${DIM}No targets.${NC}"; return; }
-
-        printf "  ${BOLD}%-15s %-10s %-8s %-15s %s${NC}\n" "TARGET" "STATE" "CPU" "MEMORY" "ADDRESS"
-        separator
-
-        while IFS= read -r t; do
-            local port domain
-            port=$(target_get "$t" "port")
-            domain=$(target_get "$t" "domain")
-            [[ -z "$port" ]] && continue
-
-            local container="el-mc-${t}"
-            local state cpu mem
-
-            if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${container}$"; then
-                state="running"
-                local stats
-                stats=$(docker stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}}' "$container" 2>/dev/null || echo "? ?")
-                cpu=$(echo "$stats" | awk '{print $1}')
-                mem=$(echo "$stats" | awk '{print $2}')
-            else
-                state="stopped"
-                cpu="-"
-                mem="-"
-            fi
-
-            local sc="$RED"
-            [[ "$state" == "running" ]] && sc="$GREEN"
-
-            local addr="${domain:-${SERVER_VM_IP:-localhost}}:${port}"
-
-            printf "  %-15s ${sc}%-10s${NC} %-8s %-15s %s\n" "$t" "$state" "$cpu" "$mem" "$addr"
-        done <<< "$targets"
-        echo ""
-
-    else
-        # Single target detail
-        header "Server: ${target_name}"
-
-        local container="el-mc-${target_name}"
-        local domain port rcon_port ram pack_dir desc
-        domain=$(target_get "$target_name" "domain")
-        port=$(target_get "$target_name" "port")
-        rcon_port=$(target_get "$target_name" "rcon_port")
-        ram=$(target_get "$target_name" "ram")
-        pack_dir=$(target_get "$target_name" "pack_dir")
-        desc=$(target_get "$target_name" "description")
-
-        echo -e "  Target:    ${BOLD}${target_name}${NC}"
-        [[ -n "$domain" ]]   && echo -e "  Domain:    ${CYAN}${domain}:${port}${NC}"
-        [[ -z "$domain" ]]   && echo -e "  Address:   ${SERVER_VM_IP:-localhost}:${port}"
-        [[ -n "$rcon_port" ]] && echo -e "  RCON:      localhost:${rcon_port}"
-        [[ -n "$desc" ]]     && echo -e "  Desc:      ${desc}"
-        [[ -n "$pack_dir" ]] && echo -e "  Pack dir:  ${pack_dir}"
-        echo -e "  RAM:       ${ram:-$SERVER_RAM}MB"
-
-        echo ""
-        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${container}$"; then
-            echo -e "  State:     ${GREEN}running${NC}"
-            docker stats --no-stream --format '  CPU: {{.CPUPerc}}  Memory: {{.MemUsage}}  Net: {{.NetIO}}' "$container" 2>/dev/null
-        else
-            echo -e "  State:     ${RED}stopped${NC}"
-        fi
-        echo ""
-    fi
-}
-
-docker_send_command() {
-    local target_name="$1" command="$2"
-
-    local rcon_port rcon_pass
-    rcon_port=$(target_get "$target_name" "rcon_port")
-    rcon_pass=$(target_get "$target_name" "rcon_password")
-
-    if [[ -z "$rcon_port" || -z "$rcon_pass" ]]; then
-        # Fallback: use docker exec to write to stdin
-        docker exec -i "el-mc-${target_name}" rcon-cli "$command" 2>>"$RUN_LOG" && log OK "Sent: ${command}" || {
-            log WARN "rcon-cli failed, trying stdin..."
-            echo "$command" | docker exec -i "el-mc-${target_name}" mc-send-to-console 2>>"$RUN_LOG" || true
-            log OK "Sent via stdin: ${command}"
-        }
-    else
-        docker exec -i "el-mc-${target_name}" rcon-cli --port "$rcon_port" --password "$rcon_pass" "$command" 2>>"$RUN_LOG"
-        log OK "Sent: ${command}"
-    fi
-}
-
-docker_logs() {
-    local target_name="$1"
-    local lines="${2:-100}"
-    docker logs --tail "$lines" -f "el-mc-${target_name}" 2>&1
-}
-
-docker_kill_target() {
-    local target_name="$1"
-    check_docker
-    header "Force Stopping: ${target_name}"
-    dc kill "mc-${target_name}" 2>/dev/null || true
-    dc rm -f "mc-${target_name}" 2>/dev/null || true
-    log OK "${target_name} killed and removed"
-}
-
-docker_remove_target() {
-    local target_name="$1"
-    check_docker
-
-    header "Removing Deployment: ${target_name}"
-
-    local container="el-mc-${target_name}"
-
-    # Stop the container if running
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${container}$"; then
-        log INFO "Stopping ${target_name}..."
-        dc stop "mc-${target_name}" 2>>"$RUN_LOG" || true
-    fi
-
-    # Remove the container
-    dc rm -f "mc-${target_name}" 2>>"$RUN_LOG" || true
-    log OK "Container removed"
-
-    # Clean up CDN published files for this target
-    local parent; parent=$(dirname "$PACK_DIR")
-    if [[ -d "${parent}/cdn/${target_name}" ]]; then
-        echo -e "  ${YELLOW}Remove published pack files in cdn/${target_name}/? (y/N)${NC}"
-        read -r confirm < /dev/tty
-        if [[ "$confirm" == [yY] ]]; then
-            rm -rf "${parent}/cdn/${target_name}"
-            log OK "Removed cdn/${target_name}/"
-        fi
-    fi
-
-    # Offer to remove docker volume
-    local volume="mc-${target_name}-data"
-    if docker volume inspect "$volume" &>/dev/null 2>&1; then
-        echo ""
-        echo -e "  ${YELLOW}${BOLD}Remove Docker volume '${volume}'?${NC}"
-        echo -e "  ${RED}This permanently deletes the server world, configs, and all data.${NC}"
-        echo -e "  ${DIM}(Consider running 'elm deploy backup' first)${NC}"
-        echo ""
-        echo -ne "  ${CYAN}Delete volume? (y/N)>${NC} "
-        read -r vol_confirm < /dev/tty
-        if [[ "$vol_confirm" == [yY] ]]; then
-            docker volume rm "$volume" 2>>"$RUN_LOG" && log OK "Volume '${volume}' removed" || log WARN "Could not remove volume (may still be in use)"
-        else
-            echo -e "  ${DIM}Volume kept. Remove later with: docker volume rm ${volume}${NC}"
-        fi
-    fi
-
-    # Remove target from registry
-    echo ""
-    echo -e "  ${YELLOW}Remove target '${target_name}' from registry? (y/N)${NC}"
-    read -r reg_confirm < /dev/tty
-    if [[ "$reg_confirm" == [yY] ]]; then
-        target_remove "$target_name"
-        log OK "Target '${target_name}' removed from registry"
-        # Regenerate compose without this target
-        generate_compose 2>/dev/null || true
-        log OK "Compose regenerated"
-    else
-        echo -e "  ${DIM}Target kept in registry.${NC}"
-    fi
-
-    echo ""
-    log OK "Deployment '${target_name}' removed"
-    echo ""
-}
-
-docker_backup_target() {
-    local target_name="$1"
-
-    header "Backup: ${target_name}"
-
-    local backup_dir="${DOCKER_COMPOSE_DIR}/backups/${target_name}"
-    mkdir -p "$backup_dir"
-
-    local timestamp; timestamp=$(date +%Y%m%d-%H%M%S)
-    local backup_file="${backup_dir}/${target_name}-${timestamp}.tar.gz"
-
-    # Pause autosave
-    docker_send_command "$target_name" "save-off" 2>/dev/null || true
-    docker_send_command "$target_name" "save-all" 2>/dev/null || true
-    sleep 3
-
-    # Backup the volume
-    docker run --rm \
-        -v "mc-${target_name}-data:/data:ro" \
-        -v "${backup_dir}:/backup" \
-        alpine tar czf "/backup/${target_name}-${timestamp}.tar.gz" -C /data . \
-        2>>"$RUN_LOG"
-
-    # Resume autosave
-    docker_send_command "$target_name" "save-on" 2>/dev/null || true
-
-    local size; size=$(du -h "$backup_file" | cut -f1)
-    log OK "Backup: ${backup_file} (${size})"
-}
+generate_compose() { _legacy_docker_removed; }
+dc() { _legacy_docker_removed; }
+docker_start_target() { _legacy_docker_removed; }
+docker_stop_target() { _legacy_docker_removed; }
+docker_restart_target() { _legacy_docker_removed; }
+docker_server_status() { _legacy_docker_removed; }
+docker_send_command() { _legacy_docker_removed; }
+docker_logs() { _legacy_docker_removed; }
+docker_kill_target() { _legacy_docker_removed; }
+docker_remove_target() { _legacy_docker_removed; }
+docker_backup_target() { _legacy_docker_removed; }
 
 # ============================================================================
 # PACK PUBLISHING (copies pack files to cdn/ for Caddy to serve)
@@ -1994,7 +2049,7 @@ publish_pack() {
     mkdir -p "${publish_dir}/mods" "${publish_dir}/jars"
 
     # Build index with hashes for distribution
-    pw refresh --build 2>>"$RUN_LOG"
+    safe_refresh --build || return 1
 
     log INFO "Publishing pack to ${publish_dir}..."
 
@@ -2789,7 +2844,7 @@ cmd_sync() {
 
     separator
     log INFO "Refreshing pack index..."
-    pw refresh 2>>"$RUN_LOG" && log OK "Index updated" || log WARN "Index warnings"
+    safe_refresh || true
 
     # Auto-publish to CDN if configured
     auto_publish_cdn
@@ -2898,7 +2953,7 @@ cmd_add() {
         printf '    ↳ %s\n' "${DEPS_ADDED[@]}"
     fi
 
-    pw refresh 2>>"$RUN_LOG"
+    safe_refresh || true
 }
 
 cmd_add_interactive() {
@@ -3043,7 +3098,7 @@ cmd_remove() {
             fi
         done
 
-        pw refresh 2>>"$RUN_LOG"
+        safe_refresh || true
         return 0
     fi
 
@@ -3072,7 +3127,7 @@ cmd_remove() {
         rm -f "${parent}/cdn/jars/${jar_filename}" 2>/dev/null || true
     fi
 
-    pw refresh 2>>"$RUN_LOG"
+    safe_refresh || true
 }
 
 cmd_list() {
@@ -3161,7 +3216,7 @@ cmd_update() {
 
     log INFO "Running packwiz update --all..."
     pw update --all --yes 2>>"$RUN_LOG" && log OK "Done" || log WARN "Some updates failed"
-    pw refresh 2>>"$RUN_LOG"
+    safe_refresh || true
 
     # Auto-publish to CDN if configured
     auto_publish_cdn
@@ -3265,7 +3320,7 @@ cmd_search() {
                 IFS='|' read -r source slug url pinned <<< "$parsed"
                 if install_mod "$source" "$slug" "$url" "$pinned"; then
                     is_in_modlist "$slug" || { append_to_modlist "$selected"; log INFO "Added to mods.txt"; }
-                    pw refresh 2>>"$RUN_LOG"
+                    safe_refresh || true
                 else
                     log FAIL "Install failed for ${slug}"
                 fi
@@ -3299,7 +3354,7 @@ cmd_doctor() {
     done < "$MODS_FILE"
 
     echo -e "  ${BLUE}Refreshing index...${NC}"
-    pw refresh 2>>"$RUN_LOG" && log OK "Index clean" || { log WARN "Index issues"; (( issues++ )); }
+    safe_refresh || { log WARN "Index issues"; (( issues++ )); }
 
     echo ""
     (( issues == 0 )) && echo -e "  ${GREEN}${BOLD}All good!${NC}" || echo -e "  ${YELLOW}${issues} issue(s). Run 'elm sync' to fix.${NC}"
@@ -3752,7 +3807,7 @@ cmd_export() {
 
     # Refresh with --build for distribution (generates internal hashes)
     log INFO "Refreshing index for distribution..."
-    pw refresh --build 2>>"$RUN_LOG"
+    safe_refresh --build || return 1
 
     case "$fmt" in
         modrinth|mr)
@@ -4096,7 +4151,7 @@ cmd_stage() {
     fi
 
     # Refresh packwiz index
-    pw refresh 2>>"$RUN_LOG" || true
+    safe_refresh || true
 
     # Summary
     separator
@@ -4158,7 +4213,7 @@ cmd_add_file() {
             log INFO "Removed from unresolved.txt"
         fi
 
-        pw refresh 2>>"$RUN_LOG" || true
+        safe_refresh || true
         echo ""
         echo -e "  ${GREEN}${BOLD}Done!${NC} ${slug} is installed as a self-hosted mod."
         echo -e "  ${DIM}Clients will download it from your CDN/server.${NC}"
@@ -4187,7 +4242,7 @@ cmd_cf_import() {
     [[ "$confirm" != [yY] ]] && exit 0
 
     pw curseforge import "$path" --yes 2>>"$RUN_LOG" && log OK "Import complete" || log FAIL "Import failed"
-    pw refresh 2>>"$RUN_LOG"
+    safe_refresh || true
 }
 
 cmd_detect() {
@@ -4195,7 +4250,7 @@ cmd_detect() {
     header "Detecting CurseForge Mods"
     log INFO "Scanning installed JARs for CurseForge matches..."
     pw curseforge detect --yes 2>>"$RUN_LOG" && log OK "Detection complete" || log WARN "Some files not detected"
-    pw refresh 2>>"$RUN_LOG"
+    safe_refresh || true
 }
 
 cmd_open() {
@@ -4236,16 +4291,12 @@ cmd_open() {
 
 cmd_refresh() {
     check_packwiz; check_pack_init
-    local build=false
-    [[ "${1:-}" == "--build" || "${1:-}" == "-b" ]] && build=true
+    local build_flag=""
+    [[ "${1:-}" == "--build" || "${1:-}" == "-b" ]] && build_flag="--build"
 
     header "Refreshing Pack Index"
-    if $build; then
-        log INFO "Building with internal hashes (for distribution)..."
-        pw refresh --build 2>>"$RUN_LOG" && log OK "Index built" || log FAIL "Build failed"
-    else
-        pw refresh 2>>"$RUN_LOG" && log OK "Index refreshed" || log FAIL "Refresh failed"
-    fi
+    [[ -n "$build_flag" ]] && log INFO "Building with internal hashes (for distribution)..."
+    safe_refresh $build_flag
 }
 
 cmd_markdown() {
@@ -4329,7 +4380,7 @@ cmd_aliases() {
                     alias_remove "$slug"
                     if [[ -f "${PACK_DIR}/mods/${resolved}.pw.toml" ]]; then
                         pw remove "$resolved" --yes 2>>"$RUN_LOG" || rm -f "${PACK_DIR}/mods/${resolved}.pw.toml"
-                        pw refresh 2>>"$RUN_LOG" || true
+                        safe_refresh || true
                         log OK "Alias removed and ${resolved} uninstalled"
                     else
                         log OK "Alias removed (${resolved}.pw.toml not found — may already be gone)"
@@ -4494,7 +4545,7 @@ cmd_resolve() {
 
     # Refresh packwiz index if we resolved anything
     if [[ $resolved -gt 0 ]]; then
-        pw refresh 2>>"$RUN_LOG" || true
+        safe_refresh || true
     fi
 
     # ── Summary ──────────────────────────────────────────────────────
@@ -4746,12 +4797,21 @@ cmd_targets() {
                 pack_dir=$(target_get "$t" "pack_dir")
                 rcon_port=$(target_get "$t" "rcon_port")
 
+                local pelican_id pelican_uuid
+                pelican_id=$(target_get "$t" "pelican_server_id")
+                pelican_uuid=$(target_get "$t" "pelican_server_uuid")
+
                 echo -e "  ${BOLD}${t}${NC}"
-                [[ -n "$domain" ]]    && echo -e "    Domain:  ${CYAN}${domain}:${port:-?}${NC}"
-                [[ -n "$port" ]]      && echo -e "    Port:    ${port}  RCON: ${rcon_port:-?}"
-                [[ -n "$pack_dir" ]]  && echo -e "    Pack:    ${pack_dir}"
-                [[ -n "$ram" ]]       && echo -e "    RAM:     ${ram}MB"
-                [[ -n "$desc" ]]      && echo -e "    Desc:    ${DIM}${desc}${NC}"
+                [[ -n "$domain" ]]    && echo -e "    Domain:   ${CYAN}${domain}:${port:-?}${NC}"
+                [[ -n "$port" ]]      && echo -e "    Port:     ${port}  RCON: ${rcon_port:-?}"
+                [[ -n "$pack_dir" ]]  && echo -e "    Pack:     ${pack_dir}"
+                [[ -n "$ram" ]]       && echo -e "    RAM:      ${ram}MB"
+                if [[ -n "$pelican_id" && "$pelican_id" != "null" ]]; then
+                    echo -e "    Pelican:  ${GREEN}ID ${pelican_id}${NC} ${DIM}(${pelican_uuid:-?})${NC}"
+                else
+                    echo -e "    Pelican:  ${DIM}not deployed${NC}"
+                fi
+                [[ -n "$desc" ]]      && echo -e "    Desc:     ${DIM}${desc}${NC}"
                 echo ""
             done <<< "$targets"
             ;;
@@ -4846,7 +4906,8 @@ cmd_targets() {
             echo -e "  ${CYAN}elm target remove <n>${NC}        Remove a target"
             echo -e "  ${CYAN}elm target dns [n]${NC}           Show SRV record setup"
             echo ""
-            echo -e "  ${BOLD}Fields:${NC} domain, port, rcon_port, pack_dir, ram, cpu, description"
+            echo -e "  ${BOLD}Fields:${NC} domain, port, rcon_port, pack_dir, ram, cpu, description,"
+            echo -e "          pelican_server_id, pelican_server_uuid, pelican_allocation_id"
             echo ""
             echo -e "  ${BOLD}Example:${NC}"
             echo "    elm target add survival domain=survival.enviouslabs.com ram=8192"
@@ -4858,8 +4919,159 @@ cmd_targets() {
 }
 
 # ============================================================================
-# DEPLOY COMMAND (Docker Compose + itzg/minecraft-server)
+# DEPLOY COMMAND (Pelican Panel + Caddy CDN)
 # ============================================================================
+
+# ── Setup Wizard — configure Pelican Panel connection ─────────────────────
+_deploy_setup_wizard() {
+    header "Pelican Panel Setup"
+    echo -e "  ${DIM}This will configure ELM to manage game servers via Pelican Panel.${NC}"
+    echo ""
+
+    # 1. Panel URL
+    local url="${PELICAN_URL:-}"
+    echo -ne "  Panel URL [${url:-https://panel.example.com}]: "
+    read -r input < /dev/tty
+    url="${input:-$url}"
+    [[ -z "$url" ]] && { log FAIL "Panel URL is required"; return 1; }
+    # Strip trailing slash
+    url="${url%/}"
+
+    # 2. API Key
+    echo ""
+    echo -e "  ${DIM}Generate an Application API key in your Pelican Panel:${NC}"
+    echo -e "  ${DIM}  Admin → Application API → Create Key${NC}"
+    echo ""
+    echo -ne "  API Key: "
+    read -r api_key < /dev/tty
+    [[ -z "$api_key" ]] && { log FAIL "API key is required"; return 1; }
+
+    # Save key
+    _key_set "PELICAN_API_KEY" "$api_key"
+    PELICAN_API_KEY="$api_key"
+    PELICAN_URL="$url"
+
+    # 3. Test connection
+    echo ""
+    log INFO "Testing connection to ${url}..."
+    local test_result
+    if test_result=$(pelican_api GET "/servers" 2>&1); then
+        log OK "Connected to Pelican Panel"
+    else
+        log FAIL "Could not connect to ${url}"
+        echo -e "  ${DIM}Check the URL and API key, then run: elm deploy setup${NC}"
+        return 1
+    fi
+
+    # 4. List nodes — user picks one
+    echo ""
+    log INFO "Fetching nodes..."
+    local nodes
+    nodes=$(pelican_api GET "/nodes") || { log FAIL "Could not fetch nodes"; return 1; }
+
+    local node_count
+    node_count=$(echo "$nodes" | jq '.data | length')
+
+    if (( node_count == 0 )); then
+        log FAIL "No nodes found. Create a node in Pelican first."
+        return 1
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}Available Nodes:${NC}"
+    echo "$nodes" | jq -r '.data[] | "    \(.attributes.id)) \(.attributes.name) — \(.attributes.fqdn // "no FQDN") (mem: \(.attributes.memory)MB)"'
+    echo ""
+
+    local node_id="${PELICAN_NODE_ID:-}"
+    echo -ne "  Node ID [${node_id:-pick one above}]: "
+    read -r input < /dev/tty
+    node_id="${input:-$node_id}"
+    [[ -z "$node_id" ]] && { log FAIL "Node ID is required"; return 1; }
+
+    # 5. List eggs — user picks Minecraft egg
+    echo ""
+    log INFO "Fetching eggs..."
+    local nests
+    nests=$(pelican_api GET "/nests") || { log WARN "Could not fetch nests"; }
+
+    if [[ -n "$nests" ]]; then
+        echo ""
+        echo -e "  ${BOLD}Available Eggs:${NC}"
+        # Iterate nests and their eggs
+        echo "$nests" | jq -r '.data[] | .attributes as $nest | "  Nest: \($nest.name) (ID: \($nest.id))"' 2>/dev/null || true
+
+        local nest_id="${PELICAN_NEST_ID:-}"
+        echo -ne "  Nest ID [${nest_id:-1}]: "
+        read -r input < /dev/tty
+        nest_id="${input:-${nest_id:-1}}"
+
+        local eggs
+        eggs=$(pelican_api GET "/nests/${nest_id}/eggs") || true
+        if [[ -n "$eggs" ]]; then
+            echo "$eggs" | jq -r '.data[] | "    \(.attributes.id)) \(.attributes.name)"' 2>/dev/null || true
+        fi
+    fi
+
+    local egg_id="${PELICAN_EGG_ID:-}"
+    echo -ne "  Egg ID (Minecraft) [${egg_id:-}]: "
+    read -r input < /dev/tty
+    egg_id="${input:-$egg_id}"
+    [[ -z "$egg_id" ]] && { log FAIL "Egg ID is required"; return 1; }
+
+    # 6. User ID
+    echo ""
+    local user_id="${PELICAN_USER_ID:-}"
+    echo -ne "  Panel User ID (owner) [${user_id:-1}]: "
+    read -r input < /dev/tty
+    user_id="${input:-${user_id:-1}}"
+
+    # 7. Save all config
+    _config_set "PELICAN_URL" "$url"
+    _config_set "PELICAN_NODE_ID" "$node_id"
+    _config_set "PELICAN_EGG_ID" "$egg_id"
+    _config_set "PELICAN_USER_ID" "$user_id"
+    [[ -n "${nest_id:-}" ]] && _config_set "PELICAN_NEST_ID" "$nest_id"
+
+    # Export for immediate use
+    PELICAN_NODE_ID="$node_id"
+    PELICAN_EGG_ID="$egg_id"
+    PELICAN_USER_ID="$user_id"
+
+    echo ""
+    header "Setup Complete"
+    echo -e "  Panel:   ${CYAN}${url}${NC}"
+    echo -e "  Node:    ${node_id}"
+    echo -e "  Egg:     ${egg_id}"
+    echo -e "  User:    ${user_id}"
+    echo ""
+    echo -e "  ${DIM}Next steps:${NC}"
+    echo "    elm target add survival domain=survival.enviouslabs.com ram=8192"
+    echo "    elm deploy create --target survival"
+    echo "    elm deploy start --target survival"
+    echo ""
+
+    # 8. Offer to start CDN
+    echo -e "  ${YELLOW}Start Caddy CDN container now? (y/N)${NC}"
+    read -r confirm < /dev/tty
+    if [[ "$confirm" == [yY] ]]; then
+        check_docker
+        start_cdn_server || true
+    fi
+}
+
+# Helper: write a key=value into the global elm.conf
+_config_set() {
+    local key="$1" val="$2"
+    local conf="${GLOBAL_CONF}"
+    mkdir -p "$(dirname "$conf")"
+    if [[ -f "$conf" ]] && grep -q "^${key}=" "$conf" 2>/dev/null; then
+        local tmp; tmp=$(mktemp)
+        sed "s|^${key}=.*|${key}=\"${val}\"|" "$conf" > "$tmp"
+        mv "$tmp" "$conf"
+    else
+        echo "${key}=\"${val}\"" >> "$conf"
+    fi
+}
 
 cmd_deploy() {
     local subcmd="${1:-help}"
@@ -4879,127 +5091,156 @@ cmd_deploy() {
     # Resolve target
     local target_name=""
     case "$subcmd" in
-        status|st|regenerate|nginx|caddy|help) target_name="${target_flag:-}" ;;
+        status|st|setup|cdn-start|cdn-stop|cdn-restart|help) target_name="${target_flag:-}" ;;
         *)
-            target_name=$(resolve_target "$target_flag")
+            target_name=$(resolve_target "$target_flag") || exit 1
+            [[ -z "$target_name" ]] && exit 1
             load_target "$target_name"
             ;;
     esac
 
     case "$subcmd" in
+        # ── Setup Pelican connection ──────────────────────────────────
+        setup)
+            _deploy_setup_wizard
+            ;;
+
+        # ── Create server on Pelican ──────────────────────────────────
         create)
             header "Creating Server: ${target_name}"
-            check_docker
 
             local port; port=$(target_get "$target_name" "port")
             [[ -z "$port" ]] && {
                 log FAIL "Target '${target_name}' has no port. Run: elm target add ${target_name}"
-                exit 1
+                return 1
             }
 
-            # Auto-publish pack to cdn/ if pack exists
+            # Auto-publish pack to CDN if pack exists
             if [[ -f "${PACK_DIR}/pack.toml" ]]; then
                 check_packwiz
                 publish_pack "$target_name"
             fi
 
-            # Download server-side mods
-            local parent; parent=$(dirname "$PACK_DIR")
-            if [[ -d "${parent}/server" && -f "${PACK_DIR}/pack.toml" ]]; then
-                download_server_mods "${parent}/server/mods"
+            # Ensure CDN server is running
+            if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^el-packserver$'; then
+                start_cdn_server || true
             fi
 
-            # Generate compose (picks up published pack in cdn/)
-            generate_compose
-
-            log OK "Compose generated for ${target_name}"
+            # Create on Pelican
+            pelican_create_server "$target_name" || return 1
 
             # Auto-update DDNS if configured
             if [[ "${ELM_DNS_AUTO_UPDATE:-false}" == "true" && -n "${ELM_DNS_PROVIDER:-}" ]]; then
                 echo ""
-                _dns_force_update
+                _dns_force_update || true
             fi
 
             echo ""
-            echo -e "  Start with:  ${CYAN}elm deploy start${NC}"
-            if [[ -n "$CDN_DOMAIN" ]]; then
-                echo -e "  Pack URL:    ${CYAN}https://${CDN_DOMAIN}/${target_name}/pack.toml${NC}"
-            else
-                echo -e "  Pack URL:    ${CYAN}http://${SERVER_VM_IP:-localhost}:8080/${target_name}/pack.toml${NC}"
-            fi
+            echo -e "  Start with:  ${CYAN}elm deploy start --target ${target_name}${NC}"
+            local cdn_url
+            cdn_url=$(resolve_cdn_base_url "$target_name" 2>/dev/null || echo "")
+            [[ -n "$cdn_url" ]] && echo -e "  Pack URL:    ${CYAN}${cdn_url}/pack.toml${NC}"
             echo ""
             ;;
 
+        # ── Publish pack + prompt restart ─────────────────────────────
         push|publish)
             check_packwiz; check_pack_init
             publish_pack "$target_name"
-            # Regenerate compose to update PACKWIZ_URL
-            generate_compose
-            # If server is running, restart to pick up new mods
-            local container="el-mc-${target_name}"
-            if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${container}$"; then
-                echo -e "  ${YELLOW}Restart to load new mods? (y/N)${NC}"
+            restart_cdn_server || true
+
+            # Offer restart if server exists on Pelican
+            local uuid
+            uuid=$(target_get "$target_name" "pelican_server_uuid")
+            if [[ -n "$uuid" && "$uuid" != "null" ]]; then
+                echo -e "  ${YELLOW}Restart server to load new mods? (y/N)${NC}"
                 read -r confirm
-                [[ "$confirm" == [yY] ]] && docker_restart_target "$target_name"
+                [[ "$confirm" == [yY] ]] && pelican_power "$target_name" "restart"
             fi
             ;;
 
+        # ── Power controls ────────────────────────────────────────────
         start|up)
-            docker_start_target "$target_name"
-            # Auto-update DDNS if configured
+            pelican_power "$target_name" "start"
             if [[ "${ELM_DNS_AUTO_UPDATE:-false}" == "true" && -n "${ELM_DNS_PROVIDER:-}" ]]; then
-                _dns_force_update
+                _dns_force_update || true
             fi
             ;;
 
         stop|down)
-            docker_stop_target "$target_name"
+            pelican_power "$target_name" "stop"
             ;;
 
         restart)
-            docker_restart_target "$target_name"
-            ;;
-
-        status|st)
-            docker_server_status "$target_name"
-            ;;
-
-        console|cmd|rcon)
-            local command="${1:?Usage: elm deploy console <command> --target <n>}"
-            docker_send_command "$target_name" "$command"
-            ;;
-
-        logs|log)
-            docker_logs "$target_name" "${1:-100}"
-            ;;
-
-        backup|bk)
-            docker_backup_target "$target_name"
-            ;;
-
-        remove|rm|destroy)
-            docker_remove_target "$target_name"
+            pelican_power "$target_name" "restart"
             ;;
 
         kill)
-            docker_kill_target "$target_name"
+            pelican_power "$target_name" "kill"
             ;;
 
+        # ── Status ────────────────────────────────────────────────────
+        status|st)
+            pelican_display_status "$target_name"
+            ;;
+
+        # ── Console command ───────────────────────────────────────────
+        console|cmd|rcon)
+            local command="${1:?Usage: elm deploy console <command> --target <n>}"
+            pelican_command "$target_name" "$command"
+            ;;
+
+        # ── Backup ────────────────────────────────────────────────────
+        backup|bk)
+            pelican_backup "$target_name"
+            ;;
+
+        # ── Remove server from Pelican ────────────────────────────────
+        remove|rm|destroy)
+            echo -e "  ${YELLOW}Remove Pelican server '${target_name}'? (y/N)${NC}"
+            read -r confirm
+            [[ "$confirm" != [yY] ]] && return 0
+            pelican_delete_server "$target_name"
+            ;;
+
+        # ── CDN management ────────────────────────────────────────────
+        cdn-start)
+            check_docker
+            start_cdn_server
+            ;;
+
+        cdn-stop)
+            stop_cdn_server
+            ;;
+
+        cdn-restart)
+            restart_cdn_server
+            ;;
+
+        cdn)
+            check_packwiz; check_pack_init
+            publish_pack "$target_name"
+            restart_cdn_server || true
+            ;;
+
+        # ── Regenerate Caddyfile ──────────────────────────────────────
         regenerate|regen)
-            header "Regenerating Compose"
-            generate_compose
-            echo -e "  ${DIM}Apply changes with: docker compose -f $(compose_dir)/docker-compose.yml up -d${NC}"
+            header "Regenerating Caddyfile"
+            generate_caddyfile
+            restart_cdn_server || true
             echo ""
             ;;
 
-        cdn|publish)
-            check_packwiz; check_pack_init
-            publish_pack "$target_name"
+        caddy)
+            header "Regenerating Caddyfile"
+            generate_caddyfile
+            echo -e "  ${DIM}Apply with: elm deploy cdn-restart${NC}"
+            echo ""
             ;;
 
+        # ── Download server mods ──────────────────────────────────────
         mods|download)
             check_pack_init
-            # Parse optional --dir flag
             local mods_dest=""
             local margs=()
             while [[ $# -gt 0 ]]; do
@@ -5008,7 +5249,6 @@ cmd_deploy() {
                     *)        margs+=("$1"); shift ;;
                 esac
             done
-            # If no --dir, try target's server dir, then sibling convention
             if [[ -z "$mods_dest" && -n "$target_name" ]]; then
                 local srv_pack_dir
                 srv_pack_dir=$(target_get "$target_name" "pack_dir")
@@ -5021,88 +5261,94 @@ cmd_deploy() {
             download_server_mods "$mods_dest"
             ;;
 
-        nginx)
-            generate_nginx_config "$target_name"
-            ;;
-
-        caddy)
-            header "Regenerating Caddyfile"
-            generate_caddyfile
-            echo -e "  ${DIM}Apply changes with: elm deploy regenerate${NC}"
-            echo ""
-            ;;
-
+        # ── Full pipeline ─────────────────────────────────────────────
         full)
             header "Full Deployment: ${target_name}"
-            echo -e "  sync → publish → compose → download server mods → start"
+            echo -e "  sync → publish → create → start"
             echo -e "  ${YELLOW}Continue? (y/N)${NC}"
             read -r confirm < /dev/tty
-            [[ "$confirm" != [yY] ]] && exit 0
+            [[ "$confirm" != [yY] ]] && return 0
 
             echo ""
             cmd_sync
             separator
             publish_pack "$target_name"
             separator
-            local parent; parent=$(dirname "$PACK_DIR")
-            [[ -d "${parent}/server" ]] && download_server_mods "${parent}/server/mods"
-            separator
-            generate_compose
-            separator
-            docker_start_target "$target_name"
 
-            local domain; domain=$(target_get "$target_name" "domain")
+            # Ensure CDN is up
+            if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^el-packserver$'; then
+                start_cdn_server || true
+            fi
+            separator
+
+            # Create on Pelican if not exists
+            local existing_id
+            existing_id=$(target_get "$target_name" "pelican_server_id")
+            if [[ -z "$existing_id" || "$existing_id" == "null" ]]; then
+                pelican_create_server "$target_name" || return 1
+            fi
+            separator
+            pelican_power "$target_name" "start"
+
+            local domain
+            domain=$(target_get "$target_name" "domain")
             local cdn_url
-            cdn_url=$(resolve_cdn_base_url "$target_name")
+            cdn_url=$(resolve_cdn_base_url "$target_name" 2>/dev/null || echo "")
 
             header "Deployment Complete: ${target_name}"
             echo -e "  ${GREEN}${BOLD}Server is starting!${NC}"
             [[ -n "$domain" ]] && echo -e "  Game:    ${CYAN}${domain}${NC}"
-            echo -e "  Pack:    ${CYAN}${cdn_url}/pack.toml${NC}"
+            [[ -n "$cdn_url" ]] && echo -e "  Pack:    ${CYAN}${cdn_url}/pack.toml${NC}"
             echo -e "  Status:  ${CYAN}elm deploy status${NC}"
-            echo -e "  Logs:    ${CYAN}elm deploy logs ${target_name}${NC}"
+            echo -e "  Panel:   ${CYAN}${PELICAN_URL:-?}${NC}"
             echo ""
             ;;
 
+        # ── Local dev server ──────────────────────────────────────────
         serve)
             check_packwiz; check_pack_init
             cmd_serve
             ;;
 
+        # ── Help ──────────────────────────────────────────────────────
         help|*)
             echo ""
-            echo -e "  ${BOLD}elm deploy${NC} — Docker Server Management"
+            echo -e "  ${BOLD}elm deploy${NC} — Server Management via Pelican Panel"
             echo ""
             echo -e "  All commands accept ${CYAN}--target <name>${NC} (auto-resolves if only one)"
             echo ""
             echo -e "  ${BOLD}Setup:${NC}"
-            echo -e "  ${CYAN}elm deploy create${NC}          Publish pack + generate compose (auto-HTTPS)"
-            echo -e "  ${CYAN}elm deploy full${NC}            Pipeline: sync → publish → compose → start"
-            echo -e "  ${CYAN}elm deploy remove${NC}          Tear down deployment"
+            echo -e "  ${CYAN}elm deploy setup${NC}           Configure Pelican Panel connection"
+            echo -e "  ${CYAN}elm deploy create${NC}          Publish pack + create server on Pelican"
+            echo -e "  ${CYAN}elm deploy full${NC}            Pipeline: sync → publish → create → start"
+            echo -e "  ${CYAN}elm deploy remove${NC}          Delete server from Pelican"
             echo ""
             echo -e "  ${BOLD}Server:${NC}"
             echo -e "  ${CYAN}elm deploy start${NC}           Start the server"
             echo -e "  ${CYAN}elm deploy stop${NC}            Stop the server"
             echo -e "  ${CYAN}elm deploy restart${NC}         Restart the server"
-            echo -e "  ${CYAN}elm deploy status${NC}          Show all servers"
-            echo -e "  ${CYAN}elm deploy console <cmd>${NC}   Send RCON command"
-            echo -e "  ${CYAN}elm deploy logs${NC}            Tail server logs"
-            echo -e "  ${CYAN}elm deploy backup${NC}          Backup server world"
+            echo -e "  ${CYAN}elm deploy kill${NC}            Force kill the server"
+            echo -e "  ${CYAN}elm deploy status${NC}          Show all server statuses"
+            echo -e "  ${CYAN}elm deploy console <cmd>${NC}   Send command to server console"
+            echo -e "  ${CYAN}elm deploy backup${NC}          Create server backup"
             echo ""
-            echo -e "  ${BOLD}Updates:${NC}"
-            echo -e "  ${CYAN}elm deploy push${NC}            Re-publish pack after changes"
-            echo -e "  ${CYAN}elm deploy mods${NC}            Download mod JARs into server/mods/"
-            echo -e "  ${CYAN}elm deploy regen${NC}           Rebuild docker-compose.yml + Caddyfile"
+            echo -e "  ${BOLD}Pack CDN:${NC}"
+            echo -e "  ${CYAN}elm deploy push${NC}            Re-publish pack + restart CDN"
+            echo -e "  ${CYAN}elm deploy cdn${NC}             Publish pack to CDN"
+            echo -e "  ${CYAN}elm deploy cdn-start${NC}       Start Caddy CDN container"
+            echo -e "  ${CYAN}elm deploy cdn-stop${NC}        Stop Caddy CDN container"
+            echo -e "  ${CYAN}elm deploy mods${NC}            Download mod JARs locally"
+            echo -e "  ${CYAN}elm deploy regen${NC}           Regenerate Caddyfile"
             echo -e "  ${CYAN}elm deploy serve${NC}           Local HTTP dev server"
             echo ""
             echo -e "  ${BOLD}Quick start:${NC}"
+            echo "    elm deploy setup                              # configure Pelican"
             echo "    elm target add survival domain=survival.enviouslabs.com ram=8192"
-            echo "    elm config edit   # set CDN_DOMAIN=pack.enviouslabs.com for HTTPS"
             echo "    elm deploy create --target survival"
-            echo "    elm deploy start"
+            echo "    elm deploy start --target survival"
             echo ""
-            echo -e "  ${DIM}Caddy handles HTTPS automatically when CDN_DOMAIN is set.${NC}"
-            echo -e "  ${DIM}Without CDN_DOMAIN, pack files are served on http://server-ip:8080${NC}"
+            echo -e "  ${DIM}Game servers run on Pelican Panel (${PELICAN_URL:-not configured}).${NC}"
+            echo -e "  ${DIM}Pack CDN runs via standalone Caddy container (auto-HTTPS when CDN_DOMAIN set).${NC}"
             echo ""
             ;;
     esac
@@ -5137,20 +5383,32 @@ cmd_config() {
             echo -e "    Source:    ${PREFER_SOURCE} first"
 
             echo ""
-            echo -e "  ${BOLD}Docker:${NC}"
-            if command -v docker &>/dev/null; then
-                echo -e "    Docker:    ${GREEN}installed${NC}"
-                local compose_file="${DOCKER_COMPOSE_DIR}/docker-compose.yml"
-                if [[ -f "$compose_file" ]]; then
-                    local svc_count
-                    svc_count=$(grep -c "^  mc-" "$compose_file" 2>/dev/null || echo 0)
-                    echo -e "    Compose:   ${compose_file} (${svc_count} server(s))"
+            echo -e "  ${BOLD}Pelican Panel:${NC}"
+            if [[ -n "${PELICAN_URL:-}" ]]; then
+                echo -e "    URL:       ${CYAN}${PELICAN_URL}${NC}"
+                echo -e "    Node:      ${PELICAN_NODE_ID:-${DIM}not set${NC}}"
+                echo -e "    Egg:       ${PELICAN_EGG_ID:-${DIM}not set${NC}}"
+                if [[ -n "${PELICAN_API_KEY:-}" ]]; then
+                    pelican_api GET "/servers" >/dev/null 2>&1 \
+                        && echo -e "    Status:    ${GREEN}connected${NC}" \
+                        || echo -e "    Status:    ${RED}unreachable${NC}"
                 else
-                    echo -e "    Compose:   ${DIM}not generated yet${NC}"
+                    echo -e "    API Key:   ${RED}not set${NC}"
                 fi
-                echo -e "    Image:     ${SERVER_IMAGE}"
             else
-                echo -e "    ${RED}Docker not installed${NC}"
+                echo -e "    ${DIM}Not configured — run: elm deploy setup${NC}"
+            fi
+
+            echo ""
+            echo -e "  ${BOLD}CDN (Caddy):${NC}"
+            if command -v docker &>/dev/null; then
+                if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^el-packserver$'; then
+                    echo -e "    CDN:       ${GREEN}running${NC}"
+                else
+                    echo -e "    CDN:       ${DIM}stopped${NC}"
+                fi
+            else
+                echo -e "    ${RED}Docker not installed (needed for CDN)${NC}"
             fi
 
             local tcount
@@ -5277,6 +5535,18 @@ cmd_key() {
             _key_set "CLOUDFLARE_API_TOKEN" "$token"
             echo -e "  ${GREEN}✓${NC} Cloudflare API token saved"
             ;;
+        pelican|pel)
+            local token="${1:?Usage: elm key pelican <API_TOKEN>}"
+            _key_set "PELICAN_API_KEY" "$token"
+            echo -e "  ${GREEN}✓${NC} Pelican API key saved"
+            # Test connection if URL is configured
+            if [[ -n "${PELICAN_URL:-}" ]]; then
+                PELICAN_API_KEY="$token"
+                pelican_api GET "/servers" >/dev/null 2>&1 \
+                    && echo -e "  ${GREEN}✓${NC} Connection verified (${PELICAN_URL})" \
+                    || echo -e "  ${YELLOW}⚠${NC} Could not reach panel at ${PELICAN_URL}"
+            fi
+            ;;
         list|ls)
             header "Configured API Keys"
             echo -e "  ${DIM}Keys stored in: ${KEYS_FILE}${NC}"
@@ -5288,6 +5558,7 @@ cmd_key() {
             _key_show "DYNU_USERNAME" "Dynu (user)"
             _key_show "DYNU_PASSWORD" "Dynu (pass)"
             _key_show "CLOUDFLARE_API_TOKEN" "Cloudflare"
+            _key_show "PELICAN_API_KEY" "Pelican"
             echo ""
             ;;
         rm|remove)
@@ -5315,9 +5586,13 @@ cmd_key() {
                     _key_remove "CLOUDFLARE_API_TOKEN"
                     echo -e "  ${GREEN}✓${NC} Cloudflare token removed"
                     ;;
+                pelican|pel)
+                    _key_remove "PELICAN_API_KEY"
+                    echo -e "  ${GREEN}✓${NC} Pelican API key removed"
+                    ;;
                 *)
                     echo -e "${RED}Unknown provider: ${provider}${NC}"
-                    echo "  Providers: curseforge, noip, duckdns, dynu, cloudflare"
+                    echo "  Providers: curseforge, noip, duckdns, dynu, cloudflare, pelican"
                     ;;
             esac
             ;;
@@ -5329,6 +5604,7 @@ cmd_key() {
             echo "  elm key duckdns <TOKEN>             Set DuckDNS token"
             echo "  elm key dynu <user> <pass>         Set Dynu credentials"
             echo "  elm key cloudflare <API_TOKEN>     Set Cloudflare API token"
+            echo "  elm key pelican <API_TOKEN>        Set Pelican Panel API token"
             echo ""
             echo "  elm key list                       Show configured keys"
             echo "  elm key rm <provider>              Remove a key"
@@ -5888,19 +6164,21 @@ cmd_help() {
     elm pin/unpin <slug>           Pin/unpin mod version
     elm export [mr|cf|md]          Export pack (.mrpack, .zip, or markdown)
 
-  SERVER (all via deploy, use --target <name>):
-    elm deploy create              Publish + generate compose (auto-HTTPS)
-    elm deploy full                Pipeline: sync → publish → compose → start
-    elm deploy start/stop/restart  Control server
-    elm deploy status              Show all servers
-    elm deploy console <cmd>       Send RCON command
-    elm deploy logs                Tail server logs
-    elm deploy backup              Backup server world
-    elm deploy push                Re-publish pack after changes
-    elm deploy mods                Download mod JARs into server/mods/
-    elm deploy regen               Rebuild docker-compose.yml + Caddyfile
+  SERVER (Pelican Panel, all via deploy, use --target <name>):
+    elm deploy setup               Configure Pelican Panel connection
+    elm deploy create              Publish pack + create server on Pelican
+    elm deploy full                Pipeline: sync → publish → create → start
+    elm deploy start/stop/restart  Control server via Pelican
+    elm deploy kill                Force kill server
+    elm deploy status              Show all server statuses
+    elm deploy console <cmd>       Send command to server console
+    elm deploy backup              Create server backup
+    elm deploy push                Re-publish pack + restart CDN
+    elm deploy cdn-start/stop      Manage Caddy CDN container
+    elm deploy mods                Download mod JARs locally
+    elm deploy regen               Regenerate Caddyfile
     elm deploy serve               Local HTTP dev server
-    elm deploy remove              Tear down deployment
+    elm deploy remove              Delete server from Pelican
     elm target [list|add|set|show|rm|dns]   Manage server targets
 
   DIAGNOSTICS:
@@ -6311,10 +6589,14 @@ cmd_nuke() {
     echo -e "  ${RED}${BOLD}⬇  EAGLE 500KG INBOUND  ⬇${NC}"
     echo ""
 
-    # ── Stop any running Docker containers first ─────────────────────
-    if [[ -f "$compose_file" ]]; then
-        echo -e "  ${YELLOW}Stopping Docker containers...${NC}"
-        (cd "$parent" && docker compose down --remove-orphans 2>/dev/null || docker-compose down --remove-orphans 2>/dev/null || true)
+    # ── Stop any running containers first ────────────────────────────
+    if command -v docker &>/dev/null; then
+        echo -e "  ${YELLOW}Stopping containers...${NC}"
+        docker rm -f el-packserver 2>/dev/null || true
+        # Legacy: stop old compose containers if compose file exists
+        if [[ -f "$compose_file" ]]; then
+            (cd "$parent" && docker compose down --remove-orphans 2>/dev/null || docker-compose down --remove-orphans 2>/dev/null || true)
+        fi
         log OK "Containers stopped"
     fi
 
