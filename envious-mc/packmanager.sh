@@ -2921,15 +2921,153 @@ cmd_add_interactive() {
 
 cmd_remove() {
     check_packwiz; check_pack_init
-    local slug="${1:?Usage: pm remove <slug>}"
-    header "Removing: ${slug}"
-    $PACKWIZ_BIN remove "$slug" --yes 2>>"$RUN_LOG" && log OK "Removed from pack" || log WARN "Remove may have failed"
+
+    if [[ -z "${1:-}" ]]; then
+        echo "Usage: pm remove <query>"
+        echo "  Query can be a partial name — matching .pw.toml files will be shown."
+        return 1
+    fi
+
+    local query="$1"
+    local query_lower
+    query_lower=$(echo "$query" | tr '[:upper:]' '[:lower:]')
+
+    # ── Scan installed .pw.toml files for matches ────────────────────
+    local -a match_slugs=() match_names=() match_files=()
+
+    for toml in "${PACK_DIR}/mods/"*.pw.toml; do
+        [[ -f "$toml" ]] || continue
+        local slug name filename
+        slug=$(basename "$toml" .pw.toml)
+        name=$(grep -oP '^name\s*=\s*"\K[^"]+' "$toml" 2>/dev/null || echo "$slug")
+        filename=$(grep -oP '^filename\s*=\s*"\K[^"]+' "$toml" 2>/dev/null || echo "")
+
+        # Match against slug, name, and filename (case-insensitive)
+        local slug_lower name_lower file_lower
+        slug_lower=$(echo "$slug" | tr '[:upper:]' '[:lower:]')
+        name_lower=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+        file_lower=$(echo "$filename" | tr '[:upper:]' '[:lower:]')
+
+        if [[ "$slug_lower" == *"$query_lower"* || "$name_lower" == *"$query_lower"* || "$file_lower" == *"$query_lower"* ]]; then
+            match_slugs+=("$slug")
+            match_names+=("$name")
+            match_files+=("$filename")
+        fi
+    done
+
+    # ── No matches ───────────────────────────────────────────────────
+    if [[ ${#match_slugs[@]} -eq 0 ]]; then
+        log FAIL "No installed mods matching '${query}'"
+        echo -e "  ${DIM}Tip: Run ${CYAN}pm list${NC} ${DIM}to see all installed mods${NC}"
+        return 1
+    fi
+
+    # ── Exact single match → remove directly ─────────────────────────
+    local target_slug=""
+    if [[ ${#match_slugs[@]} -eq 1 ]]; then
+        target_slug="${match_slugs[0]}"
+        echo -e "  ${BOLD}Match:${NC} ${match_names[0]} ${DIM}(${match_slugs[0]})${NC}"
+    else
+        # ── Multiple matches → numbered list ─────────────────────────
+        echo ""
+        echo -e "  ${CYAN}${BOLD}Mods matching '${query}':${NC}"
+        echo ""
+        local idx=1
+        for i in "${!match_slugs[@]}"; do
+            local side
+            side=$(grep -oP '^side\s*=\s*"\K[^"]+' "${PACK_DIR}/mods/${match_slugs[$i]}.pw.toml" 2>/dev/null || echo "both")
+            local si=""
+            case "$side" in
+                client) si="${CYAN}C${NC}" ;; server) si="${MAGENTA}S${NC}" ;; *) si="${DIM}B${NC}" ;;
+            esac
+            printf "    ${BOLD}%2d${NC}) [%b] %-35s %s\n" \
+                "$idx" "$si" "${match_names[$i]}" "${DIM}${match_files[$i]}${NC}"
+            ((idx++))
+        done
+        echo ""
+        echo -e "    ${BOLD} 0${NC}) Cancel"
+        echo ""
+
+        local choice
+        read -rp "  Remove which mod? [1-$((idx-1)), 0=cancel]: " choice </dev/tty
+
+        if [[ "$choice" == "0" || -z "$choice" ]]; then
+            echo "  Cancelled."
+            return 0
+        fi
+
+        # Support removing multiple: "1 3 5" or "1,3,5"
+        local -a picks=()
+        choice="${choice//,/ }"
+        for c in $choice; do
+            if [[ "$c" =~ ^[0-9]+$ && "$c" -ge 1 && "$c" -lt "$idx" ]]; then
+                picks+=("$((c - 1))")
+            fi
+        done
+
+        if [[ ${#picks[@]} -eq 0 ]]; then
+            echo "  Invalid selection."
+            return 1
+        fi
+
+        # Remove each selected mod
+        for pi in "${picks[@]}"; do
+            target_slug="${match_slugs[$pi]}"
+            local jar_filename="${match_files[$pi]}"
+            echo ""
+            header "Removing: ${match_names[$pi]} (${target_slug})"
+
+            $PACKWIZ_BIN remove "$target_slug" --yes 2>>"$RUN_LOG" && log OK "Removed from pack" || log WARN "Remove may have failed — cleaning up manually"
+
+            # Remove the .pw.toml if packwiz didn't
+            [[ -f "${PACK_DIR}/mods/${target_slug}.pw.toml" ]] && rm -f "${PACK_DIR}/mods/${target_slug}.pw.toml"
+
+            # Clean from mods.txt
+            if [[ -f "$MODS_FILE" ]]; then
+                local tmp; tmp="$(mktemp)"
+                grep -vE "^!?((mr|cf|url|local):)?${target_slug}(\s|#|$)" "$MODS_FILE" > "$tmp" || true
+                mv "$tmp" "$MODS_FILE"
+                log INFO "Removed from mods.txt"
+            fi
+
+            # Clean JAR from server/mods/ and cdn/jars/ if self-hosted
+            if [[ -n "$jar_filename" ]]; then
+                local parent; parent=$(dirname "$PACK_DIR")
+                rm -f "${PACK_DIR}/mods/${jar_filename}" 2>/dev/null || true
+                rm -f "${parent}/server/mods/${jar_filename}" 2>/dev/null || true
+                rm -f "${parent}/cdn/jars/${jar_filename}" 2>/dev/null || true
+            fi
+        done
+
+        $PACKWIZ_BIN refresh 2>>"$RUN_LOG"
+        return 0
+    fi
+
+    # ── Single match removal ─────────────────────────────────────────
+    local jar_filename="${match_files[0]}"
+    header "Removing: ${match_names[0]} (${target_slug})"
+
+    $PACKWIZ_BIN remove "$target_slug" --yes 2>>"$RUN_LOG" && log OK "Removed from pack" || log WARN "Remove may have failed — cleaning up manually"
+
+    # Remove .pw.toml if packwiz didn't
+    [[ -f "${PACK_DIR}/mods/${target_slug}.pw.toml" ]] && rm -f "${PACK_DIR}/mods/${target_slug}.pw.toml"
+
+    # Clean from mods.txt
     if [[ -f "$MODS_FILE" ]]; then
         local tmp; tmp="$(mktemp)"
-        grep -vE "^!?((mr|cf|url):)?${slug}(\s|#|$)" "$MODS_FILE" > "$tmp" || true
+        grep -vE "^!?((mr|cf|url|local):)?${target_slug}(\s|#|$)" "$MODS_FILE" > "$tmp" || true
         mv "$tmp" "$MODS_FILE"
         log INFO "Removed from mods.txt"
     fi
+
+    # Clean JAR copies
+    if [[ -n "$jar_filename" ]]; then
+        local parent; parent=$(dirname "$PACK_DIR")
+        rm -f "${PACK_DIR}/mods/${jar_filename}" 2>/dev/null || true
+        rm -f "${parent}/server/mods/${jar_filename}" 2>/dev/null || true
+        rm -f "${parent}/cdn/jars/${jar_filename}" 2>/dev/null || true
+    fi
+
     $PACKWIZ_BIN refresh 2>>"$RUN_LOG"
 }
 
