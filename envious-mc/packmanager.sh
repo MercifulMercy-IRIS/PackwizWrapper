@@ -208,7 +208,6 @@ RUN_LOG="${LOG_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
 touch "$RUN_LOG" 2>/dev/null || RUN_LOG="/tmp/pm_run_$$.log"
 
 DEPS_ADDED=()
-MISMATCHES=()          # Tracks slug mismatches: requested|resolved_slug|resolved_name|toml
 UNRESOLVED_ADDED=()    # Mods saved to unresolved.txt this run
 
 # Colors
@@ -428,7 +427,7 @@ alias_remove() {
 }
 
 # Verify a single mod after installation
-# Returns 0 if match is good, 1 if mismatch detected, 2 if user rejected alias
+# Returns 0 if match is good, 1 if mismatch (auto-removed + unresolved)
 verify_mod_install() {
     local requested_slug="$1"
 
@@ -451,80 +450,32 @@ verify_mod_install() {
     IFS='|' read -r resolved_slug resolved_name resolved_id resolved_source resolved_filename <<< "$parsed"
 
     # Normalize for comparison
-    local req_norm res_norm res_name_norm
+    local req_norm res_norm
     req_norm=$(normalize_slug "$requested_slug")
     res_norm=$(normalize_slug "$resolved_slug")
-    res_name_norm=$(normalize_slug "$resolved_name")
 
-    # Check 1: Slug match (exact or normalized)
+    # Slug match (exact or normalized) — all good
     if [[ "$req_norm" == "$res_norm" ]]; then
-        return 0  # Perfect match
+        return 0
     fi
 
-    # Check 2: Is the requested slug contained in the resolved name?
-    # e.g., "ae2" matches "Applied Energistics 2" → ae2 is in "appliedenergistics2"
-    if [[ "$res_name_norm" == *"$req_norm"* || "$res_norm" == *"$req_norm"* || "$req_norm" == *"$res_norm"* ]]; then
-        # This is an alias — check if already approved
-        local existing_alias
-        existing_alias=$(alias_get "$requested_slug")
-        if [[ "$existing_alias" == "$resolved_slug" ]]; then
-            # Previously approved, skip prompt
-            log INFO "${requested_slug} → ${resolved_name} ${DIM}(approved alias)${NC}"
-            return 0
-        fi
+    # ── Wrong mod — auto-remove and save to unresolved ──
+    # PackWiz often resolves to a similar-sounding but wrong mod.
+    # Instead of keeping it (or prompting), remove immediately
+    # and let the user resolve it manually via staging/ or search.
 
-        # --- Prompt user for approval ---
-        echo ""
-        echo -e "  ${YELLOW}${BOLD}ALIAS DETECTED${NC}"
-        echo -e "  Requested: ${BOLD}${requested_slug}${NC}"
-        echo -e "  Got:       ${BOLD}${resolved_name}${NC} (${resolved_slug}.pw.toml)"
-        echo ""
-        echo -e "  ${CYAN}(a)${NC} Accept — keep this mod and remember the alias"
-        echo -e "  ${RED}(r)${NC} Reject — remove and save to unresolved.txt for later binding"
-        echo -e "  ${RED}(d)${NC} Reject — remove and discard"
-        echo -e "  ${DIM}(s)${NC} Skip   — keep for now, ask again next time"
-        echo ""
-        echo -ne "  ${CYAN}choice [a/r/d/s]>${NC} "
-        read -r alias_choice < /dev/tty
+    echo -e "  ${RED}⚠ WRONG MOD${NC}: asked for ${BOLD}${requested_slug}${NC}, got ${BOLD}${resolved_name}${NC} (${resolved_slug})"
+    log WARN "Removing wrong mod: ${resolved_slug} (wanted ${requested_slug})"
+    echo "MISMATCH REMOVED: requested='${requested_slug}' got='${resolved_slug}' (${resolved_name})" >> "$RUN_LOG"
 
-        case "$alias_choice" in
-            a|A)
-                alias_save "$requested_slug" "$resolved_slug" "$resolved_name" "$toml_file"
-                log OK "${requested_slug} → ${resolved_name} ${DIM}(alias accepted)${NC}"
-                echo "ALIAS ACCEPTED: ${requested_slug} → ${resolved_slug} (${resolved_name})" >> "$RUN_LOG"
-                return 0
-                ;;
-            r|R)
-                # Remove the mod and save to unresolved for later url/jar binding
-                log WARN "Rejecting alias: removing ${resolved_slug}..."
-                $PACKWIZ_BIN remove "$resolved_slug" --yes 2>>"$RUN_LOG" || rm -f "$toml_file"
-                $PACKWIZ_BIN refresh 2>>"$RUN_LOG" || true
-                add_to_unresolved "$requested_slug" "alias rejected (got ${resolved_name})"
-                log WARN "${requested_slug} → saved to unresolved.txt"
-                echo "ALIAS REJECTED+UNRESOLVED: ${requested_slug} → ${resolved_slug} (removed)" >> "$RUN_LOG"
-                return 2
-                ;;
-            d|D)
-                # Remove the mod and discard entirely
-                log WARN "Rejecting alias: removing ${resolved_slug}..."
-                $PACKWIZ_BIN remove "$resolved_slug" --yes 2>>"$RUN_LOG" || rm -f "$toml_file"
-                $PACKWIZ_BIN refresh 2>>"$RUN_LOG" || true
-                echo "ALIAS REJECTED+DISCARDED: ${requested_slug} → ${resolved_slug} (removed)" >> "$RUN_LOG"
-                return 2
-                ;;
-            *)
-                log INFO "${requested_slug} → ${resolved_name} ${DIM}(skipped — will ask again)${NC}"
-                echo "ALIAS SKIPPED: ${requested_slug} → ${resolved_slug}" >> "$RUN_LOG"
-                return 0
-                ;;
-        esac
-    fi
+    # Remove the wrong mod from the pack
+    $PACKWIZ_BIN remove "$resolved_slug" --yes 2>>"$RUN_LOG" || rm -f "$toml_file"
+    $PACKWIZ_BIN refresh 2>>"$RUN_LOG" || true
 
-    # If we got here, it's a genuine mismatch (not even an alias)
-    MISMATCHES+=("${requested_slug}|${resolved_slug}|${resolved_name}|${toml_file}")
-
-    echo -e "  ${RED}⚠ MISMATCH${NC}: asked for ${BOLD}${requested_slug}${NC}, got ${BOLD}${resolved_name}${NC} (${resolved_slug}.pw.toml)"
-    echo "MISMATCH: requested='${requested_slug}' resolved_slug='${resolved_slug}' resolved_name='${resolved_name}' file='${toml_file}'" >> "$RUN_LOG"
+    # Save to unresolved for later resolution
+    add_to_unresolved "$requested_slug" "got wrong mod: ${resolved_name} (${resolved_slug})"
+    echo -e "    ${DIM}→ saved to unresolved.txt${NC}"
+    echo -e "    ${DIM}Resolve with: ${CYAN}pm search ${requested_slug}${NC}  or  ${CYAN}pm stage${NC}"
 
     return 1
 }
@@ -536,8 +487,7 @@ verify_all_mods() {
     [[ -d "${PACK_DIR}/mods" ]] || { echo -e "  ${DIM}No mods installed.${NC}"; return; }
     [[ -f "$MODS_FILE" ]] || { echo -e "  ${DIM}No mods.txt found.${NC}"; return; }
 
-    local checked=0 ok=0 aliased=0 mismatched=0 unlisted=0 missing=0
-    local mismatch_report=()
+    local checked=0 ok=0 fuzzy=0 unlisted=0 missing=0
     local unlisted_report=()
     local missing_report=()
 
@@ -583,8 +533,8 @@ verify_all_mods() {
                     break
                 elif [[ "$name_norm" == *"$req_norm"* || "$res_norm" == *"$req_norm"* ]]; then
                     found_match=true
-                    (( aliased++ ))
-                    echo -e "  ${CYAN}↔${NC} ${resolved_slug} ← ${req_slug} ${DIM}(alias)${NC}"
+                    (( fuzzy++ ))
+                    echo -e "  ${YELLOW}↔${NC} ${resolved_slug} ← ${req_slug} ${DIM}(fuzzy match — may be wrong mod)${NC}"
                     break
                 fi
             done
@@ -633,7 +583,7 @@ verify_all_mods() {
     echo -e "  ${BOLD}Audit Results${NC}"
     echo -e "  Checked:    ${BOLD}${checked}${NC} installed .pw.toml files"
     echo -e "  Matched:    ${GREEN}${ok}${NC} exact matches"
-    echo -e "  Aliased:    ${CYAN}${aliased}${NC} slug ≠ filename but name matches"
+    echo -e "  Fuzzy:      ${YELLOW}${fuzzy}${NC} slug ≠ filename (may be wrong mod)"
     echo -e "  Unlisted:   ${MAGENTA}${unlisted}${NC} installed but not in mods.txt (deps)"
     echo -e "  Missing:    ${RED}${missing}${NC} in mods.txt but not installed"
 
@@ -849,15 +799,11 @@ install_mod() {
 
     # Verify what actually got installed matches what we asked for
     if $installed; then
-        verify_mod_install "$slug"
-        local verify_result=$?
-        if (( verify_result == 0 )); then
+        if verify_mod_install "$slug"; then
             log OK "${slug} ${DIM}(${via})${NC}"
-        elif (( verify_result == 2 )); then
-            log WARN "${slug} ${DIM}(${via})${NC} — ${RED}alias rejected and removed${NC}"
-            return 1
         else
-            log WARN "${slug} ${DIM}(${via})${NC} — ${YELLOW}VERIFY FAILED — review mismatch above${NC}"
+            # Wrong mod was auto-removed and saved to unresolved
+            return 1
         fi
     fi
 
@@ -2452,7 +2398,7 @@ cmd_sync() {
     local total=0 success=0 failed=0
     local failed_mods=()
     DEPS_ADDED=()
-    MISMATCHES=()
+    UNRESOLVED_ADDED=()
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -2483,29 +2429,11 @@ cmd_sync() {
     echo -e "  Processed:   ${BOLD}${total}${NC}"
     echo -e "  Installed:   ${GREEN}${success}${NC}"
     echo -e "  Failed:      ${RED}${failed}${NC}"
-    echo -e "  Mismatches:  ${YELLOW}${#MISMATCHES[@]}${NC}"
 
     if (( ${#DEPS_ADDED[@]} > 0 )); then
         echo ""
         echo -e "  ${MAGENTA}Auto-installed dependencies:${NC}"
         printf '    ↳ %s\n' "${DEPS_ADDED[@]}"
-    fi
-
-    if (( ${#MISMATCHES[@]} > 0 )); then
-        echo ""
-        echo -e "  ${YELLOW}${BOLD}⚠ MISMATCHED MODS — review these carefully:${NC}"
-        echo -e "  ${DIM}PackWiz resolved these to something different than requested.${NC}"
-        echo ""
-        for entry in "${MISMATCHES[@]}"; do
-            IFS='|' read -r req_slug res_slug res_name res_toml <<< "$entry"
-            echo -e "    ${YELLOW}•${NC} asked for ${BOLD}${req_slug}${NC}"
-            echo -e "      got ${RED}${res_name}${NC} (${res_slug}.pw.toml)"
-            echo -e "      ${DIM}fix: pm remove ${res_slug} && pm add mr:correct-slug${NC}"
-            echo ""
-        done
-        # Write mismatches to file for reference
-        printf '%s\n' "${MISMATCHES[@]}" > "${LOG_DIR}/last_mismatches.txt"
-        echo -e "  ${DIM}Saved to: ${LOG_DIR}/last_mismatches.txt${NC}"
     fi
 
     if (( failed > 0 )); then
@@ -2557,7 +2485,6 @@ cmd_add() {
 
     header "Adding ${#} mod(s)"
     DEPS_ADDED=()
-    MISMATCHES=()
 
     for input in "$@"; do
         # Support file: prefix inline for batch adds too
@@ -2591,16 +2518,6 @@ cmd_add() {
         separator
         echo -e "  ${MAGENTA}Dependencies:${NC}"
         printf '    ↳ %s\n' "${DEPS_ADDED[@]}"
-    fi
-
-    if (( ${#MISMATCHES[@]} > 0 )); then
-        separator
-        echo -e "  ${YELLOW}${BOLD}⚠ MISMATCHED — got a different mod than requested:${NC}"
-        for entry in "${MISMATCHES[@]}"; do
-            IFS='|' read -r req_slug res_slug res_name res_toml <<< "$entry"
-            echo -e "    ${YELLOW}•${NC} ${BOLD}${req_slug}${NC} → ${RED}${res_name}${NC} (${res_slug})"
-            echo -e "      ${DIM}fix: pm remove ${res_slug} && pm add mr:correct-slug${NC}"
-        done
     fi
 
     $PACKWIZ_BIN refresh 2>>"$RUN_LOG"
@@ -3256,15 +3173,13 @@ cmd_diff() {
     (( extra > 0 ))   && echo -e "  Unlisted:          ${MAGENTA}${extra}${NC} (installed, not in mods.txt)"
     echo ""
 
-    # Show last known mismatches if they exist
-    if [[ -f "${LOG_DIR}/last_mismatches.txt" ]]; then
-        local mc
-        mc=$(wc -l < "${LOG_DIR}/last_mismatches.txt" 2>/dev/null || echo 0)
-        if (( mc > 0 )); then
-            echo -e "  ${YELLOW}${BOLD}Last sync had ${mc} slug mismatch(es):${NC}"
-            while IFS='|' read -r req_slug res_slug res_name res_toml; do
-                echo -e "    ${YELLOW}•${NC} ${BOLD}${req_slug}${NC} → ${RED}${res_name}${NC} (${res_slug})"
-            done < "${LOG_DIR}/last_mismatches.txt"
+    # Show unresolved count if any
+    if [[ -f "$UNRESOLVED_FILE" ]]; then
+        local ur_count
+        ur_count=$(grep -cvE '^\s*(#|$)' "$UNRESOLVED_FILE" 2>/dev/null || echo 0)
+        if (( ur_count > 0 )); then
+            echo -e "  ${YELLOW}${BOLD}Unresolved mods: ${ur_count}${NC}"
+            echo -e "  ${DIM}Fix with: pm unresolved search  or  pm stage${NC}"
             echo ""
         fi
     fi
@@ -3781,8 +3696,10 @@ cmd_markdown() {
 }
 
 # ============================================================================
-# ALIASES COMMAND
+# ALIASES COMMAND (legacy)
 # ============================================================================
+# New installs no longer create aliases — mismatched mods are auto-removed
+# and sent to unresolved.txt. This command exists to manage any old aliases.
 
 cmd_aliases() {
     local subcmd="${1:-list}"
