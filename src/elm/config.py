@@ -20,7 +20,6 @@ DEFAULTS: dict[str, str] = {
     "LOADER": "forge",
     "LOADER_VERSION": "",
     "PREFER_SOURCE": "mr",
-    "PACKWIZ_BIN": "packwiz",
     "RETRY_ATTEMPTS": "2",
     "RETRY_DELAY": "3",
     "AUTO_DEPS": "true",
@@ -128,10 +127,6 @@ class Config:
     @property
     def loader(self) -> str:
         return self.get("LOADER")
-
-    @property
-    def packwiz_bin(self) -> str:
-        return self.get("PACKWIZ_BIN")
 
     @property
     def prefer_source(self) -> str:

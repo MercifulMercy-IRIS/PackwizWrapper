@@ -1,13 +1,9 @@
 """Self-update logic for ELM.
 
 Handles three update paths:
-1. **Python package** — `pip install --upgrade` from the git repo (updates CLI,
-   menu, all Python modules).  Works whether ELM was installed normally or in
-   editable mode.
-2. **Shell scripts & config** — individual file sync from GitHub raw content,
-   auto-discovered via the GitHub API so new files are never missed.
-3. **Version check** — compares the remote ``__version__`` against the local
-   one *before* doing any work, so we can skip when already current.
+1. **Python package** — `pip install --upgrade` from the git repo.
+2. **Shell scripts & config** — individual file sync from GitHub raw content.
+3. **Version check** — compares remote __version__ against local.
 """
 
 from __future__ import annotations
@@ -18,7 +14,8 @@ import tempfile
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+
+import httpx
 
 from elm.config import Config
 from elm.ui import console, _fail, _ok, _warn, _info, _hint
@@ -27,15 +24,16 @@ from elm.ui import console, _fail, _ok, _warn, _info, _hint
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
-def _curl_text(url: str, timeout: int = 15) -> str | None:
-    """Fetch *url* via curl.  Returns body text or None on failure."""
-    r = subprocess.run(
-        ["curl", "-fsSL", "--connect-timeout", str(timeout), url],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
+def _fetch_text(url: str, timeout: float = 15.0) -> str | None:
+    """Fetch URL via httpx. Returns body text or None on failure."""
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.get(url)
+        if resp.status_code >= 400:
+            return None
+        return resp.text
+    except httpx.HTTPError:
         return None
-    return r.stdout
 
 
 def _github_raw_url(repo: str, branch: str, path: str) -> str:
@@ -57,16 +55,16 @@ def _github_api_url(repo: str, branch: str, path: str) -> str:
 
 
 def fetch_remote_version(repo: str, branch: str, gh_path: str) -> str | None:
-    """Fetch the remote ``__version__`` from ``src/elm/__init__.py``."""
-    # Try the Python package location first
+    """Fetch the remote __version__ from src/elm/__init__.py."""
+    import re
+
     for init_path in [
         f"{gh_path}/src/elm/__init__.py" if gh_path else "src/elm/__init__.py",
         "src/elm/__init__.py",
     ]:
         url = _github_raw_url(repo, branch, init_path)
-        body = _curl_text(url, timeout=10)
+        body = _fetch_text(url, timeout=10)
         if body:
-            import re
             m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', body)
             if m:
                 return m.group(1)
@@ -74,7 +72,7 @@ def fetch_remote_version(repo: str, branch: str, gh_path: str) -> str | None:
 
 
 def check_for_update(cfg: Config) -> tuple[str, str] | None:
-    """Return ``(local, remote)`` versions if an update is available, else None."""
+    """Return (local, remote) versions if an update is available, else None."""
     from elm import __version__ as local_version
 
     repo = cfg.get("ELM_GITHUB_REPO")
@@ -99,13 +97,9 @@ def check_for_update(cfg: Config) -> tuple[str, str] | None:
 def discover_repo_files(
     repo: str, branch: str, gh_path: str
 ) -> list[dict[str, str]] | None:
-    """List files in the repo path via the GitHub API.
-
-    Returns a list of dicts with ``name``, ``download_url``, ``type`` keys,
-    or None on failure.
-    """
+    """List files in the repo path via the GitHub API."""
     url = _github_api_url(repo, branch, gh_path)
-    body = _curl_text(url, timeout=15)
+    body = _fetch_text(url, timeout=15)
     if not body:
         return None
     try:
@@ -149,10 +143,7 @@ class UpdateResult:
 
 
 def _update_pip_package(repo: str, branch: str) -> tuple[bool, str]:
-    """Reinstall the ELM Python package from the git repo.
-
-    Returns (success, error_message).
-    """
+    """Reinstall the ELM Python package from the git repo."""
     import sys
 
     git_url = f"git+https://github.com/{repo}.git@{branch}"
@@ -179,16 +170,10 @@ def _sync_shell_files(
     gh_path: str,
     result: UpdateResult,
 ) -> None:
-    """Sync shell scripts, config templates, and data files from GitHub.
-
-    Auto-discovers files via the API when possible; falls back to the
-    hardcoded ``ELM_UPDATE_FILES`` list.
-    """
-    # Discover files from the API
+    """Sync shell scripts, config templates, and data files from GitHub."""
     remote_files = discover_repo_files(repo, branch, gh_path)
 
     if remote_files:
-        # Filter to updatable file types (skip dirs, .git, Python source)
         file_names = [
             f["name"]
             for f in remote_files
@@ -197,7 +182,6 @@ def _sync_shell_files(
             and f["name"] not in ("pyproject.toml", "README.md", "LICENSE")
         ]
     else:
-        # Fallback to configured list
         file_names = (
             cfg.get("ELM_UPDATE_FILES") or "elm.sh install.sh elm.conf mods.txt"
         ).split()
@@ -207,7 +191,7 @@ def _sync_shell_files(
     for filename in file_names:
         url = f"{base_url}/{filename}"
         try:
-            body = _curl_text(url, timeout=15)
+            body = _fetch_text(url, timeout=15)
             if body is None:
                 result.failed_files.append(filename)
                 continue
@@ -235,12 +219,7 @@ def _sync_shell_files(
 
 
 def run_full_update(cfg: Config) -> UpdateResult:
-    """Execute the full update pipeline.
-
-    1. Fetch remote version and compare with local.
-    2. Update the Python package via pip (CLI, menu, all modules).
-    3. Sync shell scripts and data files from GitHub.
-    """
+    """Execute the full update pipeline."""
     from elm import __version__ as local_version
 
     result = UpdateResult(old_version=local_version)
@@ -291,13 +270,9 @@ def print_result(result: UpdateResult) -> None:
             f" updated: {', '.join(result.updated_files)}"
         )
     if result.skipped_files:
-        _info(
-            f"{len(result.skipped_files)} already up to date"
-        )
+        _info(f"{len(result.skipped_files)} already up to date")
     if result.failed_files:
-        _warn(
-            f"{len(result.failed_files)} failed: {', '.join(result.failed_files)}"
-        )
+        _warn(f"{len(result.failed_files)} failed: {', '.join(result.failed_files)}")
 
     # Summary
     console.print()

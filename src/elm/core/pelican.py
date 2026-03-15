@@ -213,7 +213,7 @@ def get_client(cfg: Config) -> PelicanClient:
     if not url:
         raise PelicanError("GET", "/", 0, "PELICAN_URL not configured. Run: elm deploy setup")
     if not key:
-        raise PelicanError("GET", "/", 0, "Pelican API key not set. Run: elm key pelican <token>")
+        raise PelicanError("GET", "/", 0, "Pelican API key not set. Run: elm key set pelican")
     return PelicanClient(url=url.rstrip("/"), api_key=key)
 
 

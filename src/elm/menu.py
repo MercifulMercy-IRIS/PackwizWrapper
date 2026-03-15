@@ -6,9 +6,11 @@ Arrow-key navigable, categorized, plain-English labels.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from typing import Any
 
-import click
+import typer
 from rich.panel import Panel
 from rich.table import Table
 from simple_term_menu import TerminalMenu
@@ -16,6 +18,8 @@ from simple_term_menu import TerminalMenu
 from elm import __version__
 from elm.config import (
     Config,
+    DEFAULTS,
+    load_config,
     load_targets,
     target_list,
     target_remove,
@@ -26,8 +30,6 @@ from elm.ui import console, _fail, _ok, _warn, _info, _hint, _header
 
 # ── Menu definition ──────────────────────────────────────────────────────
 
-# Category headers start with ── and are not selectable.
-# Selectable items are plain strings.
 MAIN_MENU: list[str] = [
     "── Mods ──────────────────────",
     "   Install a mod",
@@ -63,9 +65,6 @@ MAIN_MENU: list[str] = [
     "   Quit",
 ]
 
-# Indices of category headers (not selectable)
-_HEADER_INDICES = [i for i, item in enumerate(MAIN_MENU) if item.startswith("──")]
-
 
 def _pick(title: str, items: list[str]) -> int | None:
     """Show a sub-menu and return the selected index, or None on escape."""
@@ -81,7 +80,7 @@ def _pick(title: str, items: list[str]) -> int | None:
 
 
 def _pick_target(cfg: Config, action: str = "select") -> str | None:
-    """Let the user pick a target from a list. Returns name or None."""
+    """Let the user pick a target from a list."""
     names = target_list()
     if not names:
         _warn("No targets configured yet.")
@@ -102,15 +101,15 @@ def _pause() -> None:
 
 
 # ── Action handlers ──────────────────────────────────────────────────────
-# Each handler receives the Config, does its work, returns nothing.
 
 
 def action_add_mod(cfg: Config) -> None:
     """Prompt for mod name(s), install them."""
-    from elm.packwiz import add_mod, safe_refresh, PackwizError
+    from elm.core.resolver import install_mod, ResolveError
+    from elm.core.packwiz import refresh_index
 
     _header("Install a Mod")
-    raw = click.prompt("  Mod name(s), separated by spaces")
+    raw = typer.prompt("  Mod name(s), separated by spaces")
     slugs = raw.strip().split()
     if not slugs:
         return
@@ -118,24 +117,24 @@ def action_add_mod(cfg: Config) -> None:
     ok_count = 0
     for slug in slugs:
         try:
-            with console.status(f"  Installing [cyan]{slug}[/cyan]..."):
-                add_mod(cfg, slug)
-            _ok(f"Installed [cyan]{slug}[/cyan]")
+            with console.status(f"  Resolving [cyan]{slug}[/cyan]..."):
+                resolved = install_mod(slug, cfg)
+            _ok(f"Installed [cyan]{resolved.name}[/cyan]")
             ok_count += 1
-        except PackwizError as exc:
+        except ResolveError as exc:
             _fail(f"Could not install [cyan]{slug}[/cyan]")
-            if exc.stderr.strip():
-                _hint(exc.stderr.strip().splitlines()[0][:100])
+            _hint(str(exc))
 
     if ok_count:
-        safe_refresh(cfg)
+        refresh_index(cfg.pack_dir)
+        _ok("Index updated")
 
 
 def action_remove_mod(cfg: Config) -> None:
     """Show installed mods, let user pick one to remove."""
-    from elm.packwiz import list_mods, remove_mod, safe_refresh, PackwizError
+    from elm.core.packwiz import list_mod_tomls, remove_mod_toml, refresh_index
 
-    mods = list_mods(cfg)
+    mods = list_mod_tomls(cfg.pack_dir)
     if not mods:
         _info("No mods installed.")
         return
@@ -146,35 +145,44 @@ def action_remove_mod(cfg: Config) -> None:
         return
 
     slug = items[idx]
-    try:
-        remove_mod(cfg, slug)
+    if remove_mod_toml(cfg.pack_dir, slug):
         _ok(f"Removed [cyan]{slug}[/cyan]")
-        safe_refresh(cfg)
-    except PackwizError as exc:
+        refresh_index(cfg.pack_dir)
+        _ok("Index updated")
+    else:
         _fail(f"Could not remove [cyan]{slug}[/cyan]")
-        if exc.stderr.strip():
-            _hint(exc.stderr.strip().splitlines()[0][:100])
 
 
 def action_update_mods(cfg: Config) -> None:
     """Update all mods."""
-    from elm.packwiz import update_mod, safe_refresh, PackwizError
+    from elm.core.resolver import install_mod, ResolveError
+    from elm.core.packwiz import list_mod_tomls, refresh_index
 
     _header("Updating All Mods")
-    try:
-        with console.status("  Checking for updates..."):
-            update_mod(cfg)
-        _ok("Update complete")
-        safe_refresh(cfg)
-    except PackwizError as exc:
-        _fail("Update failed")
-        if exc.stderr.strip():
-            _hint(exc.stderr.strip().splitlines()[0][:100])
+    mods = list_mod_tomls(cfg.pack_dir)
+    if not mods:
+        _info("No mods installed.")
+        return
+
+    ok_count = 0
+    for slug in mods:
+        try:
+            with console.status(f"  Checking [cyan]{slug}[/cyan]..."):
+                install_mod(slug, cfg)
+            _ok(f"Updated [cyan]{slug}[/cyan]")
+            ok_count += 1
+        except ResolveError as exc:
+            _warn(f"Could not update [cyan]{slug}[/cyan]: {exc}")
+
+    if ok_count:
+        refresh_index(cfg.pack_dir)
+    _ok(f"Updated {ok_count}/{len(mods)} mods")
 
 
 def action_sync(cfg: Config) -> None:
     """Sync mods from mods.txt."""
-    from elm.packwiz import sync_from_modsfile, safe_refresh
+    from elm.core.resolver import install_mod, ResolveError
+    from elm.core.packwiz import list_mod_tomls, refresh_index
 
     _header("Syncing from mods.txt")
     if not cfg.mods_file.is_file():
@@ -182,8 +190,30 @@ def action_sync(cfg: Config) -> None:
         _hint("Create a mods.txt with one mod slug per line")
         return
 
-    with console.status("  Syncing mods..."):
-        added, skipped, failed = sync_from_modsfile(cfg)
+    lines = [
+        ln.strip()
+        for ln in cfg.mods_file.read_text().splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+
+    installed = set(list_mod_tomls(cfg.pack_dir))
+    added = 0
+    skipped = 0
+    failed: list[str] = []
+
+    for raw_slug in lines:
+        slug = raw_slug.split(":")[-1] if ":" in raw_slug else raw_slug
+        slug = slug.lstrip("!")
+        if slug in installed:
+            skipped += 1
+            continue
+        try:
+            with console.status(f"  Installing [cyan]{slug}[/cyan]..."):
+                install_mod(raw_slug, cfg)
+            _ok(f"Added [cyan]{slug}[/cyan]")
+            added += 1
+        except ResolveError:
+            failed.append(slug)
 
     if added:
         _ok(f"Added {added} new mod{'s' if added != 1 else ''}")
@@ -192,16 +222,18 @@ def action_sync(cfg: Config) -> None:
     if failed:
         _warn(f"Failed: {', '.join(failed)}")
     if added:
-        safe_refresh(cfg)
+        from elm.core.packwiz import refresh_index
+        refresh_index(cfg.pack_dir)
+        _ok("Index updated")
     elif not failed:
         _ok("Everything up to date")
 
 
 def action_list_mods(cfg: Config) -> None:
     """Show installed mods in a table."""
-    from elm.packwiz import list_mods
+    from elm.core.packwiz import list_mod_tomls
 
-    mods = list_mods(cfg)
+    mods = list_mod_tomls(cfg.pack_dir)
     if not mods:
         _header("Installed Mods")
         _info("No mods installed yet.")
@@ -225,44 +257,69 @@ def action_list_mods(cfg: Config) -> None:
 
 def action_search(cfg: Config) -> None:
     """Search for a mod."""
-    from elm.packwiz import search_mod
+    query = typer.prompt("  Search for")
+    source = cfg.prefer_source
 
-    query = click.prompt("  Search for")
     with console.status(f"  Searching for [cyan]{query}[/cyan]..."):
-        output = search_mod(cfg, query)
-    if output.strip():
-        console.print(output)
-    else:
+        if source == "cf":
+            from elm.core.curseforge import search as cf_search
+            api_key = cfg.get("CURSEFORGE_API_KEY")
+            if not api_key:
+                _fail("CurseForge API key not set")
+                return
+            results = cf_search(query, api_key, mc_version=cfg.mc_version, loader=cfg.loader)
+            items = [(r.slug, r.name, f"{r.download_count:,}") for r in results]
+        else:
+            from elm.core.modrinth import search as mr_search
+            results = mr_search(query)
+            items = [(r.slug, r.title, f"{r.downloads:,}") for r in results]
+
+    if not items:
         _info(f"No results for [cyan]{query}[/cyan]")
-        _hint("Try a different query")
+        return
+
+    table = Table(title=f"Results: {query}", border_style="dim", padding=(0, 1))
+    table.add_column("Slug", style="cyan")
+    table.add_column("Name")
+    table.add_column("Downloads", style="dim", justify="right")
+    for slug_val, name, dl in items:
+        table.add_row(slug_val, name, dl)
+    console.print()
+    console.print(table)
 
 
 def action_init(cfg: Config) -> None:
     """Initialize a new pack."""
-    from elm.packwiz import init_pack, safe_refresh, PackwizError
+    from elm.core.packwiz import write_pack_toml, write_index_toml
 
     _header("New Modpack")
-    try:
-        with console.status("  Creating pack..."):
-            init_pack(cfg)
-        _ok("Pack initialized")
-        safe_refresh(cfg)
-    except PackwizError as exc:
-        _fail("Init failed")
-        if exc.stderr.strip():
-            _hint(exc.stderr.strip().splitlines()[0][:100])
+    name = cfg.pack_dir.name
+    with console.status("  Creating pack..."):
+        write_pack_toml(
+            cfg.pack_dir,
+            name=name,
+            mc_version=cfg.mc_version,
+            loader=cfg.loader,
+            loader_version=cfg.get("LOADER_VERSION"),
+        )
+        write_index_toml(cfg.pack_dir)
+        (cfg.pack_dir / "mods").mkdir(parents=True, exist_ok=True)
+    _ok(f"Pack initialized: [cyan]{name}[/cyan]")
 
 
 def action_refresh(cfg: Config) -> None:
     """Refresh pack index."""
-    from elm.packwiz import safe_refresh
+    from elm.core.packwiz import refresh_index
 
     _header("Refreshing Mod Index")
-    safe_refresh(cfg)
+    if refresh_index(cfg.pack_dir):
+        _ok("Index updated (sha256)")
+    else:
+        _fail("Refresh failed — no pack.toml found")
 
 
 def action_self_update(cfg: Config) -> None:
-    """Self-update ELM from GitHub (Python package + shell scripts)."""
+    """Self-update ELM from GitHub."""
     from elm.updater import run_full_update, print_result
 
     _header("Update ELM")
@@ -285,17 +342,17 @@ def action_self_update(cfg: Config) -> None:
 
 def action_deploy_setup(cfg: Config) -> None:
     """Interactive Pelican Panel setup."""
-    from elm.pelican import PelicanClient, PelicanError
+    from elm.core.pelican import PelicanClient, PelicanError
 
     _header("Pelican Panel Setup")
     console.print()
 
-    url = click.prompt("  Panel URL", default=cfg.pelican_url or "https://panel.example.com")
+    url = typer.prompt("  Panel URL", default=cfg.pelican_url or "https://panel.example.com")
     url = url.rstrip("/")
     cfg.set_global("PELICAN_URL", url)
     _ok(f"Panel URL: [cyan]{url}[/cyan]")
 
-    api_key = click.prompt("  Application API key", hide_input=True)
+    api_key = typer.prompt("  Application API key", hide_input=True)
     cfg.set_key("PELICAN_API_KEY", api_key)
     _ok("API key saved")
 
@@ -362,16 +419,15 @@ def action_deploy_setup(cfg: Config) -> None:
 
 def action_create_server(cfg: Config) -> None:
     """Create a Pelican server."""
-    from elm.pelican import create_target_server, PelicanError
+    from elm.core.pelican import create_target_server, PelicanError
 
     _header("Create Server")
-    name = click.prompt("  Target name")
-    domain = click.prompt("  Domain (optional)", default="")
+    name = typer.prompt("  Target name")
+    domain = typer.prompt("  Domain (optional)", default="")
 
     targets = load_targets()
     if name not in targets:
-        fields: dict = {"domain": domain, "port": 25565}
-        target_set(name, **fields)
+        target_set(name, domain=domain, port=25565)
         _ok(f"Target [cyan]{name}[/cyan] created")
 
     try:
@@ -383,9 +439,9 @@ def action_create_server(cfg: Config) -> None:
         _fail(exc.body or str(exc))
 
 
-def _server_action(cfg: Config, action: str, signal: str = "") -> None:
+def _server_action(cfg: Config, action: str) -> None:
     """Common pattern for server actions that need a target pick."""
-    from elm.pelican import (
+    from elm.core.pelican import (
         power_target, status_target, command_target,
         backup_target, delete_target_server, PelicanError,
     )
@@ -395,20 +451,10 @@ def _server_action(cfg: Config, action: str, signal: str = "") -> None:
         return
 
     try:
-        if action == "start":
-            with console.status(f"  Starting [cyan]{target}[/cyan]..."):
-                power_target(cfg, target, "start")
-            _ok(f"[cyan]{target}[/cyan] starting")
-
-        elif action == "stop":
-            with console.status(f"  Stopping [cyan]{target}[/cyan]..."):
-                power_target(cfg, target, "stop")
-            _ok(f"[cyan]{target}[/cyan] stopping")
-
-        elif action == "restart":
-            with console.status(f"  Restarting [cyan]{target}[/cyan]..."):
-                power_target(cfg, target, "restart")
-            _ok(f"[cyan]{target}[/cyan] restarting")
+        if action in ("start", "stop", "restart"):
+            with console.status(f"  Sending {action} to [cyan]{target}[/cyan]..."):
+                power_target(cfg, target, action)
+            _ok(f"[cyan]{target}[/cyan] {action}ing")
 
         elif action == "status":
             with console.status("  Fetching status..."):
@@ -439,7 +485,7 @@ def _server_action(cfg: Config, action: str, signal: str = "") -> None:
             ))
 
         elif action == "console":
-            cmd = click.prompt("  Command to send")
+            cmd = typer.prompt("  Command to send")
             command_target(cfg, target, cmd)
             _ok(f"Sent: [dim]{cmd}[/dim]")
 
@@ -449,7 +495,7 @@ def _server_action(cfg: Config, action: str, signal: str = "") -> None:
             _ok(f"Backup created for [cyan]{target}[/cyan]")
 
         elif action == "delete":
-            if not click.confirm(f"  Delete server '{target}'? This cannot be undone"):
+            if not typer.confirm(f"  Delete server '{target}'? This cannot be undone"):
                 return
             with console.status(f"  Deleting [cyan]{target}[/cyan]..."):
                 delete_target_server(cfg, target)
@@ -462,67 +508,10 @@ def _server_action(cfg: Config, action: str, signal: str = "") -> None:
 # ── Dependency actions ────────────────────────────────────────────────────
 
 
-# Each dependency: (label, check_cmd, install_hint, installer_func_or_None)
-# check_cmd is looked up via shutil.which; special keys handled separately.
-
-def _check_dep(name: str, binary: str) -> bool:
-    """Return True if *binary* is on PATH."""
-    import shutil
-    return shutil.which(binary) is not None
-
-
-def _dep_status() -> list[tuple[str, str, bool, str]]:
-    """Return (label, binary, found, hint) for every dependency."""
-    import shutil
-
-    deps: list[tuple[str, str, bool, str]] = []
-
-    # Go
-    found = shutil.which("go") is not None or Path("/usr/local/go/bin/go").is_file()
-    deps.append(("Go", "go", found, "Required to build packwiz"))
-
-    # packwiz
-    found = shutil.which("packwiz") is not None
-    deps.append(("packwiz", "packwiz", found, "Mod management CLI"))
-
-    # curl
-    found = shutil.which("curl") is not None
-    deps.append(("curl", "curl", found, "HTTP downloads & API calls"))
-
-    # jq
-    found = shutil.which("jq") is not None
-    deps.append(("jq", "jq", found, "JSON processing for targets & APIs"))
-
-    # git
-    found = shutil.which("git") is not None
-    deps.append(("Git", "git", found, "Version control"))
-
-    # Docker
-    found = shutil.which("docker") is not None
-    deps.append(("Docker", "docker", found, "Container runtime for servers"))
-
-    # Pelican Panel — check via configured URL + connection test
-    from elm.config import load_config
-    cfg = load_config()
-    pel_ok = False
-    if cfg.pelican_url and cfg.pelican_api_key:
-        try:
-            from elm.pelican import PelicanClient
-            client = PelicanClient(url=cfg.pelican_url.rstrip("/"), api_key=cfg.pelican_api_key)
-            pel_ok = client.test_connection()
-        except Exception:
-            pass
-    deps.append(("Pelican Panel", "pelican", pel_ok, "Game server management panel"))
-
-    # Wings
-    found = shutil.which("wings") is not None
-    deps.append(("Wings", "wings", found, "Pelican server daemon"))
-
-    return deps
-
-
 def action_check_deps(cfg: Config) -> None:
     """Show status of all dependencies."""
+    from elm.commands.deps import _dep_status
+
     _header("Dependency Check")
     console.print()
 
@@ -538,8 +527,8 @@ def action_check_deps(cfg: Config) -> None:
     table.add_column("Purpose", style="dim")
 
     for label, _binary, found, hint in statuses:
-        status = "[green bold]found[/green bold]" if found else "[red bold]missing[/red bold]"
-        table.add_row(label, status, hint)
+        status_str = "[green bold]found[/green bold]" if found else "[red bold]missing[/red bold]"
+        table.add_row(label, status_str, hint)
 
     console.print(table)
 
@@ -554,213 +543,12 @@ def action_check_deps(cfg: Config) -> None:
 
 def action_install_dep(cfg: Config) -> None:
     """Sub-menu to install individual dependencies."""
-    import subprocess
-    import shutil
-
-    # Build a list of installable items with their installers
-    installable: list[tuple[str, str]] = [
-        ("Go", "Language runtime needed to build packwiz"),
-        ("packwiz", "Mod management CLI (requires Go)"),
-        ("curl", "HTTP download tool"),
-        ("jq", "JSON processor"),
-        ("Git", "Version control"),
-        ("Docker", "Container runtime for game servers"),
-        ("Pelican Panel", "Game server management web UI"),
-        ("Wings", "Pelican server daemon"),
-    ]
-
-    while True:
-        items = [f"{name}  [dim]— {desc}[/dim]" for name, desc in installable]
-        items.extend(["", "← Back"])
-        idx = _pick("Install a Dependency", items)
-        if idx is None or idx >= len(installable):
-            return
-
-        name = installable[idx][0]
-        console.print()
-
-        if name == "Go":
-            if _check_dep("Go", "go") or Path("/usr/local/go/bin/go").is_file():
-                _ok("Go is already installed")
-                _pause()
-                continue
-            _header("Install Go")
-            _info("Go is required to build packwiz from source.")
-            console.print()
-            if not click.confirm("  Install Go system-wide? (requires sudo)"):
-                _pause()
-                continue
-            try:
-                import platform
-                arch = platform.machine()
-                go_arch = {"x86_64": "amd64", "aarch64": "arm64", "AMD64": "amd64"}.get(arch)
-                if not go_arch:
-                    _fail(f"Unsupported architecture: {arch}")
-                    _pause()
-                    continue
-
-                go_version = "1.22.2"
-                tarball = f"go{go_version}.linux-{go_arch}.tar.gz"
-                url = f"https://go.dev/dl/{tarball}"
-
-                with console.status(f"  Downloading Go {go_version}..."):
-                    r = subprocess.run(
-                        ["curl", "-fsSL", "-o", f"/tmp/{tarball}", url],
-                        capture_output=True, text=True,
-                    )
-                if r.returncode != 0:
-                    _fail("Download failed")
-                    _pause()
-                    continue
-
-                with console.status("  Installing to /usr/local/go..."):
-                    subprocess.run(["sudo", "rm", "-rf", "/usr/local/go"], check=True)
-                    subprocess.run(
-                        ["sudo", "tar", "-C", "/usr/local", "-xzf", f"/tmp/{tarball}"],
-                        check=True,
-                    )
-                    Path(f"/tmp/{tarball}").unlink(missing_ok=True)
-
-                _ok(f"Go {go_version} installed to /usr/local/go")
-                _hint("You may need to add /usr/local/go/bin to your PATH")
-                _hint("  export PATH=\"/usr/local/go/bin:$HOME/go/bin:$PATH\"")
-            except Exception as exc:
-                _fail(f"Installation failed: {exc}")
-
-        elif name == "packwiz":
-            if _check_dep("packwiz", "packwiz"):
-                _ok(f"packwiz is already installed: {shutil.which('packwiz')}")
-                _pause()
-                continue
-            _header("Install packwiz")
-            _info("packwiz is installed via 'go install' (requires Go).")
-            console.print()
-            go_bin = shutil.which("go") or "/usr/local/go/bin/go"
-            if not Path(go_bin).is_file():
-                _fail("Go is not installed — install Go first")
-                _pause()
-                continue
-            if not click.confirm("  Install packwiz via go install?"):
-                _pause()
-                continue
-            try:
-                import os
-                env = os.environ.copy()
-                gopath = env.get("GOPATH", str(Path.home() / "go"))
-                env["GOPATH"] = gopath
-                env["PATH"] = f"/usr/local/go/bin:{gopath}/bin:{env.get('PATH', '')}"
-                with console.status("  Building packwiz..."):
-                    subprocess.run(
-                        [go_bin, "install", "github.com/packwiz/packwiz@latest"],
-                        env=env, capture_output=True, text=True, check=True,
-                    )
-                pw_path = Path(gopath) / "bin" / "packwiz"
-                if pw_path.is_file():
-                    # Symlink to ~/.local/bin
-                    local_bin = Path.home() / ".local" / "bin"
-                    local_bin.mkdir(parents=True, exist_ok=True)
-                    dest = local_bin / "packwiz"
-                    dest.unlink(missing_ok=True)
-                    dest.symlink_to(pw_path)
-                    _ok(f"packwiz installed → {dest}")
-                else:
-                    _ok("packwiz built (check $GOPATH/bin)")
-            except subprocess.CalledProcessError as exc:
-                _fail("Build failed")
-                if exc.stderr:
-                    _hint(exc.stderr.strip().splitlines()[0][:120])
-            except Exception as exc:
-                _fail(f"Installation failed: {exc}")
-
-        elif name in ("curl", "jq", "Git"):
-            binary = {"curl": "curl", "jq": "jq", "Git": "git"}[name]
-            if _check_dep(name, binary):
-                _ok(f"{name} is already installed")
-                _pause()
-                continue
-            _header(f"Install {name}")
-            pkg = {"curl": "curl", "jq": "jq", "Git": "git"}[name]
-            _info(f"Install {name} using your system package manager:")
-            console.print()
-            console.print(f"    [cyan]sudo apt install {pkg}[/cyan]     [dim](Debian/Ubuntu)[/dim]")
-            console.print(f"    [cyan]sudo dnf install {pkg}[/cyan]     [dim](Fedora/RHEL)[/dim]")
-            console.print(f"    [cyan]sudo pacman -S {pkg}[/cyan]       [dim](Arch)[/dim]")
-            console.print(f"    [cyan]brew install {pkg}[/cyan]         [dim](macOS)[/dim]")
-            console.print()
-            if click.confirm(f"  Attempt auto-install with apt/dnf?"):
-                apt = shutil.which("apt-get")
-                dnf = shutil.which("dnf")
-                pacman = shutil.which("pacman")
-                mgr: list[str] = []
-                if apt:
-                    mgr = ["sudo", "apt-get", "install", "-y", pkg]
-                elif dnf:
-                    mgr = ["sudo", "dnf", "install", "-y", pkg]
-                elif pacman:
-                    mgr = ["sudo", "pacman", "-S", "--noconfirm", pkg]
-                else:
-                    _fail("No supported package manager found (apt, dnf, pacman)")
-                    _pause()
-                    continue
-                try:
-                    with console.status(f"  Installing {name}..."):
-                        subprocess.run(mgr, check=True)
-                    _ok(f"{name} installed")
-                except subprocess.CalledProcessError:
-                    _fail(f"Failed to install {name}")
-
-        elif name == "Docker":
-            if _check_dep("Docker", "docker"):
-                _ok("Docker is already installed")
-                _pause()
-                continue
-            _header("Install Docker")
-            _info("Docker is best installed via the official script.")
-            console.print()
-            console.print("    [cyan]curl -fsSL https://get.docker.com | sudo sh[/cyan]")
-            console.print()
-            if click.confirm("  Run the official Docker install script? (requires sudo)"):
-                try:
-                    with console.status("  Installing Docker..."):
-                        subprocess.run(
-                            ["bash", "-c", "curl -fsSL https://get.docker.com | sudo sh"],
-                            check=True,
-                        )
-                    _ok("Docker installed")
-                    _hint("Add yourself to the docker group: sudo usermod -aG docker $USER")
-                except subprocess.CalledProcessError:
-                    _fail("Docker installation failed")
-
-        elif name == "Pelican Panel":
-            _header("Install Pelican Panel")
-            _info("Pelican Panel is the web UI for managing game servers.")
-            _info("It runs as a PHP application with a database backend.")
-            console.print()
-            _info("Installation options:")
-            console.print()
-            console.print("    [cyan]1.[/cyan] Docker (recommended):")
-            console.print("       [dim]https://pelican.dev/docs/panel/getting-started[/dim]")
-            console.print()
-            console.print("    [cyan]2.[/cyan] Manual install on a web server:")
-            console.print("       [dim]Requires PHP 8.2+, MySQL/MariaDB, Nginx/Caddy[/dim]")
-            console.print()
-            _hint("After installing, run 'elm deploy setup' to connect ELM to your panel")
-
-        elif name == "Wings":
-            _header("Install Wings")
-            _info("Wings is the Pelican daemon that runs on each game server node.")
-            console.print()
-            _info("Installation options:")
-            console.print()
-            console.print("    [cyan]1.[/cyan] Docker (recommended):")
-            console.print("       [dim]https://pelican.dev/docs/wings/getting-started[/dim]")
-            console.print()
-            console.print("    [cyan]2.[/cyan] Standalone binary:")
-            console.print("       [dim]Download from GitHub releases[/dim]")
-            console.print()
-            _hint("Wings must be configured in Pelican Panel after installation")
-
-        _pause()
+    _info("Use the CLI to install dependencies:")
+    _hint("  elm deps install go")
+    _hint("  elm deps install packwiz")
+    _hint("  elm deps install curl")
+    _hint("  elm deps install git")
+    _hint("  elm deps install docker")
 
 
 # ── Settings actions ──────────────────────────────────────────────────────
@@ -768,11 +556,9 @@ def action_install_dep(cfg: Config) -> None:
 
 def action_view_settings(cfg: Config) -> None:
     """Show configuration grouped by category."""
-    from elm.config import DEFAULTS
-
     categories = {
         "Minecraft": ["MC_VERSION", "LOADER", "LOADER_VERSION"],
-        "Packwiz": ["PACKWIZ_BIN", "PREFER_SOURCE", "AUTO_DEPS"],
+        "Mod Sources": ["PREFER_SOURCE", "AUTO_DEPS"],
         "Server": ["SERVER_RAM", "SERVER_DISK", "SERVER_CPU", "SERVER_DOMAIN", "SERVER_VM_IP"],
         "Pelican": ["PELICAN_URL", "PELICAN_NODE_ID", "PELICAN_EGG_ID", "PELICAN_USER_ID"],
         "CDN": ["CDN_DOMAIN", "PACK_HOST_URL"],
@@ -804,11 +590,11 @@ def action_view_settings(cfg: Config) -> None:
 
 def action_change_setting(cfg: Config) -> None:
     """Prompt for a setting key and value."""
-    key = click.prompt("  Setting name (e.g. MC_VERSION)")
+    key = typer.prompt("  Setting name (e.g. MC_VERSION)")
     current = cfg.get(key.upper())
     if current:
         _info(f"Current: {current}")
-    value = click.prompt(f"  New value for {key.upper()}")
+    value = typer.prompt(f"  New value for {key.upper()}")
     cfg.set_global(key.upper(), value)
     _ok(f"{key.upper()} = {value}")
 
@@ -829,9 +615,9 @@ def action_manage_targets(cfg: Config) -> None:
 
         choice = items[idx]
         if choice == "Add a target":
-            name = click.prompt("  Target name")
-            domain = click.prompt("  Domain (optional)", default="")
-            port = click.prompt("  Port", type=int, default=25565)
+            name = typer.prompt("  Target name")
+            domain = typer.prompt("  Domain (optional)", default="")
+            port = typer.prompt("  Port", type=int, default=25565)
             target_set(name, domain=domain, port=port)
             _ok(f"Target [cyan]{name}[/cyan] added")
 
@@ -890,7 +676,7 @@ def action_manage_keys(cfg: Config) -> None:
             if pidx is None or pidx >= len(providers):
                 continue
             provider = providers[pidx]
-            token = click.prompt(f"  {provider.title()} API key", hide_input=True)
+            token = typer.prompt(f"  {provider.title()} API key", hide_input=True)
             key_map = {"pelican": "PELICAN_API_KEY", "curseforge": "CURSEFORGE_API_KEY"}
             cfg.set_key(key_map[provider], token)
             _ok(f"{provider.title()} key saved")
@@ -928,19 +714,14 @@ def action_check(cfg: Config) -> None:
 
     _info(f"ELM v{__version__}")
 
-    pw_path = shutil.which(cfg.packwiz_bin)
-    if pw_path:
-        _ok(f"packwiz: [dim]{pw_path}[/dim]")
-    else:
-        _fail(f"packwiz not found (expected: {cfg.packwiz_bin})")
-        _hint("Install: https://packwiz.infra.link/installation/")
-
+    # pack.toml
     if cfg.pack_toml.is_file():
         _ok(f"pack.toml: [dim]{cfg.pack_toml}[/dim]")
     else:
         _warn("No pack.toml found")
         _hint("Use 'Create new modpack' from the menu")
 
+    # mods.txt
     if cfg.mods_file.is_file():
         lines = [ln for ln in cfg.mods_file.read_text().splitlines()
                  if ln.strip() and not ln.startswith("#")]
@@ -948,11 +729,20 @@ def action_check(cfg: Config) -> None:
     else:
         _info("No mods.txt [dim](optional)[/dim]")
 
+    # Installed mods
+    from elm.core.packwiz import list_mod_tomls
+    mods = list_mod_tomls(cfg.pack_dir)
+    if mods:
+        _ok(f"Installed mods: {len(mods)}")
+    else:
+        _info("No mods installed")
+
+    # Pelican
     console.print()
     if cfg.pelican_url:
         _ok(f"Pelican: [dim]{cfg.pelican_url}[/dim]")
         if cfg.pelican_api_key:
-            from elm.pelican import PelicanClient
+            from elm.core.pelican import PelicanClient
             client = PelicanClient(url=cfg.pelican_url.rstrip("/"), api_key=cfg.pelican_api_key)
             with console.status("  Testing Pelican..."):
                 ok = client.test_connection()
@@ -966,6 +756,7 @@ def action_check(cfg: Config) -> None:
         _info("Pelican: not configured [dim](optional)[/dim]")
         _hint("Use 'Panel setup' from the Servers menu")
 
+    # Targets
     names = target_list()
     if names:
         _ok(f"Targets: {len(names)} ({', '.join(names)})")
@@ -1011,12 +802,8 @@ DISPATCH: dict[str, Any] = {
 
 def run_menu(cfg: Config) -> None:
     """Interactive menu — the main entry point."""
-    import sys
-
-    # If not an interactive terminal, show help text instead of menu
     if not sys.stdin.isatty():
-        from elm.cli import _original_main
-        click.echo(_original_main.get_help(click.Context(_original_main)))
+        console.print("Run [cyan]elm --help[/cyan] for usage information.")
         return
 
     console.print(
@@ -1040,28 +827,22 @@ def run_menu(cfg: Config) -> None:
             )
             idx = menu.show()
         except OSError:
-            # No terminal available — fall back to help
-            from elm.cli import _original_main
-            click.echo(_original_main.get_help(click.Context(_original_main)))
+            console.print("Run [cyan]elm --help[/cyan] for usage information.")
             return
 
-        # Escape pressed
         if idx is None:
             console.print("\n  [dim]Goodbye.[/dim]\n")
             break
 
         label = MAIN_MENU[idx].strip()
 
-        # Skip category headers
         if label.startswith("──"):
             continue
 
-        # Quit
         if label == "Quit":
             console.print("\n  [dim]Goodbye.[/dim]\n")
             break
 
-        # Dispatch
         handler = DISPATCH.get(label)
         if handler:
             console.print()
