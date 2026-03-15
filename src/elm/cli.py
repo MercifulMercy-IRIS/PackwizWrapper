@@ -10,6 +10,7 @@ Usage:
     elm refresh [--build]   Refresh pack index (sha256)
     elm init                Initialize a new pack
     elm deploy <sub>        Server management via Pelican Panel
+    elm cdn <sub>           Pack hosting via Caddy reverse proxy
     elm key <provider> <token>  Store API keys
     elm config show         Show current configuration
     elm check               Run diagnostics
@@ -79,6 +80,12 @@ class ElmGroup(click.Group):
                 ("deploy console -t NAME CMD", "Send console command"),
                 ("deploy backup -t NAME", "Create a backup"),
                 ("deploy remove -t NAME", "Delete a server"),
+            ],
+            "CDN": [
+                ("cdn setup", "Generate Caddy reverse proxy config"),
+                ("cdn start", "Start pack hosting server"),
+                ("cdn stop", "Stop pack hosting server"),
+                ("cdn status", "Check CDN status"),
             ],
             "Dependencies": [
                 ("deps check", "Check all dependencies"),
@@ -712,6 +719,236 @@ def remove(ctx: click.Context, target: str) -> None:
     except PelicanError as e:
         _fail(str(e))
         sys.exit(1)
+
+
+# ── CDN / Pack Hosting ─────────────────────────────────────────────────────
+
+
+@_original_main.group(cls=SubGroup)
+@click.pass_context
+def cdn(ctx: click.Context) -> None:
+    """Manage pack hosting via Caddy reverse proxy."""
+
+
+@cdn.command()
+@click.pass_context
+def setup(ctx: click.Context) -> None:
+    """Generate Caddy + Docker Compose config for pack hosting."""
+    cfg = _get_cfg(ctx)
+    _header("CDN Setup")
+
+    if not cfg.pack_toml.is_file():
+        _fail("No pack.toml found — initialize a pack first (elm init)")
+        return
+
+    domain = cfg.cdn_domain
+    pack_url = cfg.pack_host_url
+
+    if not domain and not pack_url:
+        domain = click.prompt(
+            "  CDN domain (leave empty for localhost:8080)", default="", show_default=False
+        )
+        if domain:
+            cfg.set_global("CDN_DOMAIN", domain)
+            cfg.set_global("PACK_HOST_URL", f"https://{domain}")
+            _ok(f"CDN domain: [cyan]{domain}[/cyan] (HTTPS via Caddy)")
+        else:
+            cfg.set_global("PACK_HOST_URL", "http://localhost:8080")
+            _ok("Serving on [cyan]http://localhost:8080[/cyan]")
+
+    compose_dir = cfg.cdn_compose_dir
+    compose_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resolve pack directory as absolute path for the volume mount
+    pack_abs = cfg.pack_dir.resolve()
+
+    # Generate Caddyfile
+    if domain:
+        caddy_config = (
+            f"{domain} {{\n"
+            f"    root * /srv/pack\n"
+            f"    file_server {{\n"
+            f"        browse\n"
+            f"    }}\n"
+            f"    header Cache-Control \"public, max-age=60\"\n"
+            f"    header Access-Control-Allow-Origin \"*\"\n"
+            f"}}\n"
+        )
+    else:
+        caddy_config = (
+            ":8080 {\n"
+            "    root * /srv/pack\n"
+            "    file_server {\n"
+            "        browse\n"
+            "    }\n"
+            "    header Cache-Control \"public, max-age=60\"\n"
+            "    header Access-Control-Allow-Origin \"*\"\n"
+            "}\n"
+        )
+
+    caddyfile = compose_dir / "Caddyfile"
+    caddyfile.write_text(caddy_config)
+    _ok(f"Caddyfile written to [dim]{caddyfile}[/dim]")
+
+    # Generate docker-compose.yml
+    ports_section = '    ports:\n      - "443:443"\n      - "80:80"' if domain else \
+        '    ports:\n      - "8080:8080"'
+
+    compose_config = (
+        "services:\n"
+        "  caddy:\n"
+        "    image: caddy:2-alpine\n"
+        "    restart: unless-stopped\n"
+        f"{ports_section}\n"
+        "    volumes:\n"
+        f"      - ./Caddyfile:/etc/caddy/Caddyfile:ro\n"
+        f"      - {pack_abs}:/srv/pack:ro\n"
+        "      - caddy_data:/data\n"
+        "      - caddy_config:/config\n"
+        "\n"
+        "volumes:\n"
+        "  caddy_data:\n"
+        "  caddy_config:\n"
+    )
+
+    compose_file = compose_dir / "docker-compose.yml"
+    compose_file.write_text(compose_config)
+    _ok(f"docker-compose.yml written to [dim]{compose_file}[/dim]")
+
+    pack_url = cfg.pack_host_url or (f"https://{domain}" if domain else "http://localhost:8080")
+    console.print()
+    _ok("CDN config ready")
+    _hint(f"Start:      elm cdn start")
+    _hint(f"Pack URL:   {pack_url}/pack.toml")
+
+
+@cdn.command(name="start")
+@click.pass_context
+def cdn_start(ctx: click.Context) -> None:
+    """Start the Caddy pack server."""
+    import subprocess
+
+    cfg = _get_cfg(ctx)
+    compose_dir = cfg.cdn_compose_dir
+    compose_file = compose_dir / "docker-compose.yml"
+
+    if not compose_file.is_file():
+        _fail("No docker-compose.yml found — run: elm cdn setup")
+        return
+
+    _header("Starting CDN")
+    try:
+        subprocess.run(
+            ["docker", "compose", "up", "-d"],
+            cwd=compose_dir, check=True, capture_output=True, text=True,
+        )
+        pack_url = cfg.pack_host_url or "http://localhost:8080"
+        _ok("Caddy is running")
+        _hint(f"Pack index: {pack_url}/pack.toml")
+    except subprocess.CalledProcessError as e:
+        _fail("Failed to start Caddy")
+        if e.stderr.strip():
+            _hint(e.stderr.strip().splitlines()[-1][:120])
+    except FileNotFoundError:
+        _fail("Docker not found — install with: elm deps install docker")
+
+
+@cdn.command(name="stop")
+@click.pass_context
+def cdn_stop(ctx: click.Context) -> None:
+    """Stop the Caddy pack server."""
+    import subprocess
+
+    cfg = _get_cfg(ctx)
+    compose_dir = cfg.cdn_compose_dir
+
+    if not (compose_dir / "docker-compose.yml").is_file():
+        _fail("No docker-compose.yml found — nothing to stop")
+        return
+
+    _header("Stopping CDN")
+    try:
+        subprocess.run(
+            ["docker", "compose", "down"],
+            cwd=compose_dir, check=True, capture_output=True, text=True,
+        )
+        _ok("Caddy stopped")
+    except subprocess.CalledProcessError as e:
+        _fail("Failed to stop Caddy")
+        if e.stderr.strip():
+            _hint(e.stderr.strip().splitlines()[-1][:120])
+
+
+@cdn.command(name="status")
+@click.pass_context
+def cdn_status(ctx: click.Context) -> None:
+    """Check CDN server status."""
+    import subprocess
+
+    cfg = _get_cfg(ctx)
+    compose_dir = cfg.cdn_compose_dir
+
+    if not (compose_dir / "docker-compose.yml").is_file():
+        _info("CDN not configured — run: elm cdn setup")
+        return
+
+    _header("CDN Status")
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "ps", "--format", "json"],
+            cwd=compose_dir, capture_output=True, text=True,
+        )
+        output = result.stdout.strip()
+        if not output:
+            _warn("Caddy container is not running")
+            _hint("Start with: elm cdn start")
+            return
+
+        import json as _json
+        # docker compose ps --format json outputs one JSON object per line
+        for line in output.splitlines():
+            try:
+                container = _json.loads(line)
+                name = container.get("Name", "caddy")
+                state = container.get("State", "unknown")
+                health = container.get("Health", "")
+                ports = container.get("Publishers", [])
+
+                color = {"running": "green", "exited": "red", "created": "yellow"}.get(
+                    state, "dim"
+                )
+                state_icon = {"running": "[green]●[/green]", "exited": "[red]●[/red]"}.get(
+                    state, "[dim]?[/dim]"
+                )
+
+                panel_lines = [f"  State:  {state_icon} [{color}]{state}[/{color}]"]
+                if health:
+                    panel_lines.append(f"  Health: {health}")
+
+                if ports:
+                    port_strs = []
+                    for p in ports:
+                        pub = p.get("PublishedPort", 0)
+                        tgt = p.get("TargetPort", 0)
+                        if pub:
+                            port_strs.append(f"{pub}->{tgt}")
+                    if port_strs:
+                        panel_lines.append(f"  Ports:  {', '.join(port_strs)}")
+
+                pack_url = cfg.pack_host_url or "http://localhost:8080"
+                panel_lines.append(f"  URL:    {pack_url}/pack.toml")
+
+                console.print(Panel(
+                    "\n".join(panel_lines),
+                    title=f"[bold]{name}[/bold]",
+                    border_style="cyan",
+                    padding=(0, 1),
+                ))
+            except _json.JSONDecodeError:
+                continue
+
+    except FileNotFoundError:
+        _fail("Docker not found")
 
 
 # ── Target management ─────────────────────────────────────────────────────

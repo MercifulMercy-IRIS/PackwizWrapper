@@ -162,6 +162,14 @@ class Config:
         return self.get("CDN_DOMAIN")
 
     @property
+    def cdn_compose_dir(self) -> Path:
+        return Path(self.get("CDN_COMPOSE_DIR") or str(Path.home() / ".config" / "elm" / "servers"))
+
+    @property
+    def pack_host_url(self) -> str:
+        return self.get("PACK_HOST_URL")
+
+    @property
     def server_ram(self) -> int:
         return int(self.get("SERVER_RAM") or "8192")
 
