@@ -5930,6 +5930,7 @@ cmd_help() {
     elm resolve list/search/edit   Manage unresolved mods
     elm organize [dir]             Sort flat dir into pack/ server/ cdn/
     elm migrate <mc|loader> [ver]  Migrate version
+    elm reinstall                   Emergency clean install from GitHub
     elm nuke                       Eagle 500KG — wipe everything
 
   MODS.TXT FORMAT:
@@ -5958,6 +5959,167 @@ cmd_help() {
     elm nuke
 
 HELP
+}
+
+# ============================================================================
+# REINSTALL — Emergency clean install from GitHub
+# ============================================================================
+# Clones the repo, runs install.sh, and purges all legacy pm/packmanager traces.
+
+cmd_reinstall() {
+    header "Emergency Reinstall"
+
+    echo -e "  This will:"
+    echo -e "    ${CYAN}1.${NC} Remove old 'pm' command and packmanager config"
+    echo -e "    ${CYAN}2.${NC} Clone the latest ELM from GitHub"
+    echo -e "    ${CYAN}3.${NC} Run install.sh to set up 'elm'"
+    echo -e "    ${CYAN}4.${NC} Clean up temp files"
+    echo ""
+
+    # Determine repo
+    local repo="${ELM_GITHUB_REPO:-}"
+    local branch="${ELM_GITHUB_BRANCH:-main}"
+
+    if [[ -z "$repo" ]]; then
+        echo -n "  GitHub repo (owner/repo): "
+        read -r repo
+        [[ -z "$repo" ]] && { echo -e "  ${RED}No repo provided. Aborting.${NC}"; return 1; }
+    fi
+
+    echo -e "  Repo:   ${CYAN}${repo}${NC}"
+    echo -e "  Branch: ${CYAN}${branch}${NC}"
+    echo ""
+    echo -e "  ${YELLOW}${BOLD}Proceed with reinstall? (y/N)${NC}"
+    read -r confirm < /dev/tty
+    [[ "$confirm" != [yY] ]] && { echo -e "  ${DIM}Cancelled.${NC}"; return 0; }
+    echo ""
+
+    local install_dir="${HOME}/.local/bin"
+    local old_config="${HOME}/.config/packmanager"
+    local new_config="${HOME}/.config/elm"
+    local completion_dir="${HOME}/.local/share/bash-completion/completions"
+    local tmp_clone; tmp_clone=$(mktemp -d)
+
+    # --- Step 1: Purge legacy pm / packmanager ---
+    separator
+    echo -e "  ${BOLD}Step 1:${NC} Removing legacy pm installations..."
+
+    # Remove pm binary/symlink
+    if [[ -f "${install_dir}/pm" || -L "${install_dir}/pm" ]]; then
+        rm -f "${install_dir}/pm"
+        echo -e "  ${GREEN}✓${NC} Removed ${install_dir}/pm"
+    fi
+
+    # Remove old pm bash completion
+    if [[ -f "${completion_dir}/pm" ]]; then
+        rm -f "${completion_dir}/pm"
+        echo -e "  ${GREEN}✓${NC} Removed pm bash completion"
+    fi
+
+    # Remove old packmanager config dir (backup first if elm config doesn't exist yet)
+    if [[ -d "$old_config" ]]; then
+        if [[ -d "$new_config" ]]; then
+            # elm config exists, just remove old
+            rm -rf "$old_config"
+            echo -e "  ${GREEN}✓${NC} Removed old ${old_config}/"
+        else
+            # Migrate to elm
+            mv "$old_config" "$new_config"
+            [[ -f "${new_config}/packmanager.conf" ]] && mv "${new_config}/packmanager.conf" "${new_config}/elm.conf"
+            echo -e "  ${GREEN}✓${NC} Migrated ${old_config}/ → ${new_config}/"
+        fi
+    fi
+
+    # Remove old elm binary (will be replaced)
+    if [[ -f "${install_dir}/elm" || -L "${install_dir}/elm" ]]; then
+        rm -f "${install_dir}/elm"
+        echo -e "  ${GREEN}✓${NC} Removed old ${install_dir}/elm"
+    fi
+
+    # Remove old elm bash completion
+    if [[ -f "${completion_dir}/elm" ]]; then
+        rm -f "${completion_dir}/elm"
+        echo -e "  ${GREEN}✓${NC} Removed old elm bash completion"
+    fi
+
+    # Clean bashrc of old pm source lines
+    for rc in "${HOME}/.bashrc" "${HOME}/.zshrc"; do
+        if [[ -f "$rc" ]]; then
+            if grep -q 'completions/pm' "$rc" 2>/dev/null; then
+                grep -v 'completions/pm' "$rc" > "${rc}.tmp" && mv "${rc}.tmp" "$rc"
+                echo -e "  ${GREEN}✓${NC} Cleaned pm completion from $(basename "$rc")"
+            fi
+        fi
+    done
+
+    echo ""
+
+    # --- Step 2: Clone latest from GitHub ---
+    separator
+    echo -e "  ${BOLD}Step 2:${NC} Cloning latest from GitHub..."
+
+    if ! command -v git &>/dev/null; then
+        echo -e "  ${RED}git is required. Install it first.${NC}"
+        rm -rf "$tmp_clone"
+        return 1
+    fi
+
+    local clone_url="https://github.com/${repo}.git"
+    if git clone --depth 1 --branch "$branch" "$clone_url" "$tmp_clone" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} Cloned ${repo} (${branch})"
+    else
+        echo -e "  ${RED}✗ Failed to clone ${clone_url}${NC}"
+        echo -e "  ${DIM}Check that the repo exists and is accessible.${NC}"
+        rm -rf "$tmp_clone"
+        return 1
+    fi
+
+    # Find the install script — check common locations
+    local install_script=""
+    local elm_subdir="${ELM_GITHUB_PATH:-envious-mc}"
+    if [[ -f "${tmp_clone}/${elm_subdir}/install.sh" ]]; then
+        install_script="${tmp_clone}/${elm_subdir}/install.sh"
+    elif [[ -f "${tmp_clone}/install.sh" ]]; then
+        install_script="${tmp_clone}/install.sh"
+    else
+        echo -e "  ${RED}✗ install.sh not found in repo${NC}"
+        echo -e "  ${DIM}Looked in: ${elm_subdir}/ and repo root${NC}"
+        rm -rf "$tmp_clone"
+        return 1
+    fi
+
+    echo ""
+
+    # --- Step 3: Run install script ---
+    separator
+    echo -e "  ${BOLD}Step 3:${NC} Running install.sh..."
+    echo ""
+
+    chmod +x "$install_script"
+    (cd "$(dirname "$install_script")" && bash "$install_script" install)
+    local install_exit=$?
+
+    echo ""
+
+    # --- Step 4: Cleanup ---
+    separator
+    echo -e "  ${BOLD}Step 4:${NC} Cleaning up..."
+    rm -rf "$tmp_clone"
+    echo -e "  ${GREEN}✓${NC} Removed temp clone"
+
+    echo ""
+    separator
+    echo ""
+
+    if [[ $install_exit -eq 0 ]]; then
+        echo -e "  ${GREEN}${BOLD}Reinstall complete!${NC}"
+        echo ""
+        echo -e "  ${DIM}Restart your shell or run:${NC} ${CYAN}source ~/.bashrc${NC}"
+        echo -e "  ${DIM}Then verify with:${NC}          ${CYAN}elm --version${NC}"
+    else
+        echo -e "  ${YELLOW}${BOLD}Install script exited with errors. Check output above.${NC}"
+    fi
+    echo ""
 }
 
 # ============================================================================
@@ -6217,6 +6379,7 @@ main() {
 
         # Maintenance
         nuke)              cmd_nuke ;;
+        reinstall)         cmd_reinstall ;;
         resolve|res)       cmd_resolve "$@" ;;
         organize)          cmd_organize "${1:-}" ;;
         migrate|mig)       cmd_migrate "$@" ;;
