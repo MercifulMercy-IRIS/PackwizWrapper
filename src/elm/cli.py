@@ -69,7 +69,7 @@ class ElmGroup(click.Group):
             "Pack": [
                 ("init", "Initialize a new packwiz pack"),
                 ("refresh [--build]", "Refresh pack index (sha256)"),
-                ("update", "Self-update ELM from GitHub"),
+                ("update [--check-only]", "Self-update ELM (Python + scripts)"),
             ],
             "Servers": [
                 ("deploy setup", "Interactive Pelican Panel setup"),
@@ -354,12 +354,11 @@ def init_pack(ctx: click.Context) -> None:
 
 
 @_original_main.command()
+@click.option("--check-only", is_flag=True, help="Only check for updates, don't install")
 @click.pass_context
-def update(ctx: click.Context) -> None:
-    """Self-update ELM from GitHub."""
-    import subprocess
-    import tempfile
-    import shutil
+def update(ctx: click.Context, check_only: bool) -> None:
+    """Self-update ELM from GitHub (Python package + shell scripts)."""
+    from elm.updater import check_for_update, run_full_update, print_result
 
     cfg = _get_cfg(ctx)
     _header("Self-Update")
@@ -371,67 +370,24 @@ def update(ctx: click.Context) -> None:
         return
 
     branch = cfg.get("ELM_GITHUB_BRANCH") or "main"
-    gh_path = cfg.get("ELM_GITHUB_PATH") or ""
-    update_files = (cfg.get("ELM_UPDATE_FILES") or "elm.sh install.sh elm.conf mods.txt").split()
-
-    base_url = f"https://raw.githubusercontent.com/{repo}/{branch}"
-    if gh_path:
-        base_url = f"{base_url}/{gh_path.strip('/')}"
-
     _info(f"Repo: [cyan]{repo}[/cyan]  Branch: [cyan]{branch}[/cyan]")
 
-    updated = 0
-    skipped = 0
-    errors = 0
+    if check_only:
+        with console.status("  Checking for updates..."):
+            versions = check_for_update(cfg)
+        if versions:
+            local, remote = versions
+            _info(f"Installed: {local}")
+            _ok(f"Available: [bold]{remote}[/bold]")
+            _hint("Run [cyan]elm update[/cyan] to install")
+        else:
+            from elm import __version__
+            _ok(f"Already up to date (v{__version__})")
+        return
 
-    for filename in update_files:
-        url = f"{base_url}/{filename}"
-        try:
-            with console.status(f"  Fetching [cyan]{filename}[/cyan]..."):
-                result = subprocess.run(
-                    ["curl", "-fsSL", "--connect-timeout", "10", url],
-                    capture_output=True,
-                    text=True,
-                )
-
-            if result.returncode != 0:
-                _warn(f"Could not fetch {filename}")
-                errors += 1
-                continue
-
-            dest = cfg.pack_dir / filename
-            if dest.is_file() and dest.read_text() == result.stdout:
-                skipped += 1
-                continue
-
-            # Write via temp file for atomicity
-            with tempfile.NamedTemporaryFile(
-                mode="w", dir=dest.parent, prefix=f".{filename}.", delete=False
-            ) as tmp:
-                tmp.write(result.stdout)
-                tmp_path = Path(tmp.name)
-
-            # Preserve permissions if the file existed
-            if dest.is_file():
-                shutil.copymode(dest, tmp_path)
-
-            tmp_path.replace(dest)
-            _ok(f"Updated [cyan]{filename}[/cyan]")
-            updated += 1
-
-        except Exception as exc:
-            _fail(f"Error updating {filename}: {exc}")
-            errors += 1
-
-    console.print()
-    if updated:
-        _ok(f"{updated} file{'s' if updated != 1 else ''} updated")
-    if skipped:
-        _info(f"{skipped} file{'s' if skipped != 1 else ''} already up to date")
-    if errors:
-        _warn(f"{errors} file{'s' if errors != 1 else ''} failed")
-    if not updated and not errors:
-        _ok("Everything is up to date")
+    with console.status("  Updating ELM..."):
+        result = run_full_update(cfg)
+    print_result(result)
 
 
 # ── Deploy command group (Pelican) ────────────────────────────────────────

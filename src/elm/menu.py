@@ -262,11 +262,8 @@ def action_refresh(cfg: Config) -> None:
 
 
 def action_self_update(cfg: Config) -> None:
-    """Self-update ELM from GitHub."""
-    import subprocess
-    import tempfile
-    import shutil
-    from pathlib import Path
+    """Self-update ELM from GitHub (Python package + shell scripts)."""
+    from elm.updater import run_full_update, print_result
 
     _header("Update ELM")
     repo = cfg.get("ELM_GITHUB_REPO")
@@ -276,60 +273,11 @@ def action_self_update(cfg: Config) -> None:
         return
 
     branch = cfg.get("ELM_GITHUB_BRANCH") or "main"
-    gh_path = cfg.get("ELM_GITHUB_PATH") or ""
-    update_files = (cfg.get("ELM_UPDATE_FILES") or "elm.sh install.sh elm.conf mods.txt").split()
-
-    base_url = f"https://raw.githubusercontent.com/{repo}/{branch}"
-    if gh_path:
-        base_url = f"{base_url}/{gh_path.strip('/')}"
-
     _info(f"Repo: [cyan]{repo}[/cyan]  Branch: [cyan]{branch}[/cyan]")
 
-    updated = 0
-    skipped = 0
-    errors = 0
-
-    for filename in update_files:
-        url = f"{base_url}/{filename}"
-        try:
-            with console.status(f"  Fetching [cyan]{filename}[/cyan]..."):
-                result = subprocess.run(
-                    ["curl", "-fsSL", "--connect-timeout", "10", url],
-                    capture_output=True, text=True,
-                )
-            if result.returncode != 0:
-                _warn(f"Could not fetch {filename}")
-                errors += 1
-                continue
-
-            dest = cfg.pack_dir / filename
-            if dest.is_file() and dest.read_text() == result.stdout:
-                skipped += 1
-                continue
-
-            with tempfile.NamedTemporaryFile(
-                mode="w", dir=dest.parent, prefix=f".{filename}.", delete=False
-            ) as tmp:
-                tmp.write(result.stdout)
-                tmp_path = Path(tmp.name)
-            if dest.is_file():
-                shutil.copymode(dest, tmp_path)
-            tmp_path.replace(dest)
-            _ok(f"Updated [cyan]{filename}[/cyan]")
-            updated += 1
-        except Exception as exc:
-            _fail(f"Error updating {filename}: {exc}")
-            errors += 1
-
-    console.print()
-    if updated:
-        _ok(f"{updated} file{'s' if updated != 1 else ''} updated")
-    if skipped:
-        _info(f"{skipped} already up to date")
-    if errors:
-        _warn(f"{errors} failed")
-    if not updated and not errors:
-        _ok("Everything up to date")
+    with console.status("  Updating ELM..."):
+        result = run_full_update(cfg)
+    print_result(result)
 
 
 # ── Server actions ────────────────────────────────────────────────────────
