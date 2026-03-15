@@ -18,9 +18,11 @@ Usage:
 from __future__ import annotations
 
 import sys
+from typing import Any
 
 import click
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
 from elm import __version__
@@ -33,19 +35,28 @@ from elm.config import (
     target_set,
 )
 
-console = Console()
+console = Console(highlight=False)
 
+# ── Output helpers ────────────────────────────────────────────────────────
 
 def _fail(msg: str) -> None:
-    console.print(f"  [red bold]FAIL[/red bold] {msg}")
+    console.print(f"  [red bold]FAIL[/red bold]  {msg}")
 
 
 def _ok(msg: str) -> None:
-    console.print(f"  [green]OK[/green] {msg}")
+    console.print(f"  [green bold] OK [/green bold]  {msg}")
 
 
 def _warn(msg: str) -> None:
-    console.print(f"  [yellow]WARN[/yellow] {msg}")
+    console.print(f"  [yellow bold]WARN[/yellow bold]  {msg}")
+
+
+def _info(msg: str) -> None:
+    console.print(f"  [blue bold]INFO[/blue bold]  {msg}")
+
+
+def _hint(msg: str) -> None:
+    console.print(f"         [dim]{msg}[/dim]")
 
 
 def _header(msg: str) -> None:
@@ -53,27 +64,121 @@ def _header(msg: str) -> None:
 
 
 def _get_cfg(ctx: click.Context) -> Config:
-    return ctx.ensure_object(Config)
+    return ctx.obj
+
+
+# ── Custom help formatter ─────────────────────────────────────────────────
+
+
+class ElmGroup(click.Group):
+    """Custom group that shows a branded help screen."""
+
+    def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        console.print(
+            Panel(
+                "[bold cyan]ELM[/bold cyan]  [dim]—[/dim]  EnviousLabs Minecraft CLI\n"
+                f"[dim]v{__version__}[/dim]",
+                border_style="cyan",
+                padding=(0, 2),
+            )
+        )
+
+        sections = {
+            "Mods": [
+                ("add <slug...>", "Add one or more mods"),
+                ("rm <slug...>", "Remove mods"),
+                ("update [slug]", "Update a mod or all mods"),
+                ("sync", "Sync mods from mods.txt"),
+                ("ls", "List installed mods"),
+                ("search <query>", "Search for mods"),
+            ],
+            "Pack": [
+                ("init", "Initialize a new packwiz pack"),
+                ("refresh [--build]", "Refresh pack index (sha256)"),
+            ],
+            "Servers": [
+                ("deploy setup", "Interactive Pelican Panel setup"),
+                ("deploy create -t NAME", "Create a server"),
+                ("deploy start/stop/restart -t NAME", "Power control"),
+                ("deploy status -t NAME", "Server status & resources"),
+                ("deploy console -t NAME CMD", "Send console command"),
+                ("deploy backup -t NAME", "Create a backup"),
+                ("deploy remove -t NAME", "Delete a server"),
+            ],
+            "Config": [
+                ("target add/ls/rm/show", "Manage deployment targets"),
+                ("key set/show/rm", "Manage API keys"),
+                ("config show/set/get", "View & edit configuration"),
+                ("check", "Run diagnostics"),
+            ],
+        }
+
+        for section, cmds in sections.items():
+            console.print(f"\n  [bold]{section}[/bold]")
+            for cmd, desc in cmds:
+                console.print(f"    [cyan]elm {cmd:<35}[/cyan] {desc}")
+
+        console.print("\n  [dim]Run[/dim] elm <command> --help [dim]for details[/dim]\n")
+
+
+class SubGroup(click.Group):
+    """Subgroup that shows help when invoked without a subcommand."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("invoke_without_command", True)
+        super().__init__(*args, **kwargs)
+
+    def invoke(self, ctx: click.Context) -> None:
+        super().invoke(ctx)
+        if not ctx.invoked_subcommand:
+            console.print(ctx.get_help())
 
 
 # ── Main group ────────────────────────────────────────────────────────────
 
 
-@click.group(invoke_without_command=True)
+@click.group(cls=ElmGroup, invoke_without_command=True)
 @click.version_option(__version__, prog_name="elm")
 @click.pass_context
 def main(ctx: click.Context) -> None:
     """ELM — EnviousLabs Minecraft CLI."""
-    ctx.ensure_object(dict)
-    ctx.obj = load_config()
+    try:
+        ctx.obj = load_config()
+    except Exception as exc:
+        _fail(f"Could not load config: {exc}")
+        ctx.exit(1)
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
+
+
+# Global error handler — catch uncaught exceptions so users never see raw tracebacks
+_original_main = main
+
+def main() -> None:  # noqa: F811
+    """Wrapper that catches unexpected errors."""
+    try:
+        _original_main(standalone_mode=False)
+    except click.exceptions.Abort:
+        console.print("\n  [dim]Aborted.[/dim]")
+        sys.exit(130)
+    except click.exceptions.Exit as exc:
+        sys.exit(exc.exit_code)
+    except click.ClickException as exc:
+        console.print(f"\n  [red bold]FAIL[/red bold]  {exc.format_message()}")
+        sys.exit(exc.exit_code)
+    except KeyboardInterrupt:
+        console.print("\n  [dim]Interrupted.[/dim]")
+        sys.exit(130)
+    except Exception as exc:
+        console.print(f"\n  [red bold]FAIL[/red bold]  {exc}")
+        console.print("         [dim]This is a bug — please report it.[/dim]")
+        sys.exit(1)
 
 
 # ── Mod commands ──────────────────────────────────────────────────────────
 
 
-@main.command()
+@_original_main.command()
 @click.argument("slugs", nargs=-1, required=True)
 @click.option("-s", "--source", default="", help="Source: mr (Modrinth) or cf (CurseForge)")
 @click.pass_context
@@ -84,17 +189,23 @@ def add(ctx: click.Context, slugs: tuple[str, ...], source: str) -> None:
     cfg = _get_cfg(ctx)
     _header("Adding Mods")
 
+    ok_count = 0
     for slug in slugs:
         try:
-            add_mod(cfg, slug, source=source)
-            _ok(f"Added {slug}")
+            with console.status(f"  Installing [cyan]{slug}[/cyan]..."):
+                add_mod(cfg, slug, source=source)
+            _ok(f"Added [cyan]{slug}[/cyan]")
+            ok_count += 1
         except PackwizError as e:
-            _fail(f"Could not add {slug}: {e.stderr.strip()[:120]}")
+            _fail(f"Could not add [cyan]{slug}[/cyan]")
+            if e.stderr.strip():
+                _hint(e.stderr.strip().splitlines()[0][:100])
 
-    safe_refresh(cfg)
+    if ok_count > 0:
+        safe_refresh(cfg)
 
 
-@main.command()
+@_original_main.command()
 @click.argument("slugs", nargs=-1, required=True)
 @click.pass_context
 def rm(ctx: click.Context, slugs: tuple[str, ...]) -> None:
@@ -104,17 +215,22 @@ def rm(ctx: click.Context, slugs: tuple[str, ...]) -> None:
     cfg = _get_cfg(ctx)
     _header("Removing Mods")
 
+    ok_count = 0
     for slug in slugs:
         try:
             remove_mod(cfg, slug)
-            _ok(f"Removed {slug}")
+            _ok(f"Removed [cyan]{slug}[/cyan]")
+            ok_count += 1
         except PackwizError as e:
-            _fail(f"Could not remove {slug}: {e.stderr.strip()[:120]}")
+            _fail(f"Could not remove [cyan]{slug}[/cyan]")
+            if e.stderr.strip():
+                _hint(e.stderr.strip().splitlines()[0][:100])
 
-    safe_refresh(cfg)
+    if ok_count > 0:
+        safe_refresh(cfg)
 
 
-@main.command()
+@_original_main.command()
 @click.argument("slug", required=False, default="")
 @click.pass_context
 def update(ctx: click.Context, slug: str) -> None:
@@ -122,18 +238,23 @@ def update(ctx: click.Context, slug: str) -> None:
     from elm.packwiz import update_mod, safe_refresh, PackwizError
 
     cfg = _get_cfg(ctx)
-    _header("Updating" if not slug else f"Updating {slug}")
+    label = f"Updating {slug}" if slug else "Updating All Mods"
+    _header(label)
 
     try:
-        update_mod(cfg, slug)
+        with console.status("  Checking for updates..."):
+            update_mod(cfg, slug)
         _ok("Update complete")
     except PackwizError as e:
-        _fail(f"Update failed: {e.stderr.strip()[:120]}")
+        _fail("Update failed")
+        if e.stderr.strip():
+            _hint(e.stderr.strip().splitlines()[0][:100])
+        return
 
     safe_refresh(cfg)
 
 
-@main.command(name="ls")
+@_original_main.command(name="ls")
 @click.pass_context
 def list_mods(ctx: click.Context) -> None:
     """List installed mods."""
@@ -143,19 +264,28 @@ def list_mods(ctx: click.Context) -> None:
     mods = _list(cfg)
 
     if not mods:
-        console.print("  No mods installed.")
+        _header("Installed Mods")
+        _info("No mods installed yet.")
+        _hint("Get started:  elm add <mod-slug>")
+        _hint("Or sync:      elm sync   (reads from mods.txt)")
         return
 
-    table = Table(title="Installed Mods", show_lines=False)
-    table.add_column("#", style="dim", width=4)
+    table = Table(
+        title=f"Installed Mods ({len(mods)})",
+        show_lines=False,
+        border_style="dim",
+        title_style="bold",
+        padding=(0, 1),
+    )
+    table.add_column("#", style="dim", width=4, justify="right")
     table.add_column("Mod", style="cyan")
     for i, name in enumerate(mods, 1):
         table.add_row(str(i), name)
+    console.print()
     console.print(table)
-    console.print(f"  [dim]{len(mods)} mods total[/dim]")
 
 
-@main.command()
+@_original_main.command()
 @click.argument("query")
 @click.option("-s", "--source", default="", help="Source: mr or cf")
 @click.pass_context
@@ -164,14 +294,16 @@ def search(ctx: click.Context, query: str, source: str) -> None:
     from elm.packwiz import search_mod
 
     cfg = _get_cfg(ctx)
-    output = search_mod(cfg, query, source=source)
+    with console.status(f"  Searching for [cyan]{query}[/cyan]..."):
+        output = search_mod(cfg, query, source=source)
     if output.strip():
         console.print(output)
     else:
-        console.print("  No results found.")
+        _info(f"No results for [cyan]{query}[/cyan]")
+        _hint("Try a different query or check the source (-s mr / -s cf)")
 
 
-@main.command()
+@_original_main.command()
 @click.pass_context
 def sync(ctx: click.Context) -> None:
     """Sync mods from mods.txt."""
@@ -181,18 +313,27 @@ def sync(ctx: click.Context) -> None:
     _header("Syncing from mods.txt")
 
     if not cfg.mods_file.is_file():
-        _fail(f"No mods.txt found at {cfg.mods_file}")
+        _fail(f"No mods.txt found at [dim]{cfg.mods_file}[/dim]")
+        _hint("Create a mods.txt with one mod slug per line")
         return
 
-    added, skipped, failed = sync_from_modsfile(cfg)
-    _ok(f"Added {added}, skipped {skipped}")
+    with console.status("  Syncing mods..."):
+        added, skipped, failed = sync_from_modsfile(cfg)
+
+    if added:
+        _ok(f"Added {added} new mod{'s' if added != 1 else ''}")
+    if skipped:
+        _info(f"Skipped {skipped} already installed")
     if failed:
-        _warn(f"Failed: {', '.join(failed)}")
+        _warn(f"Failed to add: {', '.join(failed)}")
 
-    safe_refresh(cfg)
+    if added > 0:
+        safe_refresh(cfg)
+    elif not failed:
+        _ok("Everything is up to date")
 
 
-@main.command()
+@_original_main.command()
 @click.option("-b", "--build", is_flag=True, help="Build for distribution")
 @click.pass_context
 def refresh(ctx: click.Context, build: bool) -> None:
@@ -206,7 +347,7 @@ def refresh(ctx: click.Context, build: bool) -> None:
         sys.exit(1)
 
 
-@main.command(name="init")
+@_original_main.command(name="init")
 @click.pass_context
 def init_pack(ctx: click.Context) -> None:
     """Initialize a new packwiz pack."""
@@ -215,22 +356,24 @@ def init_pack(ctx: click.Context) -> None:
     cfg = _get_cfg(ctx)
     _header("Initializing Pack")
     try:
-        _init(cfg)
+        with console.status("  Creating pack..."):
+            _init(cfg)
         _ok("Pack initialized")
         safe_refresh(cfg)
     except PackwizError as e:
-        _fail(f"Init failed: {e.stderr.strip()[:120]}")
+        _fail("Init failed")
+        if e.stderr.strip():
+            _hint(e.stderr.strip().splitlines()[0][:100])
         sys.exit(1)
 
 
 # ── Deploy command group (Pelican) ────────────────────────────────────────
 
 
-@main.group()
+@_original_main.group(cls=SubGroup)
 @click.pass_context
 def deploy(ctx: click.Context) -> None:
     """Server management via Pelican Panel."""
-    pass
 
 
 @deploy.command()
@@ -241,36 +384,43 @@ def setup(ctx: click.Context) -> None:
 
     cfg = _get_cfg(ctx)
     _header("Pelican Panel Setup")
+    console.print()
 
-    url = click.prompt("Pelican Panel URL", default=cfg.pelican_url or "https://panel.example.com")
+    url = click.prompt("  Panel URL", default=cfg.pelican_url or "https://panel.example.com")
     url = url.rstrip("/")
     cfg.set_global("PELICAN_URL", url)
-    _ok(f"Panel URL: {url}")
+    _ok(f"Panel URL set to [cyan]{url}[/cyan]")
 
-    api_key = click.prompt("Application API key", hide_input=True)
+    api_key = click.prompt("  Application API key", hide_input=True)
     cfg.set_key("PELICAN_API_KEY", api_key)
     _ok("API key saved")
 
     # Test connection
     client = PelicanClient(url=url, api_key=api_key)
-    console.print("  Testing connection...", end=" ")
-    if client.test_connection():
-        console.print("[green]connected[/green]")
+    with console.status("  Testing connection..."):
+        connected = client.test_connection()
+    if connected:
+        _ok("Connected to Pelican Panel")
     else:
-        console.print("[red]failed[/red]")
-        _warn("Could not reach panel. Check URL and API key.")
+        _fail("Could not reach panel — check URL and API key")
         return
 
     # List nodes
     try:
         nodes = client.list_nodes()
         if nodes:
-            console.print("\n  Available nodes:")
+            console.print()
+            table = Table(title="Available Nodes", border_style="dim", padding=(0, 1))
+            table.add_column("ID", style="bold")
+            table.add_column("Name", style="cyan")
+            table.add_column("FQDN", style="dim")
             for n in nodes:
                 a = n.get("attributes", {})
-                console.print(f"    [{a.get('id')}] {a.get('name')} — {a.get('fqdn', '')}")
-            node_id = click.prompt("Node ID", type=int)
+                table.add_row(str(a.get("id")), a.get("name", ""), a.get("fqdn", ""))
+            console.print(table)
+            node_id = click.prompt("\n  Node ID", type=int)
             cfg.set_global("PELICAN_NODE_ID", str(node_id))
+            _ok(f"Node ID: {node_id}")
     except PelicanError:
         _warn("Could not list nodes")
 
@@ -278,21 +428,30 @@ def setup(ctx: click.Context) -> None:
     try:
         nests = client.list_nests()
         if nests:
-            console.print("\n  Available nests:")
+            console.print()
+            table = Table(title="Available Nests", border_style="dim", padding=(0, 1))
+            table.add_column("ID", style="bold")
+            table.add_column("Name", style="cyan")
             for n in nests:
                 a = n.get("attributes", {})
-                console.print(f"    [{a.get('id')}] {a.get('name')}")
-            nest_id = click.prompt("Nest ID", type=int)
+                table.add_row(str(a.get("id")), a.get("name", ""))
+            console.print(table)
+            nest_id = click.prompt("\n  Nest ID", type=int)
             cfg.set_global("PELICAN_NEST_ID", str(nest_id))
 
             eggs = client.list_eggs(nest_id)
             if eggs:
-                console.print("\n  Available eggs:")
+                console.print()
+                table = Table(title="Available Eggs", border_style="dim", padding=(0, 1))
+                table.add_column("ID", style="bold")
+                table.add_column("Name", style="cyan")
                 for e in eggs:
                     a = e.get("attributes", {})
-                    console.print(f"    [{a.get('id')}] {a.get('name')}")
-                egg_id = click.prompt("Egg ID", type=int)
+                    table.add_row(str(a.get("id")), a.get("name", ""))
+                console.print(table)
+                egg_id = click.prompt("\n  Egg ID", type=int)
                 cfg.set_global("PELICAN_EGG_ID", str(egg_id))
+                _ok(f"Egg ID: {egg_id}")
     except PelicanError:
         _warn("Could not list nests/eggs")
 
@@ -300,16 +459,25 @@ def setup(ctx: click.Context) -> None:
     try:
         users = client.list_users()
         if users:
-            console.print("\n  Available users:")
+            console.print()
+            table = Table(title="Available Users", border_style="dim", padding=(0, 1))
+            table.add_column("ID", style="bold")
+            table.add_column("Username", style="cyan")
+            table.add_column("Email", style="dim")
             for u in users:
                 a = u.get("attributes", {})
-                console.print(f"    [{a.get('id')}] {a.get('username')} ({a.get('email', '')})")
-            user_id = click.prompt("User ID (server owner)", type=int)
+                table.add_row(str(a.get("id")), a.get("username", ""), a.get("email", ""))
+            console.print(table)
+            user_id = click.prompt("\n  User ID (server owner)", type=int)
             cfg.set_global("PELICAN_USER_ID", str(user_id))
+            _ok(f"User ID: {user_id}")
     except PelicanError:
         _warn("Could not list users")
 
-    _ok("Pelican Panel configured")
+    console.print()
+    _ok("Pelican Panel setup complete")
+    _hint("Next: elm target add <name> -d <domain>")
+    _hint("Then:  elm deploy create -t <name>")
 
 
 @deploy.command()
@@ -322,10 +490,14 @@ def create(ctx: click.Context, target: str) -> None:
     cfg = _get_cfg(ctx)
     _header(f"Creating Server: {target}")
     try:
-        attrs = create_target_server(cfg, target)
-        _ok(f"Server created — ID: {attrs.get('id')}, UUID: {attrs.get('uuid', '')[:8]}...")
+        with console.status(f"  Provisioning [cyan]{target}[/cyan] on Pelican..."):
+            attrs = create_target_server(cfg, target)
+        sid = attrs.get("id", "?")
+        uuid = attrs.get("uuid", "")[:8]
+        _ok(f"Server created — ID: {sid}, UUID: {uuid}...")
+        _hint(f"Start it: elm deploy start -t {target}")
     except PelicanError as e:
-        _fail(f"{e.body or str(e)}")
+        _fail(e.body or str(e))
         sys.exit(1)
 
 
@@ -339,8 +511,9 @@ def power(ctx: click.Context, target: str, signal: str) -> None:
 
     cfg = _get_cfg(ctx)
     try:
-        power_target(cfg, target, signal)
-        _ok(f"{signal.title()} signal sent to {target}")
+        with console.status(f"  Sending {signal} to [cyan]{target}[/cyan]..."):
+            power_target(cfg, target, signal)
+        _ok(f"{signal.title()} signal sent to [cyan]{target}[/cyan]")
     except PelicanError as e:
         _fail(str(e))
         sys.exit(1)
@@ -382,7 +555,7 @@ def send_console(ctx: click.Context, target: str, command: str) -> None:
     cfg = _get_cfg(ctx)
     try:
         command_target(cfg, target, command)
-        _ok(f"Command sent: {command}")
+        _ok(f"Command sent: [dim]{command}[/dim]")
     except PelicanError as e:
         _fail(str(e))
         sys.exit(1)
@@ -397,21 +570,43 @@ def status(ctx: click.Context, target: str) -> None:
 
     cfg = _get_cfg(ctx)
     try:
-        data = status_target(cfg, target)
+        with console.status(f"  Fetching status for [cyan]{target}[/cyan]..."):
+            data = status_target(cfg, target)
+
         attrs = data.get("attributes", {})
         resources = attrs.get("resources", {})
         state = attrs.get("current_state", "unknown")
 
-        color = {"running": "green", "stopped": "red", "starting": "yellow"}.get(state, "dim")
-        console.print(f"\n  Server: [bold]{target}[/bold]")
-        console.print(f"  State:  [{color}]{state}[/{color}]")
+        color = {"running": "green", "stopped": "red", "starting": "yellow",
+                 "stopping": "yellow", "offline": "red"}.get(state, "dim")
+        state_icon = {"running": "[green]●[/green]", "stopped": "[red]●[/red]",
+                      "starting": "[yellow]◐[/yellow]", "stopping": "[yellow]◑[/yellow]",
+                      "offline": "[red]○[/red]"}.get(state, "[dim]?[/dim]")
+
+        console.print()
+        panel_lines = [f"  State:  {state_icon} [{color}]{state}[/{color}]"]
+
         if resources:
             mem = resources.get("memory_bytes", 0) / 1024 / 1024
             cpu = resources.get("cpu_absolute", 0)
             disk = resources.get("disk_bytes", 0) / 1024 / 1024
-            console.print(f"  CPU:    {cpu:.1f}%")
-            console.print(f"  RAM:    {mem:.0f} MB")
-            console.print(f"  Disk:   {disk:.0f} MB")
+            uptime = resources.get("uptime", 0)
+
+            panel_lines.append(f"  CPU:    {cpu:.1f}%")
+            panel_lines.append(f"  RAM:    {mem:.0f} MB")
+            panel_lines.append(f"  Disk:   {disk:.0f} MB")
+            if uptime:
+                hours, remainder = divmod(uptime // 1000, 3600)
+                minutes = remainder // 60
+                panel_lines.append(f"  Uptime: {hours}h {minutes}m")
+
+        console.print(Panel(
+            "\n".join(panel_lines),
+            title=f"[bold]{target}[/bold]",
+            border_style="cyan",
+            padding=(0, 1),
+        ))
+
     except PelicanError as e:
         _fail(str(e))
         sys.exit(1)
@@ -426,8 +621,9 @@ def backup(ctx: click.Context, target: str) -> None:
 
     cfg = _get_cfg(ctx)
     try:
-        backup_target(cfg, target)
-        _ok("Backup created")
+        with console.status(f"  Creating backup for [cyan]{target}[/cyan]..."):
+            backup_target(cfg, target)
+        _ok(f"Backup created for [cyan]{target}[/cyan]")
     except PelicanError as e:
         _fail(str(e))
         sys.exit(1)
@@ -443,8 +639,9 @@ def remove(ctx: click.Context, target: str) -> None:
 
     cfg = _get_cfg(ctx)
     try:
-        delete_target_server(cfg, target)
-        _ok(f"Server {target} deleted")
+        with console.status(f"  Deleting [cyan]{target}[/cyan]..."):
+            delete_target_server(cfg, target)
+        _ok(f"Server [cyan]{target}[/cyan] deleted")
     except PelicanError as e:
         _fail(str(e))
         sys.exit(1)
@@ -453,11 +650,10 @@ def remove(ctx: click.Context, target: str) -> None:
 # ── Target management ─────────────────────────────────────────────────────
 
 
-@main.group()
+@_original_main.group(cls=SubGroup)
 @click.pass_context
 def target(ctx: click.Context) -> None:
     """Manage deployment targets."""
-    pass
 
 
 @target.command(name="ls")
@@ -466,21 +662,29 @@ def target_ls(ctx: click.Context) -> None:
     """List all targets."""
     targets = load_targets()
     if not targets:
-        console.print("  No targets configured.")
+        _header("Targets")
+        _info("No targets configured yet.")
+        _hint("Add one:  elm target add <name> -d <domain>")
         return
 
-    table = Table(title="Targets")
-    table.add_column("Name", style="cyan")
+    table = Table(
+        title=f"Targets ({len(targets)})",
+        border_style="dim",
+        padding=(0, 1),
+    )
+    table.add_column("Name", style="cyan bold")
     table.add_column("Domain")
-    table.add_column("Port")
+    table.add_column("Port", justify="right")
     table.add_column("Pelican ID", style="dim")
     for name, data in targets.items():
+        pel_id = data.get("pelican_server_id", "")
         table.add_row(
             name,
-            data.get("domain", ""),
+            data.get("domain", "") or "[dim]—[/dim]",
             str(data.get("port", "")),
-            str(data.get("pelican_server_id", "")),
+            str(pel_id) if pel_id else "[dim]—[/dim]",
         )
+    console.print()
     console.print(table)
 
 
@@ -496,7 +700,8 @@ def target_add(ctx: click.Context, name: str, domain: str, port: int, ram: int) 
     if ram:
         fields["ram"] = ram
     target_set(name, **fields)
-    _ok(f"Target '{name}' added")
+    _ok(f"Target [cyan]{name}[/cyan] added")
+    _hint(f"Create server:  elm deploy create -t {name}")
 
 
 @target.command(name="rm")
@@ -504,8 +709,15 @@ def target_add(ctx: click.Context, name: str, domain: str, port: int, ram: int) 
 @click.pass_context
 def target_rm(ctx: click.Context, name: str) -> None:
     """Remove a deployment target."""
+    targets = load_targets()
+    if name not in targets:
+        _fail(f"Target [cyan]{name}[/cyan] not found")
+        existing = list(targets.keys())
+        if existing:
+            _hint(f"Available: {', '.join(existing)}")
+        return
     target_remove(name)
-    _ok(f"Target '{name}' removed")
+    _ok(f"Target [cyan]{name}[/cyan] removed")
 
 
 @target.command(name="show")
@@ -516,30 +728,45 @@ def target_show(ctx: click.Context, name: str) -> None:
     targets = load_targets()
     data = targets.get(name)
     if not data:
-        _fail(f"Target '{name}' not found")
+        _fail(f"Target [cyan]{name}[/cyan] not found")
+        existing = list(targets.keys())
+        if existing:
+            _hint(f"Available: {', '.join(existing)}")
         return
-    console.print(f"\n  [bold cyan]{name}[/bold cyan]")
+
+    table = Table(
+        title=name,
+        title_style="bold cyan",
+        border_style="dim",
+        show_header=False,
+        padding=(0, 1),
+    )
+    table.add_column("Key", style="bold")
+    table.add_column("Value")
     for k, v in sorted(data.items()):
-        console.print(f"    {k}: {v}")
+        table.add_row(k, str(v) if v else "[dim]—[/dim]")
+    console.print()
+    console.print(table)
 
 
 # ── Key management ────────────────────────────────────────────────────────
 
 
-@main.group()
+@_original_main.group(cls=SubGroup)
 @click.pass_context
 def key(ctx: click.Context) -> None:
     """Manage API keys."""
-    pass
 
 
 @key.command(name="set")
 @click.argument("provider", type=click.Choice(["pelican", "curseforge"]))
-@click.argument("token")
+@click.argument("token", required=False, default=None)
 @click.pass_context
-def key_set(ctx: click.Context, provider: str, token: str) -> None:
-    """Store an API key."""
+def key_set(ctx: click.Context, provider: str, token: str | None) -> None:
+    """Store an API key. If TOKEN is omitted, you'll be prompted securely."""
     cfg = _get_cfg(ctx)
+    if token is None:
+        token = click.prompt(f"  {provider.title()} API key", hide_input=True)
     key_map = {
         "pelican": "PELICAN_API_KEY",
         "curseforge": "CURSEFORGE_API_KEY",
@@ -551,11 +778,13 @@ def key_set(ctx: click.Context, provider: str, token: str) -> None:
     if provider == "pelican" and cfg.pelican_url:
         from elm.pelican import PelicanClient
 
-        client = PelicanClient(url=cfg.pelican_url.rstrip("/"), api_key=token)
-        if client.test_connection():
+        with console.status("  Verifying connection..."):
+            client = PelicanClient(url=cfg.pelican_url.rstrip("/"), api_key=token)
+            ok = client.test_connection()
+        if ok:
             _ok("Connection verified")
         else:
-            _warn("Could not reach panel")
+            _warn("Could not reach panel — check URL and key")
 
 
 @key.command(name="show")
@@ -563,10 +792,18 @@ def key_set(ctx: click.Context, provider: str, token: str) -> None:
 def key_show(ctx: click.Context) -> None:
     """Show stored keys (masked)."""
     cfg = _get_cfg(ctx)
+
+    table = Table(border_style="dim", show_header=False, padding=(0, 1))
+    table.add_column("Provider", style="bold")
+    table.add_column("Key")
+
     for label, key_name in [("Pelican", "PELICAN_API_KEY"), ("CurseForge", "CURSEFORGE_API_KEY")]:
         masked = cfg.mask_key(key_name)
-        status = masked if masked else "[dim]not set[/dim]"
-        console.print(f"  {label}: {status}")
+        val = masked if masked else "[dim]not set[/dim]"
+        table.add_row(label, val)
+
+    console.print()
+    console.print(table)
 
 
 @key.command(name="rm")
@@ -583,27 +820,64 @@ def key_rm(ctx: click.Context, provider: str) -> None:
 # ── Config ────────────────────────────────────────────────────────────────
 
 
-@main.group(name="config")
+CONFIG_CATEGORIES = {
+    "Minecraft": ["MC_VERSION", "LOADER", "LOADER_VERSION"],
+    "Packwiz": ["PACKWIZ_BIN", "PREFER_SOURCE", "AUTO_DEPS", "AUTO_PUBLISH"],
+    "Server": ["SERVER_RAM", "SERVER_DISK", "SERVER_CPU", "SERVER_BASE_PORT",
+               "SERVER_RCON_BASE_PORT", "SERVER_DOMAIN", "SERVER_VM_IP"],
+    "Pelican": ["PELICAN_URL", "PELICAN_NODE_ID", "PELICAN_EGG_ID",
+                "PELICAN_USER_ID", "PELICAN_NEST_ID"],
+    "CDN": ["CDN_DOMAIN", "CDN_COMPOSE_DIR"],
+    "Updates": ["ELM_GITHUB_REPO", "ELM_GITHUB_BRANCH", "ELM_GITHUB_PATH",
+                "ELM_UPDATE_FILES"],
+    "Network": ["RETRY_ATTEMPTS", "RETRY_DELAY"],
+    "Local Mods": ["LOCAL_MODS_DIR", "LOCAL_MODS_URL"],
+}
+
+
+@_original_main.group(name="config", cls=SubGroup)
 @click.pass_context
 def config_group(ctx: click.Context) -> None:
     """View and edit configuration."""
-    pass
 
 
 @config_group.command(name="show")
 @click.pass_context
 def config_show(ctx: click.Context) -> None:
     """Show current configuration."""
+    from elm.config import DEFAULTS
+
     cfg = _get_cfg(ctx)
-    table = Table(title="Configuration")
-    table.add_column("Key", style="cyan")
-    table.add_column("Value")
-    for k in sorted(cfg.values):
-        v = cfg.values[k]
-        if "KEY" in k or "TOKEN" in k:
-            v = cfg.mask_key(k) or "[dim]not set[/dim]"
-        table.add_row(k, v or "[dim]empty[/dim]")
-    console.print(table)
+
+    for category, keys in CONFIG_CATEGORIES.items():
+        has_values = any(cfg.get(k) for k in keys)
+        if not has_values:
+            continue
+
+        table = Table(
+            title=category,
+            title_style="bold",
+            border_style="dim",
+            show_header=False,
+            padding=(0, 1),
+        )
+        table.add_column("Key", style="cyan", min_width=25)
+        table.add_column("Value")
+        table.add_column("", width=10)
+
+        for k in keys:
+            v = cfg.values.get(k, "")
+            if "KEY" in k or "TOKEN" in k:
+                v = cfg.mask_key(k) or ""
+
+            default = DEFAULTS.get(k, "")
+            marker = "[dim]default[/dim]" if v == default and v else ""
+
+            display = v if v else "[dim]—[/dim]"
+            table.add_row(k, display, marker)
+
+        console.print()
+        console.print(table)
 
 
 @config_group.command(name="set")
@@ -633,7 +907,7 @@ def config_get(ctx: click.Context, key: str) -> None:
 # ── Diagnostics ───────────────────────────────────────────────────────────
 
 
-@main.command()
+@_original_main.command()
 @click.pass_context
 def check(ctx: click.Context) -> None:
     """Run diagnostics."""
@@ -641,54 +915,70 @@ def check(ctx: click.Context) -> None:
 
     cfg = _get_cfg(ctx)
     _header("ELM Diagnostics")
+    console.print()
+
+    # Version
+    _info(f"ELM v{__version__}")
 
     # packwiz
     pw_path = shutil.which(cfg.packwiz_bin)
     if pw_path:
-        _ok(f"packwiz: {pw_path}")
+        _ok(f"packwiz found: [dim]{pw_path}[/dim]")
     else:
         _fail(f"packwiz not found (expected: {cfg.packwiz_bin})")
+        _hint("Install: https://packwiz.infra.link/installation/")
 
     # pack.toml
     if cfg.pack_toml.is_file():
-        _ok(f"pack.toml: {cfg.pack_toml}")
+        _ok(f"pack.toml: [dim]{cfg.pack_toml}[/dim]")
     else:
-        _warn(f"No pack.toml at {cfg.pack_toml}")
+        _warn("No pack.toml found")
+        _hint(f"Expected at: {cfg.pack_toml}")
+        _hint("Initialize with: elm init")
 
     # mods.txt
     if cfg.mods_file.is_file():
-        lines = [ln for ln in cfg.mods_file.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+        lines = [ln for ln in cfg.mods_file.read_text().splitlines()
+                 if ln.strip() and not ln.startswith("#")]
         _ok(f"mods.txt: {len(lines)} entries")
     else:
-        _warn("No mods.txt")
+        _info("No mods.txt [dim](optional)[/dim]")
 
     # Pelican
+    console.print()
     if cfg.pelican_url:
-        _ok(f"Pelican URL: {cfg.pelican_url}")
+        _ok(f"Pelican URL: [dim]{cfg.pelican_url}[/dim]")
         if cfg.pelican_api_key:
             from elm.pelican import PelicanClient
 
             client = PelicanClient(url=cfg.pelican_url.rstrip("/"), api_key=cfg.pelican_api_key)
-            if client.test_connection():
-                _ok("Pelican: connected")
+            with console.status("  Testing Pelican connection..."):
+                connected = client.test_connection()
+            if connected:
+                _ok("Pelican Panel: connected")
             else:
-                _warn("Pelican: could not connect")
+                _warn("Pelican Panel: could not connect")
         else:
             _warn("Pelican API key not set")
+            _hint("Set with: elm key set pelican")
     else:
-        console.print("  [dim]Pelican: not configured[/dim]")
+        _info("Pelican: not configured [dim](optional)[/dim]")
+        _hint("Set up with: elm deploy setup")
 
     # Targets
     names = target_list()
-    console.print(f"  Targets: {len(names)} configured")
+    if names:
+        _ok(f"Targets: {len(names)} configured ({', '.join(names)})")
+    else:
+        _info("No targets configured")
+
+    console.print()
 
 
 # ── Backwards-compat aliases ──────────────────────────────────────────────
 
-# Allow 'elm remove' as alias for 'elm rm'
-main.add_command(rm, "remove")
-# Allow 'elm list' as alias for 'elm ls'
-main.add_command(list_mods, "list")
+_original_main.add_command(rm, "remove")
+_original_main.add_command(list_mods, "list")
 
 
 if __name__ == "__main__":
