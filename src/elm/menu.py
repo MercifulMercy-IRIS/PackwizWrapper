@@ -50,6 +50,9 @@ MAIN_MENU: list[str] = [
     "   Run console command",
     "   Back up a server",
     "   Delete a server",
+    "── Dependencies ──────────────",
+    "   Check all dependencies",
+    "   Install a dependency",
     "── Settings ──────────────────",
     "   View settings",
     "   Change a setting",
@@ -508,6 +511,310 @@ def _server_action(cfg: Config, action: str, signal: str = "") -> None:
         _fail(str(exc))
 
 
+# ── Dependency actions ────────────────────────────────────────────────────
+
+
+# Each dependency: (label, check_cmd, install_hint, installer_func_or_None)
+# check_cmd is looked up via shutil.which; special keys handled separately.
+
+def _check_dep(name: str, binary: str) -> bool:
+    """Return True if *binary* is on PATH."""
+    import shutil
+    return shutil.which(binary) is not None
+
+
+def _dep_status() -> list[tuple[str, str, bool, str]]:
+    """Return (label, binary, found, hint) for every dependency."""
+    import shutil
+
+    deps: list[tuple[str, str, bool, str]] = []
+
+    # Go
+    found = shutil.which("go") is not None or Path("/usr/local/go/bin/go").is_file()
+    deps.append(("Go", "go", found, "Required to build packwiz"))
+
+    # packwiz
+    found = shutil.which("packwiz") is not None
+    deps.append(("packwiz", "packwiz", found, "Mod management CLI"))
+
+    # curl
+    found = shutil.which("curl") is not None
+    deps.append(("curl", "curl", found, "HTTP downloads & API calls"))
+
+    # jq
+    found = shutil.which("jq") is not None
+    deps.append(("jq", "jq", found, "JSON processing for targets & APIs"))
+
+    # git
+    found = shutil.which("git") is not None
+    deps.append(("Git", "git", found, "Version control"))
+
+    # Docker
+    found = shutil.which("docker") is not None
+    deps.append(("Docker", "docker", found, "Container runtime for servers"))
+
+    # Pelican Panel — check via configured URL + connection test
+    from elm.config import load_config
+    cfg = load_config()
+    pel_ok = False
+    if cfg.pelican_url and cfg.pelican_api_key:
+        try:
+            from elm.pelican import PelicanClient
+            client = PelicanClient(url=cfg.pelican_url.rstrip("/"), api_key=cfg.pelican_api_key)
+            pel_ok = client.test_connection()
+        except Exception:
+            pass
+    deps.append(("Pelican Panel", "pelican", pel_ok, "Game server management panel"))
+
+    # Wings
+    found = shutil.which("wings") is not None
+    deps.append(("Wings", "wings", found, "Pelican server daemon"))
+
+    return deps
+
+
+def action_check_deps(cfg: Config) -> None:
+    """Show status of all dependencies."""
+    _header("Dependency Check")
+    console.print()
+
+    statuses = _dep_status()
+    table = Table(
+        title="Dependencies",
+        title_style="bold",
+        border_style="dim",
+        padding=(0, 1),
+    )
+    table.add_column("Dependency", style="cyan")
+    table.add_column("Status", width=12)
+    table.add_column("Purpose", style="dim")
+
+    for label, _binary, found, hint in statuses:
+        status = "[green bold]found[/green bold]" if found else "[red bold]missing[/red bold]"
+        table.add_row(label, status, hint)
+
+    console.print(table)
+
+    missing = [label for label, _, found, _ in statuses if not found]
+    console.print()
+    if not missing:
+        _ok("All dependencies satisfied")
+    else:
+        _warn(f"{len(missing)} missing: {', '.join(missing)}")
+        _hint("Use 'Install a dependency' to set them up")
+
+
+def action_install_dep(cfg: Config) -> None:
+    """Sub-menu to install individual dependencies."""
+    import subprocess
+    import shutil
+
+    # Build a list of installable items with their installers
+    installable: list[tuple[str, str]] = [
+        ("Go", "Language runtime needed to build packwiz"),
+        ("packwiz", "Mod management CLI (requires Go)"),
+        ("curl", "HTTP download tool"),
+        ("jq", "JSON processor"),
+        ("Git", "Version control"),
+        ("Docker", "Container runtime for game servers"),
+        ("Pelican Panel", "Game server management web UI"),
+        ("Wings", "Pelican server daemon"),
+    ]
+
+    while True:
+        items = [f"{name}  [dim]— {desc}[/dim]" for name, desc in installable]
+        items.extend(["", "← Back"])
+        idx = _pick("Install a Dependency", items)
+        if idx is None or idx >= len(installable):
+            return
+
+        name = installable[idx][0]
+        console.print()
+
+        if name == "Go":
+            if _check_dep("Go", "go") or Path("/usr/local/go/bin/go").is_file():
+                _ok("Go is already installed")
+                _pause()
+                continue
+            _header("Install Go")
+            _info("Go is required to build packwiz from source.")
+            console.print()
+            if not click.confirm("  Install Go system-wide? (requires sudo)"):
+                _pause()
+                continue
+            try:
+                import platform
+                arch = platform.machine()
+                go_arch = {"x86_64": "amd64", "aarch64": "arm64", "AMD64": "amd64"}.get(arch)
+                if not go_arch:
+                    _fail(f"Unsupported architecture: {arch}")
+                    _pause()
+                    continue
+
+                go_version = "1.22.2"
+                tarball = f"go{go_version}.linux-{go_arch}.tar.gz"
+                url = f"https://go.dev/dl/{tarball}"
+
+                with console.status(f"  Downloading Go {go_version}..."):
+                    r = subprocess.run(
+                        ["curl", "-fsSL", "-o", f"/tmp/{tarball}", url],
+                        capture_output=True, text=True,
+                    )
+                if r.returncode != 0:
+                    _fail("Download failed")
+                    _pause()
+                    continue
+
+                with console.status("  Installing to /usr/local/go..."):
+                    subprocess.run(["sudo", "rm", "-rf", "/usr/local/go"], check=True)
+                    subprocess.run(
+                        ["sudo", "tar", "-C", "/usr/local", "-xzf", f"/tmp/{tarball}"],
+                        check=True,
+                    )
+                    Path(f"/tmp/{tarball}").unlink(missing_ok=True)
+
+                _ok(f"Go {go_version} installed to /usr/local/go")
+                _hint("You may need to add /usr/local/go/bin to your PATH")
+                _hint("  export PATH=\"/usr/local/go/bin:$HOME/go/bin:$PATH\"")
+            except Exception as exc:
+                _fail(f"Installation failed: {exc}")
+
+        elif name == "packwiz":
+            if _check_dep("packwiz", "packwiz"):
+                _ok(f"packwiz is already installed: {shutil.which('packwiz')}")
+                _pause()
+                continue
+            _header("Install packwiz")
+            _info("packwiz is installed via 'go install' (requires Go).")
+            console.print()
+            go_bin = shutil.which("go") or "/usr/local/go/bin/go"
+            if not Path(go_bin).is_file():
+                _fail("Go is not installed — install Go first")
+                _pause()
+                continue
+            if not click.confirm("  Install packwiz via go install?"):
+                _pause()
+                continue
+            try:
+                import os
+                env = os.environ.copy()
+                gopath = env.get("GOPATH", str(Path.home() / "go"))
+                env["GOPATH"] = gopath
+                env["PATH"] = f"/usr/local/go/bin:{gopath}/bin:{env.get('PATH', '')}"
+                with console.status("  Building packwiz..."):
+                    subprocess.run(
+                        [go_bin, "install", "github.com/packwiz/packwiz@latest"],
+                        env=env, capture_output=True, text=True, check=True,
+                    )
+                pw_path = Path(gopath) / "bin" / "packwiz"
+                if pw_path.is_file():
+                    # Symlink to ~/.local/bin
+                    local_bin = Path.home() / ".local" / "bin"
+                    local_bin.mkdir(parents=True, exist_ok=True)
+                    dest = local_bin / "packwiz"
+                    dest.unlink(missing_ok=True)
+                    dest.symlink_to(pw_path)
+                    _ok(f"packwiz installed → {dest}")
+                else:
+                    _ok("packwiz built (check $GOPATH/bin)")
+            except subprocess.CalledProcessError as exc:
+                _fail("Build failed")
+                if exc.stderr:
+                    _hint(exc.stderr.strip().splitlines()[0][:120])
+            except Exception as exc:
+                _fail(f"Installation failed: {exc}")
+
+        elif name in ("curl", "jq", "Git"):
+            binary = {"curl": "curl", "jq": "jq", "Git": "git"}[name]
+            if _check_dep(name, binary):
+                _ok(f"{name} is already installed")
+                _pause()
+                continue
+            _header(f"Install {name}")
+            pkg = {"curl": "curl", "jq": "jq", "Git": "git"}[name]
+            _info(f"Install {name} using your system package manager:")
+            console.print()
+            console.print(f"    [cyan]sudo apt install {pkg}[/cyan]     [dim](Debian/Ubuntu)[/dim]")
+            console.print(f"    [cyan]sudo dnf install {pkg}[/cyan]     [dim](Fedora/RHEL)[/dim]")
+            console.print(f"    [cyan]sudo pacman -S {pkg}[/cyan]       [dim](Arch)[/dim]")
+            console.print(f"    [cyan]brew install {pkg}[/cyan]         [dim](macOS)[/dim]")
+            console.print()
+            if click.confirm(f"  Attempt auto-install with apt/dnf?"):
+                apt = shutil.which("apt-get")
+                dnf = shutil.which("dnf")
+                pacman = shutil.which("pacman")
+                mgr: list[str] = []
+                if apt:
+                    mgr = ["sudo", "apt-get", "install", "-y", pkg]
+                elif dnf:
+                    mgr = ["sudo", "dnf", "install", "-y", pkg]
+                elif pacman:
+                    mgr = ["sudo", "pacman", "-S", "--noconfirm", pkg]
+                else:
+                    _fail("No supported package manager found (apt, dnf, pacman)")
+                    _pause()
+                    continue
+                try:
+                    with console.status(f"  Installing {name}..."):
+                        subprocess.run(mgr, check=True)
+                    _ok(f"{name} installed")
+                except subprocess.CalledProcessError:
+                    _fail(f"Failed to install {name}")
+
+        elif name == "Docker":
+            if _check_dep("Docker", "docker"):
+                _ok("Docker is already installed")
+                _pause()
+                continue
+            _header("Install Docker")
+            _info("Docker is best installed via the official script.")
+            console.print()
+            console.print("    [cyan]curl -fsSL https://get.docker.com | sudo sh[/cyan]")
+            console.print()
+            if click.confirm("  Run the official Docker install script? (requires sudo)"):
+                try:
+                    with console.status("  Installing Docker..."):
+                        subprocess.run(
+                            ["bash", "-c", "curl -fsSL https://get.docker.com | sudo sh"],
+                            check=True,
+                        )
+                    _ok("Docker installed")
+                    _hint("Add yourself to the docker group: sudo usermod -aG docker $USER")
+                except subprocess.CalledProcessError:
+                    _fail("Docker installation failed")
+
+        elif name == "Pelican Panel":
+            _header("Install Pelican Panel")
+            _info("Pelican Panel is the web UI for managing game servers.")
+            _info("It runs as a PHP application with a database backend.")
+            console.print()
+            _info("Installation options:")
+            console.print()
+            console.print("    [cyan]1.[/cyan] Docker (recommended):")
+            console.print("       [dim]https://pelican.dev/docs/panel/getting-started[/dim]")
+            console.print()
+            console.print("    [cyan]2.[/cyan] Manual install on a web server:")
+            console.print("       [dim]Requires PHP 8.2+, MySQL/MariaDB, Nginx/Caddy[/dim]")
+            console.print()
+            _hint("After installing, run 'elm deploy setup' to connect ELM to your panel")
+
+        elif name == "Wings":
+            _header("Install Wings")
+            _info("Wings is the Pelican daemon that runs on each game server node.")
+            console.print()
+            _info("Installation options:")
+            console.print()
+            console.print("    [cyan]1.[/cyan] Docker (recommended):")
+            console.print("       [dim]https://pelican.dev/docs/wings/getting-started[/dim]")
+            console.print()
+            console.print("    [cyan]2.[/cyan] Standalone binary:")
+            console.print("       [dim]Download from GitHub releases[/dim]")
+            console.print()
+            _hint("Wings must be configured in Pelican Panel after installation")
+
+        _pause()
+
+
 # ── Settings actions ──────────────────────────────────────────────────────
 
 
@@ -741,6 +1048,8 @@ DISPATCH: dict[str, Any] = {
     "Run console command": lambda cfg: _server_action(cfg, "console"),
     "Back up a server": lambda cfg: _server_action(cfg, "backup"),
     "Delete a server": lambda cfg: _server_action(cfg, "delete"),
+    "Check all dependencies": action_check_deps,
+    "Install a dependency": action_install_dep,
     "View settings": action_view_settings,
     "Change a setting": action_change_setting,
     "Manage targets": action_manage_targets,
