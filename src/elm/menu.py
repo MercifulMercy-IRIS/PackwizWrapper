@@ -6,6 +6,7 @@ Arrow-key navigable, categorized, plain-English labels.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import click
@@ -266,7 +267,6 @@ def action_self_update(cfg: Config) -> None:
     import subprocess
     import tempfile
     import shutil
-    from pathlib import Path
 
     _header("Update ELM")
     repo = cfg.get("ELM_GITHUB_REPO")
