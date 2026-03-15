@@ -16,6 +16,7 @@
 #   pm list                    Show installed mods with status
 #   pm status                  Pack health overview
 #   pm deps                    Show auto-pulled dependencies
+#   pm search <query>          Search Modrinth/CurseForge APIs
 #   pm export [mr|cf]          Export pack for distribution
 #   pm serve                   Local HTTP server for testing
 #   pm verify                  Full audit: mods.txt vs installed .pw.toml
@@ -61,10 +62,8 @@ RETRY_ATTEMPTS=2
 RETRY_DELAY=3
 AUTO_DEPS=true
 PREFER_SOURCE="mr"
-SYNC_ON_FAIL="prompt"              # What to do when a mod can't be found during sync:
-                                   #   "prompt"     — pause and ask the user (a/u/s)
-                                   #   "unresolved" — auto-save to unresolved.txt
-                                   #   "skip"       — silently skip
+# When a mod can't be found during sync, it's automatically saved
+# to unresolved.txt. Use 'pm unresolved search' to find alternatives.
 AUTO_PUBLISH=""                    # Target name to auto-publish to CDN after sync/update
                                    #   "" = disabled, "<target>" = auto-run publish_cdn after sync/update
 
@@ -93,6 +92,10 @@ PM_GITHUB_REPO=""               # e.g. "yourusername/PackwizWrapper" (owner/repo
 PM_GITHUB_BRANCH="main"         # Branch to pull updates from
 PM_GITHUB_PATH=""               # Subdirectory in repo where files live (e.g. "envious-mc")
 PM_UPDATE_FILES="packmanager.sh install.sh packmanager.conf mods.txt"  # Files to update
+
+# CurseForge API key (optional — enables fuzzy search on CurseForge)
+# Get one free at https://console.curseforge.com
+CURSEFORGE_API_KEY=""
 
 # Local/self-hosted mods (for mods not on Modrinth/CurseForge)
 LOCAL_MODS_DIR=""               # e.g. /var/www/mods — served by Caddy/tunnel
@@ -830,37 +833,11 @@ install_mod() {
         echo -e "  ${RED}${BOLD}NOT FOUND${NC}: ${BOLD}${slug}${NC}"
         echo -e "  ${DIM}Not available on Modrinth or CurseForge (source: ${source})${NC}"
 
-        local fail_action="${SYNC_ON_FAIL:-prompt}"
-
-        case "$fail_action" in
-            unresolved)
-                # Auto-save to unresolved.txt without prompting
-                add_to_unresolved "$slug" "not found on ${source}"
-                log WARN "${slug} → auto-saved to unresolved.txt"
-                ;;
-            skip)
-                log SKIP "${slug} — skipped (not found)"
-                ;;
-            prompt|*)
-                # Pause and ask — read from /dev/tty so it works inside while-read loops
-                echo ""
-                echo -e "  ${CYAN}(u)${NC} Save to unresolved.txt — bind a URL/JAR later"
-                echo -e "  ${DIM}(s)${NC} Skip — ignore for now"
-                echo ""
-                echo -ne "  ${CYAN}choice [u/s]>${NC} "
-                read -r nf_choice < /dev/tty
-
-                case "$nf_choice" in
-                    u|U)
-                        add_to_unresolved "$slug" "not found on ${source}"
-                        log WARN "${slug} → saved to unresolved.txt"
-                        ;;
-                    *)
-                        log SKIP "${slug} — skipped (not found)"
-                        ;;
-                esac
-                ;;
-        esac
+        # Always auto-save to unresolved.txt — no prompting
+        add_to_unresolved "$slug" "not found on ${source}"
+        log WARN "${slug} → saved to unresolved.txt"
+        echo -e "  ${DIM}Investigate: ${CYAN}${UNRESOLVED_FILE}${NC}"
+        echo -e "  ${DIM}Try:         ${CYAN}pm search ${slug}${NC}  or  ${CYAN}pm unresolved search ${slug}${NC}"
         return 1
     fi
 
@@ -881,6 +858,180 @@ install_mod() {
     return 0
 }
 
+
+# ============================================================================
+# MOD SEARCH (Modrinth + CurseForge APIs)
+# ============================================================================
+# Fuzzy search for mods by name/slug across both platforms.
+# Modrinth's API is free with no key. CurseForge requires CURSEFORGE_API_KEY.
+# Used by: pm search <query>, pm unresolved search, and sync failure suggestions.
+
+# User-Agent for API requests (good etiquette)
+PM_USER_AGENT="PackManager/4 (github.com/PackwizWrapper)"
+
+# Search Modrinth API — returns tab-separated: slug \t name \t downloads \t description
+search_modrinth_api() {
+    local query="$1" limit="${2:-10}"
+    command -v curl &>/dev/null || return 1
+
+    # Build facets: filter to mods, matching MC version and loader
+    local facets="[[\"project_type:mod\"]"
+    [[ -n "$MC_VERSION" ]] && facets="${facets},[\"versions:${MC_VERSION}\"]"
+    [[ -n "$LOADER" ]]     && facets="${facets},[\"categories:${LOADER}\"]"
+    facets="${facets}]"
+
+    local encoded_query
+    encoded_query=$(printf '%s' "$query" | sed 's/ /%20/g; s/"/%22/g')
+
+    local response
+    response=$(curl -sL --max-time 10 \
+        -H "User-Agent: ${PM_USER_AGENT}" \
+        "https://api.modrinth.com/v2/search?query=${encoded_query}&limit=${limit}&facets=${facets}" \
+        2>/dev/null) || return 1
+
+    # Parse response — extract hits array
+    echo "$response" | jq -r '.hits[]? | [.slug, .title, (.downloads | tostring), .description[:80]] | @tsv' 2>/dev/null
+}
+
+# Search CurseForge API — returns tab-separated: slug \t name \t downloads \t summary
+search_curseforge_api() {
+    local query="$1" limit="${2:-10}"
+    [[ -z "$CURSEFORGE_API_KEY" ]] && return 1
+    command -v curl &>/dev/null || return 1
+
+    # CurseForge gameId 432 = Minecraft
+    local loader_type=""
+    case "$LOADER" in
+        forge)     loader_type="1" ;;
+        fabric)    loader_type="4" ;;
+        quilt)     loader_type="5" ;;
+        neoforge)  loader_type="6" ;;
+    esac
+
+    local encoded_query
+    encoded_query=$(printf '%s' "$query" | sed 's/ /%20/g; s/"/%22/g')
+
+    local url="https://api.curseforge.com/v1/mods/search?gameId=432&searchFilter=${encoded_query}&pageSize=${limit}&sortField=2&sortOrder=desc"
+    [[ -n "$loader_type" ]] && url="${url}&modLoaderType=${loader_type}"
+    [[ -n "$MC_VERSION" ]]  && url="${url}&gameVersion=${MC_VERSION}"
+
+    local response
+    response=$(curl -sL --max-time 10 \
+        -H "x-api-key: ${CURSEFORGE_API_KEY}" \
+        -H "User-Agent: ${PM_USER_AGENT}" \
+        "$url" 2>/dev/null) || return 1
+
+    echo "$response" | jq -r '.data[]? | [.slug, .name, (.downloadCount | tostring), .summary[:80]] | @tsv' 2>/dev/null
+}
+
+# Unified search: hits both APIs and merges results
+# Output: source \t slug \t name \t downloads \t description
+search_mods() {
+    local query="$1" limit="${2:-5}"
+    local found=false
+
+    # Modrinth
+    local mr_results
+    mr_results=$(search_modrinth_api "$query" "$limit" 2>/dev/null) || true
+    if [[ -n "$mr_results" ]]; then
+        found=true
+        while IFS=$'\t' read -r slug name downloads desc; do
+            printf "mr\t%s\t%s\t%s\t%s\n" "$slug" "$name" "$downloads" "$desc"
+        done <<< "$mr_results"
+    fi
+
+    # CurseForge (only if API key is configured)
+    if [[ -n "$CURSEFORGE_API_KEY" ]]; then
+        local cf_results
+        cf_results=$(search_curseforge_api "$query" "$limit" 2>/dev/null) || true
+        if [[ -n "$cf_results" ]]; then
+            found=true
+            while IFS=$'\t' read -r slug name downloads desc; do
+                printf "cf\t%s\t%s\t%s\t%s\n" "$slug" "$name" "$downloads" "$desc"
+            done <<< "$cf_results"
+        fi
+    fi
+
+    $found || return 1
+}
+
+# Display search results and optionally let the user pick one to install/resolve
+# Returns the selected entry as "source:slug" (e.g. "mr:jei") or empty string
+interactive_search() {
+    local query="$1" action="${2:-install}"  # action: install | resolve
+
+    echo -e "  ${BLUE}Searching for '${query}'...${NC}"
+    echo ""
+
+    local results
+    results=$(search_mods "$query" 5 2>/dev/null)
+
+    if [[ -z "$results" ]]; then
+        echo -e "  ${DIM}No results found on Modrinth${NC}"
+        [[ -z "$CURSEFORGE_API_KEY" ]] && echo -e "  ${DIM}(Set CURSEFORGE_API_KEY in config to also search CurseForge)${NC}"
+        echo ""
+        return 1
+    fi
+
+    # Display results as a numbered list
+    local i=0
+    local -a result_entries=()
+
+    printf "  ${BOLD}%-3s %-4s %-30s %-12s %s${NC}\n" "#" "SRC" "NAME" "DOWNLOADS" "DESCRIPTION"
+    separator
+
+    while IFS=$'\t' read -r src slug name downloads desc; do
+        (( i++ ))
+        result_entries+=("${src}:${slug}")
+        local src_label
+        case "$src" in
+            mr) src_label="${GREEN}MR${NC}" ;;
+            cf) src_label="${YELLOW}CF${NC}" ;;
+            *)  src_label="$src" ;;
+        esac
+
+        # Format download count
+        local dl_fmt="$downloads"
+        if [[ "$downloads" =~ ^[0-9]+$ ]]; then
+            if (( downloads >= 1000000 )); then
+                dl_fmt="$(( downloads / 1000000 ))M"
+            elif (( downloads >= 1000 )); then
+                dl_fmt="$(( downloads / 1000 ))K"
+            fi
+        fi
+
+        printf "  ${CYAN}%-3s${NC} ${src_label}  %-30s %-12s ${DIM}%s${NC}\n" "$i" "${name:0:30}" "$dl_fmt" "${desc:0:50}"
+    done <<< "$results"
+
+    echo ""
+
+    if [[ "$action" == "none" ]]; then
+        # Just display, no prompt
+        return 0
+    fi
+
+    # Prompt user to pick one
+    local action_label="install"
+    [[ "$action" == "resolve" ]] && action_label="resolve"
+
+    echo -ne "  ${CYAN}Pick a number to ${action_label} (or Enter to skip)>${NC} "
+    read -r pick < /dev/tty
+
+    if [[ -z "$pick" ]]; then
+        echo -e "  ${DIM}Skipped.${NC}"
+        echo ""
+        return 1
+    fi
+
+    if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#result_entries[@]} )); then
+        local selected="${result_entries[$((pick - 1))]}"
+        echo "$selected"
+        return 0
+    else
+        echo -e "  ${RED}Invalid selection.${NC}"
+        return 1
+    fi
+}
 
 # ============================================================================
 # TARGET REGISTRY
@@ -2595,6 +2746,69 @@ cmd_deps() {
     echo ""
 }
 
+cmd_search() {
+    local query="${1:-}"
+
+    if [[ -z "$query" ]]; then
+        echo -e "${RED}Usage: pm search <query>${NC}"
+        echo ""
+        echo -e "  Search Modrinth (and CurseForge if API key is set) for mods."
+        echo ""
+        echo -e "  ${BOLD}Examples:${NC}"
+        echo -e "    ${CYAN}pm search jei${NC}            # search for Just Enough Items"
+        echo -e "    ${CYAN}pm search \"applied ener\"${NC}  # fuzzy search"
+        echo -e "    ${CYAN}pm search optifine${NC}        # find alternatives"
+        echo ""
+        echo -e "  ${DIM}Results are filtered by MC ${MC_VERSION} / ${LOADER}${NC}"
+        [[ -z "$CURSEFORGE_API_KEY" ]] && echo -e "  ${DIM}Set CURSEFORGE_API_KEY in config to also search CurseForge${NC}"
+        echo ""
+        return 1
+    fi
+
+    header "Search: ${query}"
+    echo -e "  ${DIM}Filtering: MC ${MC_VERSION} / ${LOADER}${NC}"
+    echo ""
+
+    local selected
+    selected=$(interactive_search "$query" "install") || return 0
+
+    if [[ -n "$selected" ]]; then
+        echo ""
+        echo -e "  ${GREEN}Selected: ${BOLD}${selected}${NC}"
+        echo ""
+        echo -e "  ${CYAN}(i)${NC} Install now and add to mods.txt"
+        echo -e "  ${CYAN}(a)${NC} Add to mods.txt only (install on next sync)"
+        echo -e "  ${DIM}(n)${NC} Cancel"
+        echo ""
+        echo -ne "  ${CYAN}choice [i/a/n]>${NC} "
+        read -r choice < /dev/tty
+
+        case "$choice" in
+            i|I)
+                check_packwiz; check_pack_init
+                local parsed
+                parsed="$(parse_mod_entry "$selected")" || return 1
+                IFS='|' read -r source slug url pinned <<< "$parsed"
+                if install_mod "$source" "$slug" "$url" "$pinned"; then
+                    is_in_modlist "$slug" || { append_to_modlist "$selected"; log INFO "Added to mods.txt"; }
+                    $PACKWIZ_BIN refresh 2>>"$RUN_LOG"
+                else
+                    log FAIL "Install failed for ${slug}"
+                fi
+                ;;
+            a|A)
+                is_in_modlist "${selected#*:}" || {
+                    append_to_modlist "$selected"
+                    log OK "Added ${selected} to mods.txt (run 'pm sync' to install)"
+                }
+                ;;
+            *)
+                echo -e "  ${DIM}Cancelled.${NC}"
+                ;;
+        esac
+    fi
+}
+
 cmd_doctor() {
     check_pack_init
     header "Pack Doctor"
@@ -3165,6 +3379,77 @@ cmd_unresolved() {
             log OK "Removed ${slug} from unresolved.txt"
             ;;
 
+        search|find)
+            header "Search Unresolved Mods"
+
+            if [[ ! -f "$UNRESOLVED_FILE" ]]; then
+                echo -e "  ${GREEN}No unresolved mods.${NC}"
+                echo ""
+                return
+            fi
+
+            # If a slug was given, search just that one
+            if [[ -n "${1:-}" ]]; then
+                local slug="$1"
+                if ! is_unresolved "$slug"; then
+                    echo -e "  ${RED}'${slug}' is not in unresolved.txt${NC}"
+                    return 1
+                fi
+
+                local selected
+                selected=$(interactive_search "$slug" "resolve") || return 0
+
+                if [[ -n "$selected" ]]; then
+                    # Remove from unresolved, add to mods.txt
+                    local tmp; tmp=$(mktemp)
+                    grep -vE "^${slug}(\s|#|$)" "$UNRESOLVED_FILE" > "$tmp" || true
+                    mv "$tmp" "$UNRESOLVED_FILE"
+                    append_to_modlist "$selected" "resolved via search (was: ${slug})"
+                    log OK "${slug} → ${selected} (moved to mods.txt)"
+                    echo -e "  ${DIM}Run 'pm sync' to install.${NC}"
+                fi
+                return
+            fi
+
+            # No slug given — search all unresolved mods
+            local count=0
+            local resolved_count=0
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                [[ "$line" =~ ^[[:space:]]*# ]] && continue
+                [[ -z "$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" ]] && continue
+                local slug
+                slug=$(echo "$line" | sed 's/\s*#.*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                (( count++ ))
+
+                separator
+                echo -e "  ${YELLOW}Searching for:${NC} ${BOLD}${slug}${NC}"
+                echo ""
+
+                local selected
+                selected=$(interactive_search "$slug" "resolve") || continue
+
+                if [[ -n "$selected" ]]; then
+                    local tmp; tmp=$(mktemp)
+                    grep -vE "^${slug}(\s|#|$)" "$UNRESOLVED_FILE" > "$tmp" || true
+                    mv "$tmp" "$UNRESOLVED_FILE"
+                    append_to_modlist "$selected" "resolved via search (was: ${slug})"
+                    log OK "${slug} → ${selected}"
+                    (( resolved_count++ ))
+                fi
+                echo ""
+            done < "$UNRESOLVED_FILE"
+
+            separator
+            echo ""
+            if (( resolved_count > 0 )); then
+                echo -e "  ${GREEN}${BOLD}Resolved ${resolved_count}/${count} mod(s).${NC}"
+                echo -e "  ${DIM}Run 'pm sync' to install them.${NC}"
+            else
+                echo -e "  ${DIM}No mods resolved.${NC}"
+            fi
+            echo ""
+            ;;
+
         clear)
             if [[ ! -f "$UNRESOLVED_FILE" ]]; then
                 echo -e "  ${DIM}Nothing to clear.${NC}"
@@ -3182,15 +3467,17 @@ cmd_unresolved() {
             echo -e "  ${BOLD}pm unresolved${NC} — Manage Mods Not Found on MR/CF"
             echo ""
             echo -e "  ${CYAN}pm unresolved list${NC}                     Show pending mods"
+            echo -e "  ${CYAN}pm unresolved search [slug]${NC}            Search APIs for matches"
             echo -e "  ${CYAN}pm unresolved edit${NC}                     Open unresolved.txt in editor"
             echo -e "  ${CYAN}pm unresolved resolve <slug> <url>${NC}     Bind a URL and move to mods.txt"
             echo -e "  ${CYAN}pm unresolved remove <slug>${NC}            Remove from unresolved list"
             echo -e "  ${CYAN}pm unresolved clear${NC}                    Delete unresolved.txt"
             echo ""
             echo -e "  ${BOLD}Example:${NC}"
+            echo "    pm unresolved search               # search all unresolved mods"
+            echo "    pm unresolved search my-mod         # search one specific mod"
             echo "    pm unresolved resolve my-mod url:https://example.com/my-mod-1.0.jar"
-            echo "    pm unresolved resolve my-mod local:my-mod"
-            echo "    pm sync   # installs the resolved mod"
+            echo "    pm sync                             # installs the resolved mods"
             echo ""
             ;;
     esac
@@ -3944,6 +4231,7 @@ cmd_help() {
     list [--side <s>] [--version]  Show installed mods (--native for raw packwiz)
     status                         Pack health overview
     deps                           Show auto-pulled dependencies
+    search <query>                 Search Modrinth/CurseForge by name/slug
     refresh [--build]              Refresh index (--build for distribution)
     serve                          Local HTTP dev server (localhost:8080)
 
@@ -3966,6 +4254,7 @@ cmd_help() {
     aliases remove <slug>          Remove alias (option to uninstall mod)
     aliases clear                  Clear all alias tracking
     unresolved list                Show mods pending URL/JAR binding
+    unresolved search [slug]       Search APIs to find & resolve unresolved mods
     unresolved resolve <slug> <u>  Bind a URL/local path and move to mods.txt
     unresolved edit                Open unresolved.txt in editor
     unresolved remove <slug>       Remove from unresolved list
@@ -4065,6 +4354,7 @@ main() {
         list|ls)           cmd_list "$@" ;;
         status|st)         cmd_status ;;
         deps)              cmd_deps ;;
+        search|s)          cmd_search "${1:-}" ;;
         export|ex)         cmd_export "${1:-modrinth}" "${2:-}" ;;
         serve)             cmd_serve ;;
         refresh)           cmd_refresh "${1:-}" ;;

@@ -267,7 +267,8 @@ RETRY_DELAY=3                   # Seconds between retries
 PREFER_SOURCE="mr"              # "mr" (Modrinth first) or "cf" (CurseForge first)
 
 # --- Sync Behavior -----------------------------------------------------------
-SYNC_ON_FAIL="prompt"           # "prompt" = pause and ask, "unresolved" = auto-save, "skip" = ignore
+# Mods not found during sync are auto-saved to unresolved.txt.
+# Use 'pm unresolved search' to find alternatives via API.
 AUTO_PUBLISH=""                 # "" = off, "__auto__" = sibling cdn/ dir, "<target>" = named target
 
 # --- Docker Server -----------------------------------------------------------
@@ -329,7 +330,7 @@ _pm_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    commands="init organize sync update add remove list status deps refresh export serve pin unpin migrate settings import detect open markdown targets deploy doctor verify diff aliases unresolved config publish self-update update-status start stop restart kill logs console backup destroy help"
+    commands="init organize sync update add remove list status deps search refresh export serve pin unpin migrate settings import detect open markdown targets deploy doctor verify diff aliases unresolved config publish self-update update-status start stop restart kill logs console backup destroy help"
 
     case "$prev" in
         pm)
@@ -353,6 +354,14 @@ _pm_completions() {
             ;;
         targets|t)
             COMPREPLY=($(compgen -W "list add set show remove help" -- "$cur"))
+            return 0
+            ;;
+        unresolved|ur)
+            COMPREPLY=($(compgen -W "list search edit resolve remove clear help" -- "$cur"))
+            return 0
+            ;;
+        aliases|al)
+            COMPREPLY=($(compgen -W "list remove clear help" -- "$cur"))
             return 0
             ;;
         config|cfg)
