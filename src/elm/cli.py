@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any
 
 import click
-from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
@@ -35,33 +34,7 @@ from elm.config import (
     target_remove,
     target_set,
 )
-
-console = Console(highlight=False)
-
-# ── Output helpers ────────────────────────────────────────────────────────
-
-def _fail(msg: str) -> None:
-    console.print(f"  [red bold]FAIL[/red bold]  {msg}")
-
-
-def _ok(msg: str) -> None:
-    console.print(f"  [green bold] OK [/green bold]  {msg}")
-
-
-def _warn(msg: str) -> None:
-    console.print(f"  [yellow bold]WARN[/yellow bold]  {msg}")
-
-
-def _info(msg: str) -> None:
-    console.print(f"  [blue bold]INFO[/blue bold]  {msg}")
-
-
-def _hint(msg: str) -> None:
-    console.print(f"         [dim]{msg}[/dim]")
-
-
-def _header(msg: str) -> None:
-    console.print(f"\n[bold cyan]── {msg} ──[/bold cyan]")
+from elm.ui import console, _fail, _ok, _warn, _info, _hint, _header
 
 
 def _get_cfg(ctx: click.Context) -> Config:
@@ -152,7 +125,8 @@ def main(ctx: click.Context) -> None:
         _fail(f"Could not load config: {exc}")
         ctx.exit(1)
     if ctx.invoked_subcommand is None:
-        click.echo(ctx.get_help())
+        from elm.menu import run_menu
+        run_menu(ctx.obj)
 
 
 # Global error handler — catch uncaught exceptions so users never see raw tracebacks
