@@ -25,6 +25,8 @@
 #   pm diff                    Side-by-side modlist vs packwiz diff
 #   pm doctor                  All checks + verify in one pass
 #   pm netcheck                Network diagnosis: can clients reach pack.toml?
+#   pm resolve                 Re-attempt unresolved mods (fuzzy search + variants)
+#   pm resolve -i              Interactive mode (pick from search results)
 #   pm aliases                 Manage mod aliases (list/remove/clear)
 #
 # SERVER MANAGEMENT (Docker Compose + itzg/minecraft-server):
@@ -796,6 +798,13 @@ install_mod() {
         fi
     fi
 
+    # --- Fuzzy resolution fallback: try slug variations + search ---
+    if ! $installed && [[ "$source" != "url" && "$source" != "local" ]]; then
+        if fuzzy_resolve_mod "$slug" "false"; then
+            installed=true; via="fuzzy resolve (${FUZZY_RESOLVED_AS:-search})"
+        fi
+    fi
+
     # --- Mod not found on any source ---
     if ! $installed; then
         echo ""
@@ -1085,6 +1094,159 @@ curseforge_download_mod() {
     fi
 
     rm -f "$tmp_jar"
+    return 1
+}
+
+# ─── Fuzzy Mod Resolution ─────────────────────────────────────────────
+# Try multiple strategies to find and download a mod when the exact slug fails.
+# Strategies (in order):
+#   1. Exact slug → Modrinth project API (already tried by direct download)
+#   2. Slug variations → strip common suffixes/prefixes, try alternate forms
+#   3. Fuzzy search → query both APIs with the slug as search text
+#   4. Substring match → pick the best search result whose slug is close
+#
+# Returns 0 if mod was successfully downloaded and imported.
+# Sets FUZZY_RESOLVED_AS with the actual slug used (for reporting).
+FUZZY_RESOLVED_AS=""
+
+fuzzy_resolve_mod() {
+    local slug="$1"
+    local interactive="${2:-false}"   # "true" = show candidates and prompt
+    FUZZY_RESOLVED_AS=""
+
+    # ── Strategy 1: Slug variations ──────────────────────────────────
+    # Many mods use different slug conventions across platforms.
+    # e.g., "fabric-api" vs "fabricapi", "jei" vs "just-enough-items"
+    local -a variations=()
+
+    # Strip common Forge/Fabric prefixes/suffixes
+    local base="$slug"
+    base="${base#forge-}" ; base="${base#fabric-}" ; base="${base#quilt-}"
+    base="${base%-forge}" ; base="${base%-fabric}" ; base="${base%-quilt}"
+    [[ "$base" != "$slug" ]] && variations+=("$base")
+
+    # Try with loader prefix added
+    [[ -n "$LOADER" && "$slug" != "${LOADER}-"* ]] && variations+=("${LOADER}-${slug}")
+
+    # Remove hyphens (fabricapi vs fabric-api)
+    local nohyphens="${slug//-/}"
+    [[ "$nohyphens" != "$slug" ]] && variations+=("$nohyphens")
+
+    # Add hyphens between words if slug is camelCase-ish (justEnoughItems → just-enough-items)
+    local hyphenated
+    hyphenated=$(echo "$slug" | sed 's/\([a-z]\)\([A-Z]\)/\1-\2/g' | tr '[:upper:]' '[:lower:]')
+    [[ "$hyphenated" != "$slug" ]] && variations+=("$hyphenated")
+
+    for variant in "${variations[@]}"; do
+        # Try Modrinth exact project lookup with variant slug
+        if modrinth_download_mod "$variant" 2>/dev/null; then
+            FUZZY_RESOLVED_AS="$variant"
+            log OK "${slug} → resolved as '${variant}' (Modrinth, slug variant)"
+            return 0
+        fi
+        # Try CurseForge with variant slug
+        if [[ -n "$CURSEFORGE_API_KEY" ]] && curseforge_download_mod "$variant" 2>/dev/null; then
+            FUZZY_RESOLVED_AS="$variant"
+            log OK "${slug} → resolved as '${variant}' (CurseForge, slug variant)"
+            return 0
+        fi
+    done
+
+    # ── Strategy 2: Fuzzy search → pick best candidate ───────────────
+    # Use the slug as a search query on both APIs, rank results by slug similarity.
+    local -a candidates=()   # "source|slug|name|downloads"
+
+    # Search Modrinth
+    local mr_hits
+    mr_hits=$(search_modrinth_api "$slug" 5 2>/dev/null) || true
+    if [[ -n "$mr_hits" ]]; then
+        while IFS=$'\t' read -r cslug cname cdownloads cdesc; do
+            [[ -n "$cslug" ]] && candidates+=("mr|${cslug}|${cname}|${cdownloads}")
+        done <<< "$mr_hits"
+    fi
+
+    # Search CurseForge
+    if [[ -n "$CURSEFORGE_API_KEY" ]]; then
+        local cf_hits
+        cf_hits=$(search_curseforge_api "$slug" 5 2>/dev/null) || true
+        if [[ -n "$cf_hits" ]]; then
+            while IFS=$'\t' read -r cslug cname cdownloads cdesc; do
+                [[ -n "$cslug" ]] && candidates+=("cf|${cslug}|${cname}|${cdownloads}")
+            done <<< "$cf_hits"
+        fi
+    fi
+
+    [[ ${#candidates[@]} -eq 0 ]] && return 1
+
+    # ── Score candidates by slug similarity ──────────────────────────
+    # Simple scoring: normalized slug containment and length distance.
+    local slug_norm
+    slug_norm=$(normalize_slug "$slug")
+    local best_score=0 best_source="" best_slug="" best_name=""
+
+    for entry in "${candidates[@]}"; do
+        IFS='|' read -r csrc cslug cname cdownloads <<< "$entry"
+        local cnorm
+        cnorm=$(normalize_slug "$cslug")
+
+        local score=0
+        # Exact match after normalization
+        [[ "$cnorm" == "$slug_norm" ]] && score=100
+        # One contains the other
+        [[ $score -lt 100 && "$cnorm" == *"$slug_norm"* ]] && score=70
+        [[ $score -lt 100 && "$slug_norm" == *"$cnorm"* ]] && score=60
+        # First 4+ chars match
+        [[ $score -lt 50 && ${#slug_norm} -ge 4 && "${cnorm:0:4}" == "${slug_norm:0:4}" ]] && score=40
+        # Bonus for high download count (popular mods more likely correct)
+        [[ $score -gt 0 && "${cdownloads:-0}" -gt 1000000 ]] && score=$((score + 5))
+
+        if [[ $score -gt $best_score ]]; then
+            best_score=$score
+            best_source="$csrc"
+            best_slug="$cslug"
+            best_name="$cname"
+        fi
+    done
+
+    # ── Interactive mode: show candidates and let user pick ──────────
+    if [[ "$interactive" == "true" && ${#candidates[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "  ${CYAN}Search results for ${BOLD}${slug}${NC}:"
+        local idx=1
+        for entry in "${candidates[@]}"; do
+            IFS='|' read -r csrc cslug cname cdownloads <<< "$entry"
+            local src_label="MR"
+            [[ "$csrc" == "cf" ]] && src_label="CF"
+            printf "    ${BOLD}%d${NC}) [%s] %-30s %s  (%s downloads)\n" \
+                "$idx" "$src_label" "$cslug" "$cname" "$cdownloads"
+            idx=$((idx + 1))
+        done
+        echo -e "    ${BOLD}0${NC}) Skip"
+
+        local choice
+        read -rp "  Pick mod to install [1-$((idx-1)), 0=skip]: " choice </dev/tty
+        if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -lt "$idx" ]]; then
+            local picked="${candidates[$((choice-1))]}"
+            IFS='|' read -r csrc cslug cname cdownloads <<< "$picked"
+            if [[ "$csrc" == "mr" ]]; then
+                modrinth_download_mod "$cslug" && { FUZZY_RESOLVED_AS="$cslug"; return 0; }
+            else
+                curseforge_download_mod "$cslug" && { FUZZY_RESOLVED_AS="$cslug"; return 0; }
+            fi
+        fi
+        return 1
+    fi
+
+    # ── Auto mode: only accept high-confidence matches ───────────────
+    if [[ $best_score -ge 70 && -n "$best_slug" ]]; then
+        log INFO "${slug} → fuzzy match: ${best_name} (${best_slug}, score ${best_score})"
+        if [[ "$best_source" == "mr" ]]; then
+            modrinth_download_mod "$best_slug" && { FUZZY_RESOLVED_AS="$best_slug"; return 0; }
+        else
+            curseforge_download_mod "$best_slug" && { FUZZY_RESOLVED_AS="$best_slug"; return 0; }
+        fi
+    fi
+
     return 1
 }
 
@@ -4037,6 +4199,137 @@ cmd_aliases() {
 }
 
 # ============================================================================
+# RESOLVE COMMAND — aggressively re-attempt all unresolved mods
+# ============================================================================
+
+cmd_resolve() {
+    local mode="${1:-auto}"   # auto | interactive | <specific-slug>
+
+    if [[ ! -f "$UNRESOLVED_FILE" ]]; then
+        log OK "No unresolved mods — nothing to resolve"
+        return 0
+    fi
+
+    # Load unresolved slugs
+    local -a slugs=()
+    while IFS= read -r line; do
+        [[ "$line" =~ ^#|^$ ]] && continue
+        local s="${line%%[[:space:]]*}"
+        [[ -n "$s" ]] && slugs+=("$s")
+    done < "$UNRESOLVED_FILE"
+
+    if [[ ${#slugs[@]} -eq 0 ]]; then
+        log OK "unresolved.txt is empty — nothing to resolve"
+        return 0
+    fi
+
+    # Specific slug mode
+    if [[ "$mode" != "auto" && "$mode" != "interactive" && "$mode" != "-i" ]]; then
+        local target="$mode"
+        local found=false
+        for s in "${slugs[@]}"; do
+            [[ "$s" == "$target" ]] && { found=true; break; }
+        done
+        if ! $found; then
+            log FAIL "'${target}' not in unresolved.txt"
+            return 1
+        fi
+        slugs=("$target")
+        mode="interactive"  # single-slug always interactive
+    fi
+
+    [[ "$mode" == "-i" ]] && mode="interactive"
+    local interactive="false"
+    [[ "$mode" == "interactive" ]] && interactive="true"
+
+    echo ""
+    echo -e "${CYAN}${BOLD}══ Resolve Unresolved Mods ══${NC}"
+    echo -e "${DIM}Strategy: exact slug → slug variations → fuzzy search → ${interactive} mode${NC}"
+    echo -e "${DIM}Processing ${#slugs[@]} unresolved mod(s)...${NC}"
+    echo ""
+
+    local resolved=0 failed=0 skipped=0
+    local -a resolved_list=() still_unresolved=()
+
+    for slug in "${slugs[@]}"; do
+        echo -e "  ${BOLD}→ ${slug}${NC}"
+
+        # Skip if somehow already installed
+        if is_installed "$slug"; then
+            log SKIP "${slug} — already installed"
+            resolved_list+=("$slug")
+            ((resolved++))
+            continue
+        fi
+
+        # Round 1: Try exact slug via direct download (quick re-check)
+        if modrinth_download_mod "$slug" 2>/dev/null; then
+            log OK "${slug} — found on Modrinth (exact)"
+            resolved_list+=("$slug")
+            ((resolved++))
+            continue
+        fi
+        if [[ -n "$CURSEFORGE_API_KEY" ]] && curseforge_download_mod "$slug" 2>/dev/null; then
+            log OK "${slug} — found on CurseForge (exact)"
+            resolved_list+=("$slug")
+            ((resolved++))
+            continue
+        fi
+
+        # Round 2: Fuzzy resolution (slug variants + search)
+        if fuzzy_resolve_mod "$slug" "$interactive"; then
+            log OK "${slug} → resolved as '${FUZZY_RESOLVED_AS:-${slug}}'"
+            resolved_list+=("$slug")
+            ((resolved++))
+            continue
+        fi
+
+        # Still unresolved
+        echo -e "    ${RED}✗${NC} Could not resolve ${slug}"
+        still_unresolved+=("$slug")
+        ((failed++))
+    done
+
+    # ── Update files ─────────────────────────────────────────────────
+    # Remove resolved mods from unresolved.txt
+    for slug in "${resolved_list[@]}"; do
+        sed -i "/^${slug}[[:space:]#]/d; /^${slug}$/d" "$UNRESOLVED_FILE" 2>/dev/null || true
+
+        # Add to mods.txt if not already there
+        if [[ -f "$MODS_FILE" ]] && ! grep -qE "^(mr:|cf:|url:|local:)?${slug}(\s|$)" "$MODS_FILE" 2>/dev/null; then
+            echo "$slug" >> "$MODS_FILE"
+        fi
+    done
+
+    # Refresh packwiz index if we resolved anything
+    if [[ $resolved -gt 0 ]]; then
+        (cd "$PACK_DIR" && $PACKWIZ_BIN refresh 2>>"$RUN_LOG" || true)
+    fi
+
+    # ── Summary ──────────────────────────────────────────────────────
+    echo ""
+    echo -e "${CYAN}${BOLD}── Resolve Summary ──${NC}"
+    echo -e "  ${GREEN}✓ Resolved:${NC}   ${resolved}"
+    echo -e "  ${RED}✗ Still unresolved:${NC} ${failed}"
+
+    if [[ ${#still_unresolved[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "  ${DIM}Still unresolved:${NC}"
+        for s in "${still_unresolved[@]}"; do
+            echo -e "    ${RED}•${NC} ${s}"
+        done
+        echo ""
+        echo -e "  ${DIM}Tips:${NC}"
+        echo -e "    ${DIM}• Run ${CYAN}pm resolve -i${NC} ${DIM}for interactive mode (pick from search results)${NC}"
+        echo -e "    ${DIM}• Run ${CYAN}pm search <name>${NC} ${DIM}to find alternative slugs manually${NC}"
+        echo -e "    ${DIM}• Add ${CYAN}url:https://...${NC} ${DIM}binding in mods.txt for direct-download mods${NC}"
+        echo -e "    ${DIM}• Drop JARs in staging/ and run ${CYAN}pm stage${NC}${NC}"
+    fi
+
+    return 0
+}
+
+# ============================================================================
 # UNRESOLVED COMMAND
 # ============================================================================
 
@@ -5007,6 +5300,9 @@ cmd_help() {
     diff                           Side-by-side modlist vs packwiz state
     doctor                         All checks + verify + refresh
     netcheck                       Test pack serving: local → LAN → public
+    resolve                        Re-attempt all unresolved mods (auto mode)
+    resolve -i                     Re-attempt interactively (pick from search)
+    resolve <slug>                 Re-attempt a single unresolved mod
     aliases list                   Show all tracked mod aliases
     aliases remove <slug>          Remove alias (option to uninstall mod)
     aliases clear                  Clear all alias tracking
@@ -5136,6 +5432,7 @@ main() {
         verify|vf)         cmd_verify ;;
         diff|df)           cmd_diff ;;
         netcheck|net|nc)   cmd_netcheck ;;
+        resolve|res)       cmd_resolve "$@" ;;
         aliases|al)        cmd_aliases "$@" ;;
         unresolved|ur)     cmd_unresolved "$@" ;;
 
