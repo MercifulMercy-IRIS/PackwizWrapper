@@ -24,6 +24,7 @@
 #   pm verify                  Full audit: mods.txt vs installed .pw.toml
 #   pm diff                    Side-by-side modlist vs packwiz diff
 #   pm doctor                  All checks + verify in one pass
+#   pm netcheck                Network diagnosis: can clients reach pack.toml?
 #   pm aliases                 Manage mod aliases (list/remove/clear)
 #
 # SERVER MANAGEMENT (Docker Compose + itzg/minecraft-server):
@@ -2872,6 +2873,302 @@ cmd_verify() {
     verify_all_mods
 }
 
+# ============================================================================
+# NETCHECK — network self-diagnosis for pack serving
+# ============================================================================
+# Tests the full chain: local files → Caddy container → LAN → public internet
+# Tells you exactly where things break if clients can't reach pack.toml.
+
+cmd_netcheck() {
+    header "Network Diagnostics"
+
+    command -v curl &>/dev/null || { log FAIL "curl is required for network checks"; return 1; }
+
+    local issues=0
+    local parent; parent=$(dirname "$PACK_DIR")
+
+    # ── Step 1: Gather targets ──
+    local targets; targets=$(target_list 2>/dev/null)
+    if [[ -z "$targets" ]]; then
+        log WARN "No targets registered — checking global config only"
+        targets="__global__"
+    fi
+
+    while IFS= read -r target_name; do
+        local label="$target_name"
+        [[ "$target_name" == "__global__" ]] && label="(global)"
+
+        separator
+        echo -e "  ${BOLD}Target: ${CYAN}${label}${NC}"
+        echo ""
+
+        # ── Step 2: Check local cdn/ files exist ──
+        local cdn_dir="${parent}/cdn"
+        [[ "$target_name" != "__global__" ]] && cdn_dir="${parent}/cdn/${target_name}"
+
+        if [[ -f "${cdn_dir}/pack.toml" ]]; then
+            log OK "cdn/pack.toml exists locally"
+        else
+            log FAIL "cdn/pack.toml NOT FOUND at ${cdn_dir}/"
+            echo -e "    ${DIM}Run: pm deploy cdn --target ${target_name}${NC}"
+            (( issues++ ))
+            continue
+        fi
+
+        local toml_count=0
+        [[ -d "${cdn_dir}/mods" ]] && toml_count=$(find "${cdn_dir}/mods" -name "*.pw.toml" 2>/dev/null | wc -l)
+        local jar_count=0
+        [[ -d "${cdn_dir}/jars" ]] && jar_count=$(find "${cdn_dir}/jars" -name "*.jar" 2>/dev/null | wc -l)
+        echo -e "    ${DIM}mods/*.pw.toml: ${toml_count}  |  jars/*.jar: ${jar_count}${NC}"
+
+        # ── Step 3: Resolve URLs ──
+        local cdn_domain; cdn_domain=$(resolve_cdn_domain "$([[ "$target_name" != "__global__" ]] && echo "$target_name")" 2>/dev/null)
+        local cdn_base; cdn_base=$(resolve_cdn_base_url "$([[ "$target_name" != "__global__" ]] && echo "$target_name")" 2>/dev/null)
+        local pack_url="${cdn_base}/pack.toml"
+        local index_url="${cdn_base}/index.toml"
+
+        echo -e "    CDN domain:  ${CYAN}${cdn_domain}${NC}"
+        echo -e "    pack.toml:   ${CYAN}${pack_url}${NC}"
+        echo ""
+
+        # ── Step 4: Check Docker/Caddy is running ──
+        if command -v docker &>/dev/null; then
+            local caddy_running=false
+            if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "caddy\|packserver"; then
+                log OK "Caddy container is running"
+                caddy_running=true
+            else
+                log FAIL "Caddy container not found/not running"
+                echo -e "    ${DIM}Run: pm deploy create --target ${target_name}${NC}"
+                echo -e "    ${DIM}Then: pm start ${target_name}${NC}"
+                (( issues++ ))
+            fi
+        else
+            log WARN "Docker not available — skipping container check"
+        fi
+
+        # ── Step 5: Localhost/internal check ──
+        echo ""
+        echo -e "  ${BOLD}Internal (localhost):${NC}"
+
+        # Determine internal URL (always http, ports 8080 or 80)
+        local internal_port="8080"
+        [[ -n "$CDN_DOMAIN" ]] && internal_port="80"
+
+        local internal_base="http://localhost:${internal_port}"
+        [[ "$target_name" != "__global__" ]] && internal_base="${internal_base}/${target_name}"
+
+        local internal_pack="${internal_base}/pack.toml"
+        local internal_health="${internal_base%/*}/health"
+        [[ "$target_name" == "__global__" ]] && internal_health="http://localhost:${internal_port}/health"
+
+        # Health endpoint
+        local http_code
+        http_code=$(curl -so /dev/null -w '%{http_code}' --max-time 5 "$internal_health" 2>/dev/null || echo "000")
+        if [[ "$http_code" == "200" ]]; then
+            log OK "Caddy health → ${internal_health} (HTTP ${http_code})"
+        else
+            log FAIL "Caddy health → ${internal_health} (HTTP ${http_code})"
+            echo -e "    ${DIM}Caddy may not be running or port ${internal_port} is not bound${NC}"
+            (( issues++ ))
+        fi
+
+        # pack.toml from localhost
+        http_code=$(curl -so /dev/null -w '%{http_code}' --max-time 5 "$internal_pack" 2>/dev/null || echo "000")
+        if [[ "$http_code" == "200" ]]; then
+            log OK "pack.toml → ${internal_pack} (HTTP ${http_code})"
+        else
+            log FAIL "pack.toml → ${internal_pack} (HTTP ${http_code})"
+            echo -e "    ${DIM}File may not be published or Caddy file root is misconfigured${NC}"
+            (( issues++ ))
+        fi
+
+        # index.toml
+        local internal_index="${internal_base}/index.toml"
+        http_code=$(curl -so /dev/null -w '%{http_code}' --max-time 5 "$internal_index" 2>/dev/null || echo "000")
+        if [[ "$http_code" == "200" ]]; then
+            log OK "index.toml reachable"
+        else
+            log WARN "index.toml → HTTP ${http_code} (may not be published yet)"
+        fi
+
+        # Spot-check a random .pw.toml
+        if (( toml_count > 0 )); then
+            local sample_toml; sample_toml=$(find "${cdn_dir}/mods" -name "*.pw.toml" 2>/dev/null | head -1)
+            if [[ -n "$sample_toml" ]]; then
+                local sample_slug; sample_slug=$(basename "$sample_toml")
+                local sample_url="${internal_base}/mods/${sample_slug}"
+                http_code=$(curl -so /dev/null -w '%{http_code}' --max-time 5 "$sample_url" 2>/dev/null || echo "000")
+                if [[ "$http_code" == "200" ]]; then
+                    log OK "Sample mod → mods/${sample_slug} (HTTP ${http_code})"
+                else
+                    log WARN "Sample mod → mods/${sample_slug} (HTTP ${http_code})"
+                fi
+            fi
+        fi
+
+        # Spot-check a self-hosted JAR
+        if (( jar_count > 0 )); then
+            local sample_jar; sample_jar=$(find "${cdn_dir}/jars" -name "*.jar" 2>/dev/null | head -1)
+            if [[ -n "$sample_jar" ]]; then
+                local jar_name; jar_name=$(basename "$sample_jar")
+                local jar_url="${internal_base}/jars/${jar_name}"
+                http_code=$(curl -so /dev/null -w '%{http_code}' --max-time 5 "$jar_url" 2>/dev/null || echo "000")
+                if [[ "$http_code" == "200" ]]; then
+                    log OK "Sample JAR → jars/${jar_name} (HTTP ${http_code})"
+                else
+                    log WARN "Sample JAR → jars/${jar_name} (HTTP ${http_code})"
+                fi
+            fi
+        fi
+
+        # ── Step 6: LAN / VM IP check ──
+        if [[ -n "$SERVER_VM_IP" && "$SERVER_VM_IP" != "localhost" ]]; then
+            echo ""
+            echo -e "  ${BOLD}LAN (${SERVER_VM_IP}):${NC}"
+
+            local lan_base="http://${SERVER_VM_IP}:${internal_port}"
+            [[ "$target_name" != "__global__" ]] && lan_base="${lan_base}/${target_name}"
+
+            local lan_pack="${lan_base}/pack.toml"
+            http_code=$(curl -so /dev/null -w '%{http_code}' --max-time 5 "$lan_pack" 2>/dev/null || echo "000")
+            if [[ "$http_code" == "200" ]]; then
+                log OK "pack.toml via LAN (HTTP ${http_code})"
+            else
+                log FAIL "pack.toml via LAN → HTTP ${http_code}"
+                echo -e "    ${DIM}Firewall may be blocking port ${internal_port}${NC}"
+                echo -e "    ${DIM}Check: sudo firewall-cmd --list-ports  or  sudo ufw status${NC}"
+                (( issues++ ))
+            fi
+        fi
+
+        # ── Step 7: Public / CDN domain check ──
+        if [[ "$cdn_domain" != *":"* && "$cdn_domain" != "localhost"* ]]; then
+            echo ""
+            echo -e "  ${BOLD}Public (${cdn_domain}):${NC}"
+
+            # DNS resolution
+            if command -v dig &>/dev/null; then
+                local dns_result; dns_result=$(dig +short "$cdn_domain" 2>/dev/null | head -1)
+                if [[ -n "$dns_result" ]]; then
+                    log OK "DNS resolves → ${dns_result}"
+                else
+                    log FAIL "DNS lookup failed for ${cdn_domain}"
+                    echo -e "    ${DIM}Add an A record: ${cdn_domain} → ${SERVER_VM_IP:-your-server-ip}${NC}"
+                    (( issues++ ))
+                fi
+            elif command -v nslookup &>/dev/null; then
+                local dns_result; dns_result=$(nslookup "$cdn_domain" 2>/dev/null | grep -A1 "Name:" | tail -1 | awk '{print $2}')
+                if [[ -n "$dns_result" ]]; then
+                    log OK "DNS resolves → ${dns_result}"
+                else
+                    log FAIL "DNS lookup failed for ${cdn_domain}"
+                    (( issues++ ))
+                fi
+            else
+                log WARN "No dig/nslookup — skipping DNS check"
+            fi
+
+            # HTTPS connectivity
+            http_code=$(curl -so /dev/null -w '%{http_code}' --max-time 10 "${pack_url}" 2>/dev/null || echo "000")
+            if [[ "$http_code" == "200" ]]; then
+                log OK "pack.toml via HTTPS (HTTP ${http_code})"
+            elif [[ "$http_code" == "000" ]]; then
+                log FAIL "Connection failed — cannot reach ${cdn_domain}"
+                echo -e "    ${DIM}Possible causes:${NC}"
+                echo -e "    ${DIM}  • DNS not pointing to this server${NC}"
+                echo -e "    ${DIM}  • Ports 80/443 not open (firewall or cloud provider)${NC}"
+                echo -e "    ${DIM}  • Caddy hasn't provisioned TLS yet (check: docker logs caddy)${NC}"
+                (( issues++ ))
+            else
+                log FAIL "pack.toml via HTTPS → HTTP ${http_code}"
+                echo -e "    ${DIM}Server responded but returned an error${NC}"
+                (( issues++ ))
+            fi
+
+            # TLS certificate check
+            if [[ "$http_code" != "000" ]]; then
+                local tls_info; tls_info=$(curl -svI --max-time 5 "https://${cdn_domain}/" 2>&1 | grep -i "SSL certificate\|issuer\|expire" | head -3)
+                if [[ -n "$tls_info" ]]; then
+                    echo -e "    ${DIM}TLS: $(echo "$tls_info" | head -1 | sed 's/^[* ]*//')${NC}"
+                fi
+            fi
+        else
+            echo ""
+            echo -e "  ${DIM}No public domain configured — skipping external check${NC}"
+            echo -e "  ${DIM}Set CDN_DOMAIN in config for auto-HTTPS via Caddy${NC}"
+        fi
+
+        # ── Step 8: Client simulation ──
+        echo ""
+        echo -e "  ${BOLD}Client Simulation:${NC}"
+        echo -e "  ${DIM}(What a Minecraft client would do on connect)${NC}"
+
+        # Try to fetch pack.toml and check it's valid TOML
+        local pack_content
+        pack_content=$(curl -sL --max-time 10 "$internal_pack" 2>/dev/null || echo "")
+        if [[ -n "$pack_content" ]]; then
+            if echo "$pack_content" | grep -q "^\[pack\]" 2>/dev/null; then
+                log OK "pack.toml is valid (contains [pack] section)"
+                # Extract pack-format and index info
+                local pf; pf=$(echo "$pack_content" | grep -oP 'pack-format\s*=\s*"\K[^"]+' 2>/dev/null || echo "?")
+                echo -e "    ${DIM}pack-format: ${pf}${NC}"
+            else
+                log WARN "pack.toml fetched but may be malformed (no [pack] section)"
+                (( issues++ ))
+            fi
+
+            # Try fetching index.toml
+            local idx_content
+            idx_content=$(curl -sL --max-time 10 "$internal_index" 2>/dev/null || echo "")
+            if echo "$idx_content" | grep -q "\[\[files\]\]" 2>/dev/null; then
+                local file_count; file_count=$(echo "$idx_content" | grep -c "\[\[files\]\]" 2>/dev/null || echo 0)
+                log OK "index.toml lists ${file_count} file(s)"
+            elif [[ -n "$idx_content" ]]; then
+                log WARN "index.toml fetched but may be incomplete"
+            fi
+        else
+            log FAIL "Could not fetch pack.toml — client would fail to connect"
+            (( issues++ ))
+        fi
+
+    done <<< "$targets"
+
+    # ── Summary ──
+    separator
+    echo ""
+    if (( issues == 0 )); then
+        echo -e "  ${GREEN}${BOLD}All checks passed!${NC} Clients should be able to connect."
+    else
+        echo -e "  ${RED}${BOLD}${issues} issue(s) found.${NC} Fix the above and re-run ${CYAN}pm netcheck${NC}."
+    fi
+    echo ""
+
+    # ── Quick Reference ──
+    echo -e "  ${BOLD}Manual curl commands to test from another machine:${NC}"
+    echo ""
+    local first_target; first_target=$(echo "$targets" | head -1)
+    local sample_base; sample_base=$(resolve_cdn_base_url "$([[ "$first_target" != "__global__" ]] && echo "$first_target")" 2>/dev/null)
+    echo -e "    ${DIM}# Health check${NC}"
+    echo -e "    curl -I ${sample_base%/*}/health"
+    echo ""
+    echo -e "    ${DIM}# Fetch pack descriptor${NC}"
+    echo -e "    curl -sL ${sample_base}/pack.toml"
+    echo ""
+    echo -e "    ${DIM}# Fetch mod index${NC}"
+    echo -e "    curl -sL ${sample_base}/index.toml"
+    echo ""
+    echo -e "    ${DIM}# Fetch a specific .pw.toml${NC}"
+    echo -e "    curl -sL ${sample_base}/mods/<slug>.pw.toml"
+    echo ""
+    echo -e "    ${DIM}# Check DNS resolution${NC}"
+    echo -e "    dig ${cdn_domain:-your-domain}"
+    echo ""
+    echo -e "    ${DIM}# Check TLS certificate${NC}"
+    echo -e "    curl -vI https://${cdn_domain:-your-domain}/ 2>&1 | grep -i 'ssl\\|issuer\\|expire'"
+    echo ""
+}
+
 cmd_diff() {
     # Show a side-by-side: what mods.txt says vs what .pw.toml files contain
     check_pack_init
@@ -4580,6 +4877,7 @@ cmd_help() {
     verify                         Full audit: mods.txt ↔ installed .pw.toml
     diff                           Side-by-side modlist vs packwiz state
     doctor                         All checks + verify + refresh
+    netcheck                       Test pack serving: local → LAN → public
     aliases list                   Show all tracked mod aliases
     aliases remove <slug>          Remove alias (option to uninstall mod)
     aliases clear                  Clear all alias tracking
@@ -4708,6 +5006,7 @@ main() {
         doctor|doc)        cmd_doctor ;;
         verify|vf)         cmd_verify ;;
         diff|df)           cmd_diff ;;
+        netcheck|net|nc)   cmd_netcheck ;;
         aliases|al)        cmd_aliases "$@" ;;
         unresolved|ur)     cmd_unresolved "$@" ;;
 
