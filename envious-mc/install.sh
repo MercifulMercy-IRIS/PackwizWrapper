@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ============================================================================
-# EnviousLabs MC Pack Manager — Installer
+# ELM (EnviousLabs Minecraft) — Installer
 # ============================================================================
 # Installs:
 #   1. PackWiz (Go binary) if not present
-#   2. PackManager as 'pm' command on PATH
-#   3. Bash completion for pm
-#   4. Default config at ~/.config/packmanager/packmanager.conf
+#   2. ELM as 'elm' command on PATH
+#   3. Bash completion for elm
+#   4. Default config at ~/.config/elm/elm.conf
 #
 # Usage:
 #   curl -sSL <your-host>/install.sh | bash
@@ -14,11 +14,10 @@
 #   ./install.sh
 #
 # After install, use from anywhere:
-#   pm init
-#   pm sync
-#   pm organize
-#   pm deploy
-#   pm add tinkers-construct mekanism
+#   elm init
+#   elm sync
+#   elm add tinkers-construct mekanism
+#   elm deploy create
 # ============================================================================
 
 set -euo pipefail
@@ -32,7 +31,7 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 INSTALL_DIR="${HOME}/.local/bin"
-CONFIG_DIR="${HOME}/.config/packmanager"
+CONFIG_DIR="${HOME}/.config/elm"
 COMPLETION_DIR="${HOME}/.local/share/bash-completion/completions"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -44,7 +43,7 @@ fail() { echo -e "  ${RED}✗${NC} $*"; exit 1; }
 header() {
     echo ""
     echo -e "${BOLD}═══════════════════════════════════════════${NC}"
-    echo -e "${BOLD}  EnviousLabs MC Pack Manager — Installer${NC}"
+    echo -e "${BOLD}  ELM — EnviousLabs Minecraft — Installer${NC}"
     echo -e "${BOLD}═══════════════════════════════════════════${NC}"
     echo ""
 }
@@ -133,7 +132,7 @@ install_go() {
             if ! grep -q '/usr/local/go/bin' "$profile" 2>/dev/null; then
                 {
                     echo ""
-                    echo "# Go (added by PackManager installer)"
+                    echo "# Go (added by ELM installer)"
                     echo "$go_path_line"
                     echo "$go_export_line"
                 } >> "$profile"
@@ -192,20 +191,37 @@ install_packwiz() {
 }
 
 # ============================================================================
-# INSTALL PACKMANAGER
+# INSTALL ELM
 # ============================================================================
 
-install_packmanager() {
-    info "Installing PackManager as 'pm'..."
+migrate_from_packmanager() {
+    local old_config="${HOME}/.config/packmanager"
+    local old_bin="${INSTALL_DIR}/pm"
+    local old_completion="${COMPLETION_DIR}/pm"
+
+    if [[ -d "$old_config" && ! -d "$CONFIG_DIR" ]]; then
+        info "Migrating config from packmanager → elm..."
+        mv "$old_config" "$CONFIG_DIR"
+        [[ -f "${CONFIG_DIR}/packmanager.conf" ]] && mv "${CONFIG_DIR}/packmanager.conf" "${CONFIG_DIR}/elm.conf"
+        log "Config migrated to ${CONFIG_DIR}"
+    fi
+
+    # Remove old pm binary/symlink
+    [[ -f "$old_bin" || -L "$old_bin" ]] && rm -f "$old_bin" && log "Removed old 'pm' command"
+    [[ -f "$old_completion" ]] && rm -f "$old_completion" && log "Removed old pm completion"
+}
+
+install_elm() {
+    info "Installing ELM as 'elm'..."
 
     mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
 
-    # Symlink the main script (so edits to packmanager.sh take effect immediately)
-    local src="${SCRIPT_DIR}/packmanager.sh"
-    local dest="${INSTALL_DIR}/pm"
+    # Symlink the main script
+    local src="${SCRIPT_DIR}/elm.sh"
+    local dest="${INSTALL_DIR}/elm"
 
     if [[ ! -f "$src" ]]; then
-        fail "packmanager.sh not found in ${SCRIPT_DIR}"
+        fail "elm.sh not found in ${SCRIPT_DIR}"
     fi
 
     chmod +x "$src"
@@ -220,15 +236,15 @@ install_packmanager() {
     fi
 
     # Copy default config if none exists
-    if [[ ! -f "${CONFIG_DIR}/packmanager.conf" ]]; then
-        if [[ -f "${SCRIPT_DIR}/packmanager.conf" ]]; then
-            cp "${SCRIPT_DIR}/packmanager.conf" "${CONFIG_DIR}/packmanager.conf"
-            log "Config → ${CONFIG_DIR}/packmanager.conf"
+    if [[ ! -f "${CONFIG_DIR}/elm.conf" ]]; then
+        if [[ -f "${SCRIPT_DIR}/elm.conf" ]]; then
+            cp "${SCRIPT_DIR}/elm.conf" "${CONFIG_DIR}/elm.conf"
+            log "Config → ${CONFIG_DIR}/elm.conf"
         else
             create_default_config
         fi
     else
-        warn "Config already exists at ${CONFIG_DIR}/packmanager.conf — not overwriting"
+        warn "Config already exists at ${CONFIG_DIR}/elm.conf — not overwriting"
     fi
 
     # Ensure INSTALL_DIR is in PATH
@@ -246,13 +262,12 @@ install_packmanager() {
 }
 
 create_default_config() {
-    cat > "${CONFIG_DIR}/packmanager.conf" << 'CONF'
+    cat > "${CONFIG_DIR}/elm.conf" << 'CONF'
 # ============================================================================
-# PackManager Configuration
+# ELM Configuration (EnviousLabs Minecraft)
 # ============================================================================
-# This file is loaded by pm from ~/.config/packmanager/packmanager.conf
-# It can also be overridden per-project by placing packmanager.conf in the
-# pack directory (alongside pack.toml and mods.txt).
+# Loaded from ~/.config/elm/elm.conf
+# Per-project override: place elm.conf alongside pack.toml and mods.txt.
 # ============================================================================
 
 # --- Minecraft & Loader -----------------------------------------------------
@@ -268,7 +283,7 @@ PREFER_SOURCE="mr"              # "mr" (Modrinth first) or "cf" (CurseForge firs
 
 # --- Sync Behavior -----------------------------------------------------------
 # Mods not found during sync are auto-saved to unresolved.txt.
-# Use 'pm unresolved search' to find alternatives via API.
+# Use 'elm resolve search' to find alternatives via API.
 AUTO_PUBLISH=""                 # "" = off, "__auto__" = sibling cdn/ dir, "<target>" = named target
 
 # --- Docker Server -----------------------------------------------------------
@@ -295,14 +310,12 @@ PACK_HOST_DIR=""                # Local dir served by Cloudflare tunnel
 CDN_DOMAIN=""                   # Set for automatic HTTPS; leave empty for http://server-ip:8080
 
 # --- Self-Update (GitHub) --------------------------------------------------
-PM_GITHUB_REPO=""               # e.g. "yourusername/PackwizWrapper" (owner/repo)
-PM_GITHUB_BRANCH="main"         # Branch to pull updates from
-PM_GITHUB_PATH=""               # Subdirectory in repo (e.g. "envious-mc")
-PM_UPDATE_FILES="packmanager.sh install.sh packmanager.conf mods.txt"
+ELM_GITHUB_REPO=""              # e.g. "yourusername/PackwizWrapper" (owner/repo)
+ELM_GITHUB_BRANCH="main"        # Branch to pull updates from
+ELM_GITHUB_PATH=""              # Subdirectory in repo (e.g. "envious-mc")
+ELM_UPDATE_FILES="elm.sh install.sh elm.conf mods.txt"
 
 # --- Local/Self-Hosted Mods ------------------------------------------------
-# For mods not on Modrinth or CurseForge (custom builds, forks, etc.)
-# Place JARs in LOCAL_MODS_DIR and reference them as local:slug in mods.txt
 LOCAL_MODS_DIR=""               # e.g. /var/www/mods — directory with JAR files
 LOCAL_MODS_URL=""               # e.g. https://mods.enviouslabs.com — public URL
 
@@ -310,7 +323,7 @@ LOCAL_MODS_URL=""               # e.g. https://mods.enviouslabs.com — public U
 JVM_FLAGS="-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCLiveThresholdPercent=90 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1 -Dusing.aikars.flags=https://mcflags.emc.gs -Daikars.new.flags=true"
 CONF
 
-    log "Created default config → ${CONFIG_DIR}/packmanager.conf"
+    log "Created default config → ${CONFIG_DIR}/elm.conf"
 }
 
 # ============================================================================
@@ -322,79 +335,71 @@ install_completion() {
 
     mkdir -p "$COMPLETION_DIR"
 
-    cat > "${COMPLETION_DIR}/pm" << 'COMP'
-# Bash completion for pm (PackManager)
-_pm_completions() {
+    cat > "${COMPLETION_DIR}/elm" << 'COMP'
+# Bash completion for elm (EnviousLabs Minecraft CLI)
+_elm_completions() {
     local cur prev commands
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    commands="init organize sync update add remove list status deps search stage refresh export serve pin unpin migrate settings import detect open markdown targets deploy doctor verify diff netcheck resolve aliases unresolved config publish self-update update-status start stop restart kill logs console backup destroy nuke help"
+    commands="init add rm ls sync up search pin unpin export deploy target check net config key dns update resolve organize migrate nuke help"
 
     case "$prev" in
-        pm)
+        elm)
             COMPREPLY=($(compgen -W "$commands" -- "$cur"))
             return 0
             ;;
         export|ex)
-            COMPREPLY=($(compgen -W "modrinth curseforge mr cf" -- "$cur"))
+            COMPREPLY=($(compgen -W "modrinth curseforge mr cf md" -- "$cur"))
             return 0
             ;;
-        modrinth|curseforge|mr|cf)
-            # After export format, offer side filter
-            if [[ "${COMP_WORDS[1]}" == "export" || "${COMP_WORDS[1]}" == "ex" ]]; then
-                COMPREPLY=($(compgen -W "client server" -- "$cur"))
-            fi
+        deploy)
+            COMPREPLY=($(compgen -W "create push start stop restart status console logs backup mods regen cdn full serve remove --target" -- "$cur"))
             return 0
             ;;
-        deploy|d)
-            COMPREPLY=($(compgen -W "create push publish start stop restart kill remove destroy status console backup regenerate mods download full help --target" -- "$cur"))
-            return 0
-            ;;
-        targets|t)
-            COMPREPLY=($(compgen -W "list add set show remove help" -- "$cur"))
+        target|t)
+            COMPREPLY=($(compgen -W "list add set show rm dns" -- "$cur"))
             return 0
             ;;
         resolve|res)
-            COMPREPLY=($(compgen -W "auto -i" -- "$cur"))
-            return 0
-            ;;
-        unresolved|ur)
-            COMPREPLY=($(compgen -W "list search edit resolve remove clear help" -- "$cur"))
-            return 0
-            ;;
-        aliases|al)
-            COMPREPLY=($(compgen -W "list remove clear help" -- "$cur"))
+            COMPREPLY=($(compgen -W "auto -i list search edit remove" -- "$cur"))
             return 0
             ;;
         config|cfg)
-            COMPREPLY=($(compgen -W "show edit path" -- "$cur"))
+            COMPREPLY=($(compgen -W "show edit path alias" -- "$cur"))
+            return 0
+            ;;
+        key)
+            COMPREPLY=($(compgen -W "curseforge noip duckdns dynu cloudflare list rm" -- "$cur"))
+            return 0
+            ;;
+        dns)
+            COMPREPLY=($(compgen -W "set update status auto" -- "$cur"))
+            return 0
+            ;;
+        update)
+            COMPREPLY=($(compgen -W "--check" -- "$cur"))
+            return 0
+            ;;
+        check)
+            COMPREPLY=($(compgen -W "--diff --refresh" -- "$cur"))
             return 0
             ;;
         migrate|mig)
             COMPREPLY=($(compgen -W "minecraft loader mc" -- "$cur"))
             return 0
             ;;
-        settings|set)
-            COMPREPLY=($(compgen -W "versions show" -- "$cur"))
-            return 0
-            ;;
-        list|ls)
-            COMPREPLY=($(compgen -W "--side --version --native" -- "$cur"))
+        ls)
+            COMPREPLY=($(compgen -W "--side --version --native --deps" -- "$cur"))
             return 0
             ;;
         --side|-s)
             COMPREPLY=($(compgen -W "client server both" -- "$cur"))
             return 0
             ;;
-        refresh)
-            COMPREPLY=($(compgen -W "--build" -- "$cur"))
-            return 0
-            ;;
         --target|-t)
-            # Complete with target names from registry
-            local targets_file="${HOME}/.config/packmanager/targets.json"
+            local targets_file="${HOME}/.config/elm/targets.json"
             if [[ -f "$targets_file" ]] && command -v jq &>/dev/null; then
                 local target_names
                 target_names=$(jq -r 'keys[]' "$targets_file" 2>/dev/null)
@@ -402,18 +407,7 @@ _pm_completions() {
             fi
             return 0
             ;;
-        start|stop|restart|kill|logs|console|backup|destroy)
-            # Complete with target names for server shortcuts
-            local targets_file="${HOME}/.config/packmanager/targets.json"
-            if [[ -f "$targets_file" ]] && command -v jq &>/dev/null; then
-                local target_names
-                target_names=$(jq -r 'keys[]' "$targets_file" 2>/dev/null)
-                COMPREPLY=($(compgen -W "$target_names" -- "$cur"))
-            fi
-            return 0
-            ;;
-        remove|rm|pin|unpin|open)
-            # Complete with installed mod slugs
+        rm|pin|unpin)
             if [[ -d "mods" ]]; then
                 local mods
                 mods=$(find mods -name "*.pw.toml" -exec basename {} .pw.toml \; 2>/dev/null)
@@ -422,9 +416,7 @@ _pm_completions() {
             return 0
             ;;
         add|a)
-            # Complete with mods.txt entries, or file: prefix for JAR import
             if [[ "$cur" == file:* ]]; then
-                # Complete file paths after file: prefix
                 local path_part="${cur#file:}"
                 local completions
                 completions=$(compgen -f -- "$path_part" 2>/dev/null)
@@ -432,15 +424,14 @@ _pm_completions() {
             elif [[ -f "mods.txt" ]]; then
                 local slugs
                 slugs=$(grep -vE '^\s*#|^\s*$' mods.txt | sed 's/\s*#.*$//;s/^!//;s/^mr://;s/^cf://;s/^url://;s/^local://' | xargs)
-                COMPREPLY=($(compgen -W "$slugs file:" -- "$cur"))
+                COMPREPLY=($(compgen -W "$slugs file: --stage --import" -- "$cur"))
             else
-                COMPREPLY=($(compgen -W "file:" -- "$cur"))
+                COMPREPLY=($(compgen -W "file: --stage --import" -- "$cur"))
             fi
             return 0
             ;;
-        import)
-            # Complete with .zip files
-            COMPREPLY=($(compgen -f -X '!*.zip' -- "$cur"))
+        search|s)
+            COMPREPLY=($(compgen -W "--open" -- "$cur"))
             return 0
             ;;
     esac
@@ -451,12 +442,12 @@ _pm_completions() {
     fi
 }
 
-complete -F _pm_completions pm
+complete -F _elm_completions elm
 COMP
 
     # Source it in bashrc if not already
-    local source_line="[[ -f ${COMPLETION_DIR}/pm ]] && source ${COMPLETION_DIR}/pm"
-    if ! grep -qF "bash-completion/completions/pm" "${HOME}/.bashrc" 2>/dev/null; then
+    local source_line="[[ -f ${COMPLETION_DIR}/elm ]] && source ${COMPLETION_DIR}/elm"
+    if ! grep -qF "bash-completion/completions/elm" "${HOME}/.bashrc" 2>/dev/null; then
         echo "$source_line" >> "${HOME}/.bashrc"
     fi
 
@@ -474,10 +465,10 @@ verify() {
 
     local all_good=true
 
-    if command -v pm &>/dev/null; then
-        log "pm command available"
+    if command -v elm &>/dev/null; then
+        log "elm command available"
     else
-        warn "pm not found in PATH — restart your shell or run: source ~/.bashrc"
+        warn "elm not found in PATH — restart your shell or run: source ~/.bashrc"
         all_good=false
     fi
 
@@ -488,8 +479,8 @@ verify() {
         all_good=false
     fi
 
-    if [[ -f "${CONFIG_DIR}/packmanager.conf" ]]; then
-        log "Config at ${CONFIG_DIR}/packmanager.conf"
+    if [[ -f "${CONFIG_DIR}/elm.conf" ]]; then
+        log "Config at ${CONFIG_DIR}/elm.conf"
     else
         warn "No config file found"
         all_good=false
@@ -504,16 +495,16 @@ verify() {
 
     echo ""
     echo -e "  ${BOLD}Quick start:${NC}"
-    echo -e "    ${CYAN}pm init${NC}              Initialize a pack in the current directory"
-    echo -e "    ${CYAN}pm sync${NC}              Install all mods from mods.txt"
-    echo -e "    ${CYAN}pm add <slug>${NC}        Add a mod"
-    echo -e "    ${CYAN}pm organize${NC}          Sort messy dir into pack/ server/ cdn/"
-    echo -e "    ${CYAN}pm deploy create${NC}     Publish pack + generate Docker compose (auto-HTTPS)"
-    echo -e "    ${CYAN}pm deploy full${NC}       Pipeline: sync → publish → compose → start"
-    echo -e "    ${CYAN}pm config edit${NC}       Edit your config (set CDN_DOMAIN for HTTPS)"
+    echo -e "    ${CYAN}elm init${NC}              Initialize a pack in the current directory"
+    echo -e "    ${CYAN}elm sync${NC}              Install all mods from mods.txt"
+    echo -e "    ${CYAN}elm add <slug>${NC}        Add a mod"
+    echo -e "    ${CYAN}elm key cf <KEY>${NC}      Set CurseForge API key"
+    echo -e "    ${CYAN}elm deploy create${NC}     Publish pack + generate Docker compose"
+    echo -e "    ${CYAN}elm deploy full${NC}       Pipeline: sync → publish → compose → start"
+    echo -e "    ${CYAN}elm config edit${NC}       Edit your config"
     echo ""
-    echo -e "  ${BOLD}Config:${NC} ${CYAN}${CONFIG_DIR}/packmanager.conf${NC}"
-    echo -e "  ${BOLD}Docs:${NC}   ${CYAN}pm help${NC}"
+    echo -e "  ${BOLD}Config:${NC} ${CYAN}${CONFIG_DIR}/elm.conf${NC}"
+    echo -e "  ${BOLD}Docs:${NC}   ${CYAN}elm help${NC}"
     echo ""
 }
 
@@ -523,15 +514,15 @@ verify() {
 
 uninstall() {
     echo ""
-    echo -e "${YELLOW}Uninstalling PackManager...${NC}"
+    echo -e "${YELLOW}Uninstalling ELM...${NC}"
 
-    rm -f "${INSTALL_DIR}/pm"
-    rm -f "${COMPLETION_DIR}/pm"
+    rm -f "${INSTALL_DIR}/elm"
+    rm -f "${COMPLETION_DIR}/elm"
     # Don't remove config — user may want to keep it
 
-    log "Removed pm binary"
+    log "Removed elm binary"
     log "Removed bash completion"
-    warn "Config preserved at ${CONFIG_DIR}/packmanager.conf"
+    warn "Config preserved at ${CONFIG_DIR}/elm.conf"
     warn "PackWiz preserved — remove manually with: rm ${INSTALL_DIR}/packwiz"
     echo ""
 }
@@ -548,7 +539,8 @@ main() {
             header
             check_prerequisites
             install_packwiz
-            install_packmanager
+            migrate_from_packmanager
+            install_elm
             install_completion
             verify
             ;;
