@@ -480,8 +480,8 @@ verify_mod_install() {
     echo "MISMATCH REMOVED: requested='${requested_slug}' got='${resolved_slug}' (${resolved_name})" >> "$RUN_LOG"
 
     # Remove the wrong mod from the pack
-    pw remove "$resolved_slug" --yes 2>>"$RUN_LOG" || rm -f "$toml_file"
-    pw refresh 2>>"$RUN_LOG" || true
+    $PACKWIZ_BIN remove "$resolved_slug" --yes 2>>"$RUN_LOG" || rm -f "$toml_file"
+    $PACKWIZ_BIN refresh 2>>"$RUN_LOG" || true
 
     # Save to unresolved for later resolution
     add_to_unresolved "$requested_slug" "got wrong mod: ${resolved_name} (${resolved_slug})"
@@ -643,7 +643,7 @@ run_packwiz_install() {
     local cmd="$1" slug="$2"
     local output="" exit_code=0
 
-    output=$(pw "$cmd" install "$slug" --yes 2>&1) || exit_code=$?
+    output=$($PACKWIZ_BIN "$cmd" install "$slug" --yes 2>&1) || exit_code=$?
     echo "$output" >> "$RUN_LOG"
 
     # Parse dependencies from packwiz output
@@ -681,7 +681,7 @@ try_curseforge() { try_source "curseforge" "$1"; }
 try_url() {
     local url="$1" slug="$2"
     # packwiz url add <display-name> <download-url> [--force] [--meta-name <filename>]
-    pw url add "$slug" "$url" --force --yes 2>>"$RUN_LOG"
+    $PACKWIZ_BIN url add "$slug" "$url" --force --yes 2>>"$RUN_LOG"
 }
 
 # Generate .pw.toml manually for local/self-hosted mods
@@ -747,7 +747,7 @@ TOML
     fi
 
     # Refresh index to pick up the new .pw.toml
-    pw refresh 2>>"$RUN_LOG" || true
+    $PACKWIZ_BIN refresh 2>>"$RUN_LOG" || true
     return 0
 }
 
@@ -2007,7 +2007,7 @@ publish_pack() {
     mkdir -p "${publish_dir}/mods" "${publish_dir}/jars"
 
     # Build index with hashes for distribution
-    pw refresh --build 2>>"$RUN_LOG"
+    $PACKWIZ_BIN refresh --build 2>>"$RUN_LOG"
 
     log INFO "Publishing pack to ${publish_dir}..."
 
@@ -2086,7 +2086,7 @@ publish_pack() {
 
     # Refresh the published index to reflect rewritten URLs
     if command -v "$PACKWIZ_BIN" &>/dev/null; then
-        (cd "$publish_dir" && "$PACKWIZ_BIN" refresh --build 2>/dev/null || true)
+        (cd "$publish_dir" && $PACKWIZ_BIN refresh --build 2>/dev/null || true)
     fi
 
     log OK "Published: ${toml_count} mod(s), ${jar_count} self-hosted JAR(s)"
@@ -2761,7 +2761,7 @@ cmd_init() {
     [[ -n "$loader_ver" ]] && loader_arg="--${loader}-version ${loader_ver}"
 
     echo ""
-    pw init --mc-version "$mc_ver" --modloader "$loader" $loader_arg
+    $PACKWIZ_BIN init --mc-version "$mc_ver" --modloader "$loader" $loader_arg
 
     [[ -f "$MODS_FILE" ]] || {
         echo "# PackManager mods list — edit and run: pm sync" > "$MODS_FILE"
@@ -2802,7 +2802,7 @@ cmd_sync() {
 
     separator
     log INFO "Refreshing pack index..."
-    pw refresh 2>>"$RUN_LOG" && log OK "Index updated" || log WARN "Index warnings"
+    $PACKWIZ_BIN refresh 2>>"$RUN_LOG" && log OK "Index updated" || log WARN "Index warnings"
 
     # Auto-publish to CDN if configured
     auto_publish_cdn
@@ -2902,7 +2902,7 @@ cmd_add() {
         printf '    ↳ %s\n' "${DEPS_ADDED[@]}"
     fi
 
-    pw refresh 2>>"$RUN_LOG"
+    $PACKWIZ_BIN refresh 2>>"$RUN_LOG"
 }
 
 cmd_add_interactive() {
@@ -3025,7 +3025,7 @@ cmd_remove() {
             echo ""
             header "Removing: ${match_names[$pi]} (${target_slug})"
 
-            pw remove "$target_slug" --yes 2>>"$RUN_LOG" && log OK "Removed from pack" || log WARN "Remove may have failed — cleaning up manually"
+            $PACKWIZ_BIN remove "$target_slug" --yes 2>>"$RUN_LOG" && log OK "Removed from pack" || log WARN "Remove may have failed — cleaning up manually"
 
             # Remove the .pw.toml if packwiz didn't
             [[ -f "${PACK_DIR}/mods/${target_slug}.pw.toml" ]] && rm -f "${PACK_DIR}/mods/${target_slug}.pw.toml"
@@ -3047,7 +3047,7 @@ cmd_remove() {
             fi
         done
 
-        pw refresh 2>>"$RUN_LOG"
+        $PACKWIZ_BIN refresh 2>>"$RUN_LOG"
         return 0
     fi
 
@@ -3055,7 +3055,7 @@ cmd_remove() {
     local jar_filename="${match_files[0]}"
     header "Removing: ${match_names[0]} (${target_slug})"
 
-    pw remove "$target_slug" --yes 2>>"$RUN_LOG" && log OK "Removed from pack" || log WARN "Remove may have failed — cleaning up manually"
+    $PACKWIZ_BIN remove "$target_slug" --yes 2>>"$RUN_LOG" && log OK "Removed from pack" || log WARN "Remove may have failed — cleaning up manually"
 
     # Remove .pw.toml if packwiz didn't
     [[ -f "${PACK_DIR}/mods/${target_slug}.pw.toml" ]] && rm -f "${PACK_DIR}/mods/${target_slug}.pw.toml"
@@ -3076,7 +3076,7 @@ cmd_remove() {
         rm -f "${parent}/cdn/jars/${jar_filename}" 2>/dev/null || true
     fi
 
-    pw refresh 2>>"$RUN_LOG"
+    $PACKWIZ_BIN refresh 2>>"$RUN_LOG"
 }
 
 cmd_list() {
@@ -3098,7 +3098,7 @@ cmd_list() {
         local args=()
         [[ -n "$side_filter" ]] && args+=("--side" "$side_filter")
         $show_version && args+=("--version")
-        pw list "${args[@]}" 2>>"$RUN_LOG"
+        $PACKWIZ_BIN list "${args[@]}" 2>>"$RUN_LOG"
         return
     fi
 
@@ -3163,8 +3163,8 @@ cmd_update() {
     fi
 
     log INFO "Running packwiz update --all..."
-    pw update --all --yes 2>>"$RUN_LOG" && log OK "Done" || log WARN "Some updates failed"
-    pw refresh 2>>"$RUN_LOG"
+    $PACKWIZ_BIN update --all --yes 2>>"$RUN_LOG" && log OK "Done" || log WARN "Some updates failed"
+    $PACKWIZ_BIN refresh 2>>"$RUN_LOG"
 
     # Auto-publish to CDN if configured
     auto_publish_cdn
@@ -3262,7 +3262,7 @@ cmd_search() {
                 IFS='|' read -r source slug url pinned <<< "$parsed"
                 if install_mod "$source" "$slug" "$url" "$pinned"; then
                     is_in_modlist "$slug" || { append_to_modlist "$selected"; log INFO "Added to mods.txt"; }
-                    pw refresh 2>>"$RUN_LOG"
+                    $PACKWIZ_BIN refresh 2>>"$RUN_LOG"
                 else
                     log FAIL "Install failed for ${slug}"
                 fi
@@ -3296,7 +3296,7 @@ cmd_doctor() {
     done < "$MODS_FILE"
 
     echo -e "  ${BLUE}Refreshing index...${NC}"
-    pw refresh 2>>"$RUN_LOG" && log OK "Index clean" || { log WARN "Index issues"; (( issues++ )); }
+    $PACKWIZ_BIN refresh 2>>"$RUN_LOG" && log OK "Index clean" || { log WARN "Index issues"; (( issues++ )); }
 
     echo ""
     (( issues == 0 )) && echo -e "  ${GREEN}${BOLD}All good!${NC}" || echo -e "  ${YELLOW}${issues} issue(s). Run 'pm sync' to fix.${NC}"
@@ -3716,14 +3716,14 @@ cmd_export() {
 
     # Refresh with --build for distribution (generates internal hashes)
     log INFO "Refreshing index for distribution..."
-    pw refresh --build 2>>"$RUN_LOG"
+    $PACKWIZ_BIN refresh --build 2>>"$RUN_LOG"
 
     case "$fmt" in
         modrinth|mr)
-            pw modrinth export $side_flag 2>>"$RUN_LOG" && log OK "Modrinth .mrpack created" || log FAIL "Export failed"
+            $PACKWIZ_BIN modrinth export $side_flag 2>>"$RUN_LOG" && log OK "Modrinth .mrpack created" || log FAIL "Export failed"
             ;;
         curseforge|cf)
-            pw curseforge export $side_flag 2>>"$RUN_LOG" && log OK "CurseForge .zip created" || log FAIL "Export failed"
+            $PACKWIZ_BIN curseforge export $side_flag 2>>"$RUN_LOG" && log OK "CurseForge .zip created" || log FAIL "Export failed"
             ;;
         *)
             echo -e "${RED}Usage: pm export [mr|cf] [client|server]${NC}"
@@ -3739,7 +3739,7 @@ cmd_serve() {
     echo -e "  Index auto-refreshes on each request."
     echo -e "  ${DIM}Ctrl+C to stop${NC}"
     echo ""
-    pw serve
+    $PACKWIZ_BIN serve
 }
 
 # ============================================================================
@@ -3751,14 +3751,14 @@ cmd_pin() {
     local slug="${1:?Usage: pm pin <slug>}"
     header "Pinning: ${slug}"
     # Native packwiz pin — adds [pin] section to .pw.toml
-    pw pin "$slug" 2>>"$RUN_LOG" && log OK "Pinned (won't receive updates)" || log FAIL "Pin failed"
+    $PACKWIZ_BIN pin "$slug" 2>>"$RUN_LOG" && log OK "Pinned (won't receive updates)" || log FAIL "Pin failed"
 }
 
 cmd_unpin() {
     check_packwiz; check_pack_init
     local slug="${1:?Usage: pm unpin <slug>}"
     header "Unpinning: ${slug}"
-    pw unpin "$slug" 2>>"$RUN_LOG" && log OK "Unpinned (will receive updates)" || log FAIL "Unpin failed"
+    $PACKWIZ_BIN unpin "$slug" 2>>"$RUN_LOG" && log OK "Unpinned (will receive updates)" || log FAIL "Unpin failed"
 }
 
 cmd_migrate() {
@@ -3771,20 +3771,20 @@ cmd_migrate() {
             header "Migrating Minecraft Version"
             if [[ -n "$version" ]]; then
                 log INFO "Migrating to Minecraft ${version}..."
-                pw migrate minecraft "$version" --yes 2>>"$RUN_LOG" && log OK "Done" || log WARN "Some mods may not support ${version}"
+                $PACKWIZ_BIN migrate minecraft "$version" --yes 2>>"$RUN_LOG" && log OK "Done" || log WARN "Some mods may not support ${version}"
             else
                 log INFO "Interactive Minecraft migration..."
-                pw migrate minecraft 2>>"$RUN_LOG"
+                $PACKWIZ_BIN migrate minecraft 2>>"$RUN_LOG"
             fi
             ;;
         loader|forge|neoforge|fabric|quilt)
             header "Migrating Loader Version"
             if [[ -n "$version" ]]; then
                 log INFO "Migrating loader to ${version}..."
-                pw migrate loader "$version" --yes 2>>"$RUN_LOG" && log OK "Done" || log WARN "Migration had issues"
+                $PACKWIZ_BIN migrate loader "$version" --yes 2>>"$RUN_LOG" && log OK "Done" || log WARN "Migration had issues"
             else
                 log INFO "Interactive loader migration..."
-                pw migrate loader 2>>"$RUN_LOG"
+                $PACKWIZ_BIN migrate loader 2>>"$RUN_LOG"
             fi
             ;;
         *)
@@ -3808,7 +3808,7 @@ cmd_settings() {
                 local versions="$*"
                 header "Setting Acceptable Game Versions"
                 log INFO "Setting: ${versions}"
-                pw settings acceptable-versions "$versions" 2>>"$RUN_LOG" && log OK "Done" || log FAIL "Failed"
+                $PACKWIZ_BIN settings acceptable-versions "$versions" 2>>"$RUN_LOG" && log OK "Done" || log FAIL "Failed"
             else
                 header "Acceptable Game Versions"
                 local current
@@ -4057,7 +4057,7 @@ cmd_stage() {
     fi
 
     # Refresh packwiz index
-    pw refresh 2>>"$RUN_LOG" || true
+    $PACKWIZ_BIN refresh 2>>"$RUN_LOG" || true
 
     # Summary
     separator
@@ -4119,7 +4119,7 @@ cmd_add_file() {
             log INFO "Removed from unresolved.txt"
         fi
 
-        pw refresh 2>>"$RUN_LOG" || true
+        $PACKWIZ_BIN refresh 2>>"$RUN_LOG" || true
         echo ""
         echo -e "  ${GREEN}${BOLD}Done!${NC} ${slug} is installed as a self-hosted mod."
         echo -e "  ${DIM}Clients will download it from your CDN/server.${NC}"
@@ -4147,16 +4147,16 @@ cmd_cf_import() {
     read -r confirm
     [[ "$confirm" != [yY] ]] && exit 0
 
-    pw curseforge import "$path" --yes 2>>"$RUN_LOG" && log OK "Import complete" || log FAIL "Import failed"
-    pw refresh 2>>"$RUN_LOG"
+    $PACKWIZ_BIN curseforge import "$path" --yes 2>>"$RUN_LOG" && log OK "Import complete" || log FAIL "Import failed"
+    $PACKWIZ_BIN refresh 2>>"$RUN_LOG"
 }
 
 cmd_detect() {
     check_packwiz; check_pack_init
     header "Detecting CurseForge Mods"
     log INFO "Scanning installed JARs for CurseForge matches..."
-    pw curseforge detect --yes 2>>"$RUN_LOG" && log OK "Detection complete" || log WARN "Some files not detected"
-    pw refresh 2>>"$RUN_LOG"
+    $PACKWIZ_BIN curseforge detect --yes 2>>"$RUN_LOG" && log OK "Detection complete" || log WARN "Some files not detected"
+    $PACKWIZ_BIN refresh 2>>"$RUN_LOG"
 }
 
 cmd_open() {
@@ -4203,16 +4203,16 @@ cmd_refresh() {
     header "Refreshing Pack Index"
     if $build; then
         log INFO "Building with internal hashes (for distribution)..."
-        pw refresh --build 2>>"$RUN_LOG" && log OK "Index built" || log FAIL "Build failed"
+        $PACKWIZ_BIN refresh --build 2>>"$RUN_LOG" && log OK "Index built" || log FAIL "Build failed"
     else
-        pw refresh 2>>"$RUN_LOG" && log OK "Index refreshed" || log FAIL "Refresh failed"
+        $PACKWIZ_BIN refresh 2>>"$RUN_LOG" && log OK "Index refreshed" || log FAIL "Refresh failed"
     fi
 }
 
 cmd_markdown() {
     check_packwiz; check_pack_init
     header "Generating Mod List (Markdown)"
-    pw utils markdown 2>>"$RUN_LOG"
+    $PACKWIZ_BIN utils markdown 2>>"$RUN_LOG"
 }
 
 # ============================================================================
@@ -4289,8 +4289,8 @@ cmd_aliases() {
                 b|B)
                     alias_remove "$slug"
                     if [[ -f "${PACK_DIR}/mods/${resolved}.pw.toml" ]]; then
-                        pw remove "$resolved" --yes 2>>"$RUN_LOG" || rm -f "${PACK_DIR}/mods/${resolved}.pw.toml"
-                        pw refresh 2>>"$RUN_LOG" || true
+                        $PACKWIZ_BIN remove "$resolved" --yes 2>>"$RUN_LOG" || rm -f "${PACK_DIR}/mods/${resolved}.pw.toml"
+                        $PACKWIZ_BIN refresh 2>>"$RUN_LOG" || true
                         log OK "Alias removed and ${resolved} uninstalled"
                     else
                         log OK "Alias removed (${resolved}.pw.toml not found — may already be gone)"
@@ -4449,7 +4449,7 @@ cmd_resolve() {
 
     # Refresh packwiz index if we resolved anything
     if [[ $resolved -gt 0 ]]; then
-        pw refresh 2>>"$RUN_LOG" || true
+        (cd "$PACK_DIR" && $PACKWIZ_BIN refresh 2>>"$RUN_LOG" || true)
     fi
 
     # ── Summary ──────────────────────────────────────────────────────
