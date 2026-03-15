@@ -1,0 +1,14 @@
+# Don't index non-pack files
+src/
+envious-mc/
+scripts/
+__pycache__/
+*.egg-info/
+*.pyc
+.git/
+.gitignore
+.gitattributes
+.packwizignore
+pyproject.toml
+*.md
+.logs/

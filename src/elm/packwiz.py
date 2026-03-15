@@ -27,7 +27,7 @@ class PackwizError(Exception):
 
 def pw(cfg: Config, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     """Run a packwiz command in the pack directory."""
-    cmd = [cfg.packwiz_bin, *args]
+    cmd = [cfg.packwiz_bin, "-y", *args]
     result = subprocess.run(
         cmd,
         cwd=cfg.pack_dir,
@@ -91,14 +91,55 @@ def list_mods(cfg: Config) -> list[str]:
     mods_dir = cfg.pack_dir / "mods"
     if not mods_dir.is_dir():
         return []
-    return sorted(p.stem for p in mods_dir.glob("*.toml"))
+    names = []
+    for p in mods_dir.glob("*.toml"):
+        name = p.stem
+        # packwiz uses .pw.toml filenames — strip the .pw suffix
+        if name.endswith(".pw"):
+            name = name[:-3]
+        names.append(name)
+    return sorted(names)
 
 
 def search_mod(cfg: Config, query: str, *, source: str = "") -> str:
-    """Search for mods. Returns stdout from packwiz."""
-    src = source or cfg.prefer_source
-    result = pw(cfg, src, "search", query, check=False)
-    return result.stdout
+    """Search for mods via Modrinth API. Returns formatted results."""
+    import httpx
+    import urllib.parse
+
+    mc_version = cfg.mc_version
+    loader = cfg.loader
+
+    params = {
+        "query": query,
+        "facets": f'[["versions:{mc_version}"],["categories:{loader}"],["project_type:mod"]]',
+        "limit": "15",
+    }
+    url = f"https://api.modrinth.com/v2/search?{urllib.parse.urlencode(params)}"
+
+    try:
+        resp = httpx.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return ""
+
+    hits = data.get("hits", [])
+    if not hits:
+        return ""
+
+    lines = []
+    for hit in hits:
+        slug = hit.get("slug", "")
+        title = hit.get("title", "")
+        desc = hit.get("description", "")[:80]
+        downloads = hit.get("downloads", 0)
+        dl_str = f"{downloads:,}"
+        lines.append(f"  [cyan]{slug:<30}[/cyan] {title}")
+        lines.append(f"  {'':30} [dim]{desc}[/dim]")
+        lines.append(f"  {'':30} [dim]{dl_str} downloads[/dim]")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def init_pack(cfg: Config) -> subprocess.CompletedProcess[str]:
