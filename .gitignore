@@ -5,3 +5,8 @@ dist/
 build/
 .eggs/
 .ruff_cache/
+
+# Packwiz pack files (generated per-instance)
+pack.toml
+index.toml
+mods/
