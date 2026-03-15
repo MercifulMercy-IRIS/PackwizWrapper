@@ -6352,8 +6352,8 @@ main() {
         # Core pack management
         init)              cmd_init ;;
         add|a)             cmd_add "$@" ;;
-        rm)                cmd_remove "${1:-}" ;;
-        ls)                cmd_list "$@" ;;
+        rm|remove)         cmd_remove "${1:-}" ;;
+        ls|list)           cmd_list "$@" ;;
         sync)              cmd_sync ;;
         up)                cmd_update ;;
         search|s)          cmd_search "$@" ;;
@@ -6362,27 +6362,53 @@ main() {
         export|ex)         cmd_export "$@" ;;
 
         # Server & deploy
-        deploy)            cmd_deploy "$@" ;;
-        target|t)          cmd_targets "$@" ;;
+        deploy|d)          cmd_deploy "$@" ;;
+        target|targets|t)  cmd_targets "$@" ;;
 
         # Diagnostics
-        check)             cmd_check "$@" ;;
-        net)               cmd_netcheck ;;
+        check|doctor|doc|verify|vf|status|st|diff|df)
+                           cmd_check "$@" ;;
+        net|netcheck|nc)   cmd_netcheck ;;
 
         # Config, keys & DNS
-        config|cfg)        cmd_config "$@" ;;
+        config|cfg|settings|set)
+                           cmd_config "$@" ;;
         key)               cmd_key "$@" ;;
         dns)               cmd_dns "$@" ;;
 
         # Self-update
         update)            cmd_self_update "$@" ;;
+        self-update|selfupdate|su)
+                           cmd_self_update "$@" ;;
+        update-status|us)  cmd_self_update --check ;;
 
         # Maintenance
         nuke)              cmd_nuke ;;
         reinstall)         cmd_reinstall ;;
         resolve|res)       cmd_resolve "$@" ;;
-        organize)          cmd_organize "${1:-}" ;;
+        unresolved|ur)     cmd_unresolved "$@" ;;
+        aliases|al)        cmd_aliases "$@" ;;
+        organize|org)      cmd_organize "${1:-}" ;;
         migrate|mig)       cmd_migrate "$@" ;;
+        refresh)           cmd_refresh "${1:-}" ;;
+        deps)              cmd_deps ;;
+        stage|staging)     cmd_stage ;;
+        detect)            cmd_detect ;;
+        open)              cmd_open "${1:-}" ;;
+        markdown|md)       cmd_markdown ;;
+        import)            cmd_cf_import "${1:-}" ;;
+        serve)             cmd_serve ;;
+        publish)           publish_pack ;;
+
+        # Legacy server shortcuts (kept for backwards compat)
+        start)             cmd_deploy start --target "${1:-}" ;;
+        stop)              cmd_deploy stop --target "${1:-}" ;;
+        restart)           cmd_deploy restart --target "${1:-}" ;;
+        kill)              cmd_deploy kill --target "${1:-}" ;;
+        logs)              cmd_deploy logs --target "${1:-}" ;;
+        console|rcon)      cmd_deploy console "${2:-}" --target "${1:-}" ;;
+        backup)            cmd_deploy backup --target "${1:-}" ;;
+        destroy)           cmd_deploy remove --target "${1:-}" ;;
 
         # Meta
         help|--help|-h)    cmd_help ;;
