@@ -17,7 +17,7 @@
 #   pm list                    Show installed mods with status
 #   pm status                  Pack health overview
 #   pm deps                    Show auto-pulled dependencies
-#   pm search <query>          Search Modrinth/CurseForge/GitHub APIs
+#   pm search <query>          Search Modrinth/CurseForge APIs
 #   pm stage                   Batch-match JARs in staging/ vs unresolved
 #   pm export [mr|cf]          Export pack for distribution
 #   pm serve                   Local HTTP server for testing
@@ -100,10 +100,6 @@ PM_UPDATE_FILES="packmanager.sh install.sh packmanager.conf mods.txt"  # Files t
 # Get one free at https://console.curseforge.com
 CURSEFORGE_API_KEY=""
 
-# GitHub token (optional — raises API rate limit from 60 to 5000 req/hr)
-# Used as a third-source fallback to find mods via GitHub Releases
-# Generate at https://github.com/settings/tokens (no special scopes needed)
-GITHUB_TOKEN=""
 
 # Local/self-hosted mods (for mods not on Modrinth/CurseForge)
 LOCAL_MODS_DIR=""               # e.g. /var/www/mods — served by Caddy/tunnel
@@ -291,7 +287,7 @@ is_installed() {
 is_in_modlist() {
     local slug="$1"
     [[ -f "$MODS_FILE" ]] || return 1
-    grep -qE "^!?((mr|cf|gh|url|local):)?${slug}(\s|#|$)" "$MODS_FILE" 2>/dev/null
+    grep -qE "^!?((mr|cf|url|local):)?${slug}(\s|#|$)" "$MODS_FILE" 2>/dev/null
 }
 
 add_to_unresolved() {
@@ -345,7 +341,6 @@ parse_mod_entry() {
 
     if   [[ "$raw" == mr:* ]];    then source="modrinth";   slug="${raw#mr:}"
     elif [[ "$raw" == cf:* ]];    then source="curseforge";  slug="${raw#cf:}"
-    elif [[ "$raw" == gh:* ]];    then source="github";      slug="${raw#gh:}"
     elif [[ "$raw" == url:* ]];   then source="url"; url="${raw#url:}"; slug="$(basename "$url" .jar | sed 's/[-_][0-9].*$//')"
     elif [[ "$raw" == local:* ]]; then source="local"; slug="${raw#local:}"; slug="$(basename "$slug" .jar)"
     elif [[ "$raw" == https://www.curseforge.com/* ]]; then source="curseforge"; url="$raw"; slug="$raw"
@@ -787,17 +782,17 @@ install_mod() {
                 fi
             fi
             ;;
-        gh|github)
-            try_github "$slug" && { installed=true; via="GitHub"; }
-            ;;
     esac
 
-    # --- GitHub fallback: if MR/CF both failed, try GitHub Releases ---
-    if ! $installed && [[ "$source" != "gh" && "$source" != "github" && "$source" != "url" && "$source" != "local" ]]; then
-        log WARN "${slug} not on Modrinth/CurseForge, trying GitHub Releases..."
-        if try_github "$slug"; then
-            installed=true; via="GitHub fallback"
-            echo -e "    ${DIM}Tip: Pin as 'local:${slug}' in mods.txt (self-hosted JAR)${NC}"
+    # --- Direct-download fallback: bypass packwiz, resolve via API + self-host ---
+    # If packwiz couldn't install it (or we haven't tried yet), use the Modrinth/CF
+    # version APIs directly to find the exact file, download the JAR, and import it.
+    if ! $installed && [[ "$source" != "url" && "$source" != "local" ]]; then
+        log WARN "${slug} — trying direct API resolution..."
+        if modrinth_download_mod "$slug"; then
+            installed=true; via="Modrinth direct"
+        elif [[ -n "$CURSEFORGE_API_KEY" ]] && curseforge_download_mod "$slug"; then
+            installed=true; via="CurseForge direct"
         fi
     fi
 
@@ -805,7 +800,7 @@ install_mod() {
     if ! $installed; then
         echo ""
         echo -e "  ${RED}${BOLD}NOT FOUND${NC}: ${BOLD}${slug}${NC}"
-        echo -e "  ${DIM}Not available on Modrinth, CurseForge, or GitHub (source: ${source})${NC}"
+        echo -e "  ${DIM}Not available on Modrinth or CurseForge (source: ${source})${NC}"
 
         # Always auto-save to unresolved.txt — no prompting
         add_to_unresolved "$slug" "not found on ${source}"
@@ -830,13 +825,11 @@ install_mod() {
 
 
 # ============================================================================
-# MOD SEARCH (Modrinth + CurseForge + GitHub APIs)
+# MOD SEARCH (Modrinth + CurseForge APIs)
 # ============================================================================
-# Fuzzy search for mods by name/slug across all three platforms.
+# Fuzzy search for mods by name/slug across both platforms.
 # Modrinth's API is free with no key. CurseForge requires CURSEFORGE_API_KEY.
-# GitHub is free (60 req/hr, 5000 with GITHUB_TOKEN).
 # Used by: pm search <query>, pm unresolved search, and sync failure suggestions.
-# GitHub results can also download the JAR directly for self-hosting.
 
 # User-Agent for API requests (good etiquette)
 PM_USER_AGENT="PackManager/4 (github.com/PackwizWrapper)"
@@ -896,147 +889,206 @@ search_curseforge_api() {
     echo "$response" | jq -r '.data[]? | [.slug, .name, (.downloadCount | tostring), .summary[:80]] | @tsv' 2>/dev/null
 }
 
-# GitHub Releases search — find mods published as GitHub releases
-# Searches for Minecraft mod repos, then checks their releases for JAR assets.
-# Free: 60 req/hr unauthenticated, 5000 with GITHUB_TOKEN.
-search_github_api() {
-    local query="$1" limit="${2:-5}"
-    command -v curl &>/dev/null || return 1
+# ============================================================================
+# DIRECT MOD RESOLUTION (Prism Launcher-style)
+# ============================================================================
+# When packwiz can't install a mod (or installs the wrong one), these functions
+# use the official Modrinth/CurseForge version APIs to:
+#   1. Look up the project by slug
+#   2. Find the exact file matching our MC_VERSION + LOADER
+#   3. Download the JAR directly
+#   4. Import it via import_jar_as_mod (self-hosted)
+#
+# This mirrors how Prism Launcher resolves mods — using
+# /v2/project/{slug}/version (Modrinth) and /v1/mods/{id}/files (CurseForge)
+# instead of relying on packwiz's fuzzy name matching.
 
-    # Build search: look for repos with topic "minecraft-mod" or the query + minecraft
-    local encoded_query
-    encoded_query=$(printf '%s' "$query minecraft mod" | sed 's/ /%20/g; s/"/%22/g')
-
-    local -a headers=("-H" "User-Agent: ${PM_USER_AGENT}" "-H" "Accept: application/vnd.github+json")
-    [[ -n "$GITHUB_TOKEN" ]] && headers+=("-H" "Authorization: Bearer ${GITHUB_TOKEN}")
-
-    local response
-    response=$(curl -sL --max-time 10 \
-        "${headers[@]}" \
-        "https://api.github.com/search/repositories?q=${encoded_query}&per_page=${limit}&sort=stars&order=desc" \
-        2>/dev/null) || return 1
-
-    # Filter to repos that actually have releases, extract useful info
-    # Output: slug(owner/repo) \t name \t stars \t description
-    echo "$response" | jq -r '.items[]? | select(.has_pages or .size > 0) | [.full_name, .name, (.stargazers_count | tostring), (.description // "")[:80]] | @tsv' 2>/dev/null
-}
-
-# Get the latest release JAR URL from a GitHub repo
-# Returns: jar_url \t jar_filename \t tag_name
-github_get_release_jar() {
-    local repo="$1"
-    command -v curl &>/dev/null || return 1
-
-    local -a headers=("-H" "User-Agent: ${PM_USER_AGENT}" "-H" "Accept: application/vnd.github+json")
-    [[ -n "$GITHUB_TOKEN" ]] && headers+=("-H" "Authorization: Bearer ${GITHUB_TOKEN}")
-
-    local response
-    response=$(curl -sL --max-time 10 \
-        "${headers[@]}" \
-        "https://api.github.com/repos/${repo}/releases/latest" \
-        2>/dev/null) || return 1
-
-    # Find the first .jar asset (skip -sources.jar, -javadoc.jar, -dev.jar)
-    echo "$response" | jq -r '
-        .assets[]?
-        | select(.name | test("\\.jar$"; "i"))
-        | select(.name | test("(sources|javadoc|dev|api-only)"; "i") | not)
-        | [.browser_download_url, .name, (.size | tostring)]
-        | @tsv
-    ' 2>/dev/null | head -1
-}
-
-# Try installing a mod from GitHub Releases — downloads JAR and self-hosts it
-# Accepts either a slug name (searches GitHub) or owner/repo (direct lookup)
-try_github() {
+# Modrinth: resolve a slug to an exact JAR download, filtered by MC version + loader
+modrinth_download_mod() {
     local slug="$1"
-    local mod_slug="$slug"  # The name to use in mods.txt / .pw.toml
+    command -v curl &>/dev/null || return 1
 
-    # If slug contains '/', treat as direct owner/repo reference
-    if [[ "$slug" == */* ]]; then
-        mod_slug=$(echo "${slug##*/}" | tr '[:upper:]' '[:lower:]' | tr ' _' '-')
-        log INFO "${slug} — fetching latest release..."
+    # Step 1: Get the project to verify it exists
+    local project
+    project=$(curl -sL --max-time 10 \
+        -H "User-Agent: ${PM_USER_AGENT}" \
+        "https://api.modrinth.com/v2/project/${slug}" \
+        2>/dev/null) || return 1
 
-        local jar_info
-        jar_info=$(github_get_release_jar "$slug" 2>/dev/null)
-        if [[ -n "$jar_info" ]]; then
-            IFS=$'\t' read -r jar_url jar_filename jar_size <<< "$jar_info"
-            if [[ -n "$jar_url" && -n "$jar_filename" ]]; then
-                local tmp_jar; tmp_jar=$(mktemp --suffix=.jar)
-                local http_code
-                http_code=$(curl -sL -o "$tmp_jar" -w '%{http_code}' --max-time 60 "$jar_url" 2>/dev/null || echo "000")
-                if [[ "$http_code" == "200" ]] && file "$tmp_jar" 2>/dev/null | grep -qiE "zip|jar|java"; then
-                    if import_jar_as_mod "$tmp_jar" "$mod_slug"; then
-                        rm -f "$tmp_jar"
-                        log OK "${mod_slug} — installed from GitHub (${slug})"
-                        echo "GITHUB INSTALL: ${mod_slug} from ${slug} (${jar_filename})" >> "$RUN_LOG"
-                        return 0
-                    fi
-                fi
-                rm -f "$tmp_jar"
-            fi
-        fi
+    # Check for valid response (has slug field)
+    local project_slug
+    project_slug=$(echo "$project" | jq -r '.slug // empty' 2>/dev/null)
+    [[ -z "$project_slug" ]] && return 1
+
+    local project_title
+    project_title=$(echo "$project" | jq -r '.title // empty' 2>/dev/null)
+
+    # Step 2: Fetch versions filtered by game version + loader
+    local loaders_param=""
+    [[ -n "$LOADER" ]] && loaders_param="loaders=%5B%22${LOADER}%22%5D"
+
+    local versions_param=""
+    [[ -n "$MC_VERSION" ]] && versions_param="game_versions=%5B%22${MC_VERSION}%22%5D"
+
+    local query_string=""
+    [[ -n "$loaders_param" ]] && query_string="${loaders_param}"
+    [[ -n "$versions_param" ]] && query_string="${query_string:+${query_string}&}${versions_param}"
+
+    local versions_url="https://api.modrinth.com/v2/project/${project_slug}/version"
+    [[ -n "$query_string" ]] && versions_url="${versions_url}?${query_string}"
+
+    local versions
+    versions=$(curl -sL --max-time 10 \
+        -H "User-Agent: ${PM_USER_AGENT}" \
+        "$versions_url" \
+        2>/dev/null) || return 1
+
+    # Step 3: Pick the first (latest) version's primary file
+    local file_info
+    file_info=$(echo "$versions" | jq -r '
+        [.[] | select(.files | length > 0)] | first |
+        .files[] | select(.primary == true or .primary == null) |
+        [.url, .filename, .hashes.sha512] | @tsv
+    ' 2>/dev/null | head -1)
+
+    [[ -z "$file_info" ]] && {
+        log WARN "${slug} — no compatible version on Modrinth for ${MC_VERSION}/${LOADER}"
+        return 1
+    }
+
+    IFS=$'\t' read -r download_url jar_filename file_hash <<< "$file_info"
+    [[ -z "$download_url" || -z "$jar_filename" ]] && return 1
+
+    log INFO "${slug} — Modrinth direct: ${jar_filename}"
+
+    # Step 4: Download the JAR
+    local tmp_jar; tmp_jar=$(mktemp --suffix=.jar)
+    local http_code
+    http_code=$(curl -sL -o "$tmp_jar" -w '%{http_code}' --max-time 60 "$download_url" 2>/dev/null || echo "000")
+
+    if [[ "$http_code" != "200" ]]; then
+        rm -f "$tmp_jar"
+        log WARN "${slug} — download failed (HTTP ${http_code})"
         return 1
     fi
 
-    log INFO "${slug} — searching GitHub Releases..."
-
-    # Search GitHub for the mod
-    local results
-    results=$(search_github_api "$slug" 5 2>/dev/null)
-    [[ -z "$results" ]] && return 1
-
-    # Try each result until we find one with a JAR release
-    while IFS=$'\t' read -r repo name stars desc; do
-        [[ -z "$repo" ]] && continue
-
-        local jar_info
-        jar_info=$(github_get_release_jar "$repo" 2>/dev/null)
-        [[ -z "$jar_info" ]] && continue
-
-        IFS=$'\t' read -r jar_url jar_filename jar_size <<< "$jar_info"
-        [[ -z "$jar_url" || -z "$jar_filename" ]] && continue
-
-        # Verify it looks like a Minecraft mod JAR (basic sanity)
-        if [[ ! "$jar_filename" =~ \.jar$ ]]; then
-            continue
-        fi
-
-        log INFO "${slug} — found: ${jar_filename} from ${repo}"
-
-        # Download the JAR to a temp location
-        local tmp_jar; tmp_jar=$(mktemp --suffix=.jar)
-        local http_code
-        http_code=$(curl -sL -o "$tmp_jar" -w '%{http_code}' --max-time 60 "$jar_url" 2>/dev/null || echo "000")
-
-        if [[ "$http_code" != "200" ]]; then
+    # Step 5: Verify hash if available
+    if [[ -n "$file_hash" ]]; then
+        local actual_hash
+        actual_hash=$(sha512sum "$tmp_jar" 2>/dev/null | cut -d' ' -f1)
+        if [[ "$actual_hash" != "$file_hash" ]]; then
             rm -f "$tmp_jar"
-            log WARN "${slug} — download failed (HTTP ${http_code})"
-            continue
+            log WARN "${slug} — SHA-512 hash mismatch after download"
+            return 1
         fi
+    fi
 
-        # Verify it's actually a JAR (ZIP magic bytes)
-        if ! file "$tmp_jar" 2>/dev/null | grep -qiE "zip|jar|java"; then
-            rm -f "$tmp_jar"
-            log WARN "${slug} — downloaded file is not a valid JAR"
-            continue
-        fi
-
-        # Import the JAR as a self-hosted mod
-        if import_jar_as_mod "$tmp_jar" "$slug"; then
-            rm -f "$tmp_jar"
-            log OK "${slug} — installed from GitHub (${repo})"
-            echo "GITHUB INSTALL: ${slug} from ${repo} (${jar_filename})" >> "$RUN_LOG"
-            return 0
-        fi
-
+    # Step 6: Import as self-hosted mod
+    if import_jar_as_mod "$tmp_jar" "$slug"; then
         rm -f "$tmp_jar"
-    done <<< "$results"
+        log OK "${slug} — ${project_title} (Modrinth direct download)"
+        echo "MODRINTH DIRECT: ${slug} → ${jar_filename}" >> "$RUN_LOG"
+        return 0
+    fi
 
+    rm -f "$tmp_jar"
     return 1
 }
 
-# Unified search: hits all three APIs and merges results
+# CurseForge: resolve a slug to an exact JAR download, filtered by MC version + loader
+curseforge_download_mod() {
+    local slug="$1"
+    [[ -z "$CURSEFORGE_API_KEY" ]] && return 1
+    command -v curl &>/dev/null || return 1
+
+    # Step 1: Search for the mod to get its numeric ID
+    local encoded_slug
+    encoded_slug=$(printf '%s' "$slug" | sed 's/ /%20/g')
+
+    local search_url="https://api.curseforge.com/v1/mods/search?gameId=432&searchFilter=${encoded_slug}&pageSize=1&sortField=2&sortOrder=desc"
+
+    local loader_type=""
+    case "$LOADER" in
+        forge)    loader_type="1" ;; fabric)   loader_type="4" ;;
+        quilt)    loader_type="5" ;; neoforge) loader_type="6" ;;
+    esac
+    [[ -n "$loader_type" ]] && search_url="${search_url}&modLoaderType=${loader_type}"
+    [[ -n "$MC_VERSION" ]]  && search_url="${search_url}&gameVersion=${MC_VERSION}"
+
+    local search_result
+    search_result=$(curl -sL --max-time 10 \
+        -H "x-api-key: ${CURSEFORGE_API_KEY}" \
+        -H "User-Agent: ${PM_USER_AGENT}" \
+        "$search_url" 2>/dev/null) || return 1
+
+    local mod_id mod_name
+    mod_id=$(echo "$search_result" | jq -r '.data[0].id // empty' 2>/dev/null)
+    mod_name=$(echo "$search_result" | jq -r '.data[0].name // empty' 2>/dev/null)
+    [[ -z "$mod_id" ]] && return 1
+
+    # Verify the slug actually matches (prevent wrong mod)
+    local result_slug
+    result_slug=$(echo "$search_result" | jq -r '.data[0].slug // empty' 2>/dev/null)
+    local slug_norm result_norm
+    slug_norm=$(normalize_slug "$slug")
+    result_norm=$(normalize_slug "$result_slug")
+    if [[ "$slug_norm" != "$result_norm" ]]; then
+        log WARN "${slug} — CurseForge returned '${result_slug}' (not a match)"
+        return 1
+    fi
+
+    # Step 2: Get files for this mod, filtered by game version + loader
+    local files_url="https://api.curseforge.com/v1/mods/${mod_id}/files?pageSize=10"
+    [[ -n "$MC_VERSION" ]]  && files_url="${files_url}&gameVersion=${MC_VERSION}"
+    [[ -n "$loader_type" ]] && files_url="${files_url}&modLoaderType=${loader_type}"
+
+    local files_result
+    files_result=$(curl -sL --max-time 10 \
+        -H "x-api-key: ${CURSEFORGE_API_KEY}" \
+        -H "User-Agent: ${PM_USER_AGENT}" \
+        "$files_url" 2>/dev/null) || return 1
+
+    # Step 3: Pick the first (most recent) file with a download URL
+    local file_info
+    file_info=$(echo "$files_result" | jq -r '
+        [.data[] | select(.downloadUrl != null and .downloadUrl != "")] | first |
+        [.downloadUrl, .fileName, (.fileLength | tostring)] | @tsv
+    ' 2>/dev/null)
+
+    [[ -z "$file_info" ]] && {
+        log WARN "${slug} — no compatible file on CurseForge for ${MC_VERSION}/${LOADER}"
+        return 1
+    }
+
+    IFS=$'\t' read -r download_url jar_filename file_size <<< "$file_info"
+    [[ -z "$download_url" || -z "$jar_filename" ]] && return 1
+
+    log INFO "${slug} — CurseForge direct: ${jar_filename}"
+
+    # Step 4: Download the JAR
+    local tmp_jar; tmp_jar=$(mktemp --suffix=.jar)
+    local http_code
+    http_code=$(curl -sL -o "$tmp_jar" -w '%{http_code}' --max-time 60 "$download_url" 2>/dev/null || echo "000")
+
+    if [[ "$http_code" != "200" ]]; then
+        rm -f "$tmp_jar"
+        log WARN "${slug} — download failed (HTTP ${http_code})"
+        return 1
+    fi
+
+    # Step 5: Import as self-hosted mod
+    if import_jar_as_mod "$tmp_jar" "$slug"; then
+        rm -f "$tmp_jar"
+        log OK "${slug} — ${mod_name} (CurseForge direct download)"
+        echo "CURSEFORGE DIRECT: ${slug} → ${jar_filename} (mod ID ${mod_id})" >> "$RUN_LOG"
+        return 0
+    fi
+
+    rm -f "$tmp_jar"
+    return 1
+}
+
+# Unified search: hits both official APIs and merges results
 # Output: source \t slug \t name \t downloads \t description
 search_mods() {
     local query="$1" limit="${2:-5}"
@@ -1064,17 +1116,6 @@ search_mods() {
         fi
     fi
 
-    # GitHub Releases (always available, rate-limited without token)
-    local gh_results
-    gh_results=$(search_github_api "$query" "$limit" 2>/dev/null) || true
-    if [[ -n "$gh_results" ]]; then
-        found=true
-        while IFS=$'\t' read -r repo name stars desc; do
-            # Use stars as the "downloads" metric for sorting/display
-            printf "gh\t%s\t%s\t%s\t%s\n" "$repo" "$name" "${stars}★" "$desc"
-        done <<< "$gh_results"
-    fi
-
     $found || return 1
 }
 
@@ -1090,9 +1131,8 @@ interactive_search() {
     results=$(search_mods "$query" 5 2>/dev/null)
 
     if [[ -z "$results" ]]; then
-        echo -e "  ${DIM}No results found on Modrinth, CurseForge, or GitHub${NC}"
+        echo -e "  ${DIM}No results found on Modrinth or CurseForge${NC}"
         [[ -z "$CURSEFORGE_API_KEY" ]] && echo -e "  ${DIM}(Set CURSEFORGE_API_KEY in config to also search CurseForge)${NC}"
-        [[ -z "$GITHUB_TOKEN" ]] && echo -e "  ${DIM}(Set GITHUB_TOKEN in config for higher GitHub rate limits)${NC}"
         echo ""
         return 1
     fi
@@ -1111,7 +1151,6 @@ interactive_search() {
         case "$src" in
             mr) src_label="${GREEN}MR${NC}" ;;
             cf) src_label="${YELLOW}CF${NC}" ;;
-            gh) src_label="${CYAN}GH${NC}" ;;
             *)  src_label="$src" ;;
         esac
 
@@ -4947,7 +4986,7 @@ cmd_help() {
     list [--side <s>] [--version]  Show installed mods (--native for raw packwiz)
     status                         Pack health overview
     deps                           Show auto-pulled dependencies
-    search <query>                 Search Modrinth/CurseForge/GitHub by name
+    search <query>                 Search Modrinth/CurseForge by name/slug
     stage                          Batch-match JARs in staging/ vs unresolved
     refresh [--build]              Refresh index (--build for distribution)
     serve                          Local HTTP dev server (localhost:8080)
@@ -5016,7 +5055,6 @@ cmd_help() {
     tinkers-construct              Auto-detect (Modrinth → CurseForge)
     mr:ars-nouveau                 Modrinth only
     cf:journeymap                  CurseForge only
-    gh:owner/repo                  GitHub Releases (downloads JAR, self-hosts)
     url:https://dl.com/mod.jar     Direct download URL
     local:my-custom-mod            Local JAR from LOCAL_MODS_DIR
     file:/path/to/mod.jar          Import JAR file directly (auto-hashes)
@@ -5032,7 +5070,6 @@ cmd_help() {
     pm add tinkers-construct mekanism ae2 ars-nouveau
     pm add cf:journeymap mr:jade
     pm add url:https://example.com/custom-mod.jar
-    pm add gh:SomeUser/CoolMod                 # from GitHub Releases
     pm add local:my-fork                       # from LOCAL_MODS_DIR
     pm add file:~/Downloads/my-mod-1.0.jar     # import JAR directly
     pm add file:/path/to/mod.jar --slug name   # import with custom slug

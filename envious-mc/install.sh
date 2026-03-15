@@ -427,10 +427,10 @@ _pm_completions() {
                 COMPREPLY=($(printf "file:%s\n" $completions))
             elif [[ -f "mods.txt" ]]; then
                 local slugs
-                slugs=$(grep -vE '^\s*#|^\s*$' mods.txt | sed 's/\s*#.*$//;s/^!//;s/^mr://;s/^cf://;s/^gh://;s/^url://;s/^local://' | xargs)
-                COMPREPLY=($(compgen -W "$slugs file: gh:" -- "$cur"))
+                slugs=$(grep -vE '^\s*#|^\s*$' mods.txt | sed 's/\s*#.*$//;s/^!//;s/^mr://;s/^cf://;s/^url://;s/^local://' | xargs)
+                COMPREPLY=($(compgen -W "$slugs file:" -- "$cur"))
             else
-                COMPREPLY=($(compgen -W "file: gh:" -- "$cur"))
+                COMPREPLY=($(compgen -W "file:" -- "$cur"))
             fi
             return 0
             ;;
