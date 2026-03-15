@@ -12,11 +12,13 @@
 #   pm sync                    Install all mods from mods.txt
 #   pm update                  Update all non-pinned mods
 #   pm add [slug...]           Add mods (no args = interactive)
+#   pm add file:/path/to.jar   Add a single JAR as self-hosted mod
 #   pm remove <slug>           Remove a mod
 #   pm list                    Show installed mods with status
 #   pm status                  Pack health overview
 #   pm deps                    Show auto-pulled dependencies
 #   pm search <query>          Search Modrinth/CurseForge APIs
+#   pm stage                   Batch-match JARs in staging/ vs unresolved
 #   pm export [mr|cf]          Export pack for distribution
 #   pm serve                   Local HTTP server for testing
 #   pm verify                  Full audit: mods.txt vs installed .pw.toml
@@ -171,6 +173,8 @@ fi
 MODS_FILE="${PACK_DIR}/mods.txt"
 UNRESOLVED_FILE="${PACK_DIR}/unresolved.txt"
 LOG_DIR="${PACK_DIR}/.logs"
+# Staging directory — drop JAR files here for batch matching against unresolved mods
+STAGING_DIR="$(dirname "$PACK_DIR")/staging"
 
 # Also try to load a local config from the discovered pack dir
 # (in case discovery moved us and there's a packmanager.conf there)
@@ -181,6 +185,7 @@ if [[ -f "${PACK_DIR}/packmanager.conf" && "${PACK_DIR}/packmanager.conf" != "$L
     MODS_FILE="${PACK_DIR}/mods.txt"
     UNRESOLVED_FILE="${PACK_DIR}/unresolved.txt"
     LOG_DIR="${PACK_DIR}/.logs"
+    STAGING_DIR="$(dirname "$PACK_DIR")/staging"
 fi
 
 # Handle stray files: if mods.txt / unresolved.txt exist at the original dir
@@ -2135,6 +2140,7 @@ print_srv_records() {
 #     │   ├── logs/
 #     │   ├── ops.json, whitelist.json, banned-*.json
 #     │   └── ...
+#     ├── staging/             ← drop JARs here for 'pm stage' batch matching
 #     └── cdn/                 ← Caddy-served files (client downloads)
 #         ├── pack.toml
 #         ├── index.toml
@@ -2532,11 +2538,37 @@ cmd_add() {
         cmd_add_interactive; return
     fi
 
+    # Handle file: prefix — route to cmd_add_file
+    if [[ "$1" == file:* ]]; then
+        local file_path="${1#file:}"
+        shift
+        # Check for --slug flag
+        local slug_flag=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --slug) slug_flag="${2:-}"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        cmd_add_file "$file_path" "$slug_flag"
+        return
+    fi
+
     header "Adding ${#} mod(s)"
     DEPS_ADDED=()
     MISMATCHES=()
 
     for input in "$@"; do
+        # Support file: prefix inline for batch adds too
+        if [[ "$input" == file:* ]]; then
+            local fp="${input#file:}"
+            import_jar_as_mod "$fp" "" && {
+                local auto_slug; auto_slug=$(basename "$fp" | sed 's/\.jar$//; s/[-_][0-9].*$//' | tr '[:upper:]' '[:lower:]' | tr ' _' '-')
+                is_in_modlist "$auto_slug" || append_to_modlist "local:${auto_slug}" "added via file"
+            }
+            continue
+        fi
+
         local parsed
         parsed="$(parse_mod_entry "$input")" || continue
         IFS='|' read -r source slug url pinned <<< "$parsed"
@@ -2549,6 +2581,7 @@ cmd_add() {
             echo "    pm search ${slug}"
             echo "    pm add cf:alternate-slug"
             echo "    pm add url:https://direct-link.jar"
+            echo "    pm add file:/path/to/mod.jar"
             echo ""
         fi
     done
@@ -3071,7 +3104,302 @@ cmd_settings() {
     esac
 }
 
-cmd_import() {
+# ============================================================================
+# JAR FILE IMPORT — add self-hosted mods from JAR files
+# ============================================================================
+#
+# import_jar_as_mod <jar_path> [slug_override]
+#   Takes a JAR file path, generates a .pw.toml, hashes it, copies to:
+#     pack/mods/  — the .pw.toml + JAR for packwiz
+#     server/mods/ — the JAR for the Minecraft server
+#     cdn/jars/    — the JAR for client downloads via Caddy
+#   Returns 0 on success.
+
+import_jar_as_mod() {
+    local jar_path="$1"
+    local slug_override="${2:-}"
+
+    [[ -f "$jar_path" ]] || { log FAIL "JAR not found: ${jar_path}"; return 1; }
+
+    local jar_filename
+    jar_filename=$(basename "$jar_path")
+
+    # Derive slug from filename: strip version suffix + .jar, lowercase
+    local slug
+    if [[ -n "$slug_override" ]]; then
+        slug="$slug_override"
+    else
+        slug=$(echo "$jar_filename" | sed 's/\.jar$//; s/[-_][0-9].*$//' | tr '[:upper:]' '[:lower:]' | tr ' _' '-')
+    fi
+
+    # Skip if already installed via Modrinth/CurseForge
+    local existing_toml="${PACK_DIR}/mods/${slug}.pw.toml"
+    if [[ -f "$existing_toml" ]]; then
+        if grep -q '\[update\.modrinth\]\|\[update\.curseforge\]' "$existing_toml" 2>/dev/null; then
+            log SKIP "${slug} — already installed from Modrinth/CurseForge"
+            return 2
+        fi
+    fi
+
+    # Compute SHA256
+    local hash
+    hash=$(sha256sum "$jar_path" | cut -d' ' -f1) || { log FAIL "hash failed for ${jar_filename}"; return 1; }
+
+    # Resolve CDN base URL for download URL
+    local parent; parent=$(dirname "$PACK_DIR")
+    local cdn_base=""
+    local download_url=""
+    if [[ -n "$LOCAL_MODS_URL" ]]; then
+        download_url="${LOCAL_MODS_URL}/${jar_filename}"
+    else
+        cdn_base=$(resolve_cdn_base_url "" 2>/dev/null || echo "")
+        if [[ -n "$cdn_base" ]]; then
+            download_url="${cdn_base}/jars/${jar_filename}"
+        else
+            download_url="http://localhost:8080/jars/${jar_filename}"
+            log WARN "No CDN_DOMAIN or LOCAL_MODS_URL — using localhost URL"
+        fi
+    fi
+
+    # Generate .pw.toml
+    local toml_path="${PACK_DIR}/mods/${slug}.pw.toml"
+    cat > "$toml_path" << TOML
+name = "${slug}"
+filename = "${jar_filename}"
+side = "both"
+
+[download]
+url = "${download_url}"
+hash-format = "sha256"
+hash = "${hash}"
+TOML
+
+    # Copy JAR to pack/mods/ (for packwiz serve + distribution)
+    cp "$jar_path" "${PACK_DIR}/mods/${jar_filename}" 2>/dev/null || true
+
+    # Copy to server/mods/ if the directory exists
+    local server_mods="${parent}/server/mods"
+    if [[ -d "${parent}/server" ]]; then
+        mkdir -p "$server_mods"
+        cp "$jar_path" "${server_mods}/${jar_filename}" 2>/dev/null || true
+    fi
+
+    # Copy to cdn/jars/ for client downloads
+    local cdn_jars="${parent}/cdn/jars"
+    mkdir -p "$cdn_jars"
+    cp "$jar_path" "${cdn_jars}/${jar_filename}" 2>/dev/null || true
+
+    log OK "${slug} → ${jar_filename}"
+    log DEP "  pack/mods/ + server/mods/ + cdn/jars/"
+    return 0
+}
+
+# ============================================================================
+# STAGE — batch-match JARs in staging/ against unresolved mods
+# ============================================================================
+
+cmd_stage() {
+    check_packwiz; check_pack_init
+    header "Staging — Batch Import JARs"
+
+    # Create staging dir if needed
+    mkdir -p "$STAGING_DIR"
+
+    # Check for JARs
+    local jars=()
+    while IFS= read -r -d '' f; do
+        jars+=("$f")
+    done < <(find "$STAGING_DIR" -maxdepth 1 -name "*.jar" -print0 2>/dev/null)
+
+    if (( ${#jars[@]} == 0 )); then
+        echo -e "  ${DIM}No JAR files found in:${NC} ${CYAN}${STAGING_DIR}/${NC}"
+        echo ""
+        echo -e "  Drop .jar files into that directory, then run ${BOLD}pm stage${NC} again."
+        echo -e "  JARs are fuzzy-matched against your unresolved mods list."
+        echo ""
+        return 0
+    fi
+
+    log INFO "Found ${#jars[@]} JAR(s) in staging/"
+
+    # Load unresolved mods (if any)
+    local -A unresolved_slugs
+    local unresolved_count=0
+    if [[ -f "$UNRESOLVED_FILE" ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            local uslug
+            uslug=$(echo "$line" | sed 's/\s*#.*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [[ -z "$uslug" ]] && continue
+            local norm; norm=$(normalize_slug "$uslug")
+            unresolved_slugs["$norm"]="$uslug"
+            (( unresolved_count++ ))
+        done < "$UNRESOLVED_FILE"
+    fi
+
+    local matched=0 unmatched=0 skipped=0
+    local matched_files=()
+
+    echo ""
+    for jar in "${jars[@]}"; do
+        local jar_name; jar_name=$(basename "$jar")
+        # Derive a normalized form from the filename for matching
+        local jar_slug; jar_slug=$(echo "$jar_name" | sed 's/\.jar$//; s/[-_][0-9].*$//' | tr '[:upper:]' '[:lower:]' | tr ' _' '-')
+        local jar_norm; jar_norm=$(normalize_slug "$jar_slug")
+
+        # Try exact match against unresolved
+        local resolved_slug=""
+        if [[ -n "${unresolved_slugs[$jar_norm]+_}" ]]; then
+            resolved_slug="${unresolved_slugs[$jar_norm]}"
+        else
+            # Fuzzy: check if any unresolved slug is a substring of the JAR name or vice versa
+            for norm in "${!unresolved_slugs[@]}"; do
+                if [[ "$jar_norm" == *"$norm"* || "$norm" == *"$jar_norm"* ]]; then
+                    resolved_slug="${unresolved_slugs[$norm]}"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -n "$resolved_slug" ]]; then
+            # Matched an unresolved mod — import it
+            if import_jar_as_mod "$jar" "$resolved_slug"; then
+                (( matched++ ))
+                matched_files+=("$jar")
+                # Remove from unresolved.txt
+                local escaped; escaped=$(printf '%s\n' "$resolved_slug" | sed 's/[][\\/.^$*]/\\&/g')
+                sed -i "/^${escaped}\b/d" "$UNRESOLVED_FILE" 2>/dev/null || true
+                # Add to mods.txt as local: if not already there
+                if ! is_in_modlist "$resolved_slug"; then
+                    append_to_modlist "local:${resolved_slug}" "imported from staging/"
+                fi
+                # Remove the normalized key so it can't double-match
+                unset "unresolved_slugs[$(normalize_slug "$resolved_slug")]"
+            else
+                (( skipped++ ))
+            fi
+        else
+            # No unresolved match — offer to import anyway
+            echo -e "  ${YELLOW}?${NC} ${BOLD}${jar_name}${NC} — no unresolved match (slug: ${jar_slug})"
+            echo -ne "    Import anyway? (y/N/s=slug override): "
+            read -r answer
+            case "$answer" in
+                [yY])
+                    if import_jar_as_mod "$jar" ""; then
+                        (( matched++ ))
+                        matched_files+=("$jar")
+                        local auto_slug; auto_slug=$(echo "$jar_name" | sed 's/\.jar$//; s/[-_][0-9].*$//' | tr '[:upper:]' '[:lower:]' | tr ' _' '-')
+                        is_in_modlist "$auto_slug" || append_to_modlist "local:${auto_slug}" "imported from staging/"
+                    fi
+                    ;;
+                s*|S*)
+                    # User wants to specify a slug
+                    echo -ne "    Enter slug: "
+                    read -r custom_slug
+                    if [[ -n "$custom_slug" ]]; then
+                        if import_jar_as_mod "$jar" "$custom_slug"; then
+                            (( matched++ ))
+                            matched_files+=("$jar")
+                            is_in_modlist "$custom_slug" || append_to_modlist "local:${custom_slug}" "imported from staging/"
+                        fi
+                    fi
+                    ;;
+                *)
+                    (( unmatched++ ))
+                    ;;
+            esac
+        fi
+    done
+
+    # Clean up — remove matched JARs from staging/
+    if (( ${#matched_files[@]} > 0 )); then
+        echo ""
+        echo -ne "  Remove ${#matched_files[@]} matched JAR(s) from staging/? (Y/n): "
+        read -r cleanup
+        if [[ "$cleanup" != [nN] ]]; then
+            for f in "${matched_files[@]}"; do
+                rm -f "$f"
+            done
+            log OK "Cleaned up staging/"
+        fi
+    fi
+
+    # Refresh packwiz index
+    $PACKWIZ_BIN refresh 2>>"$RUN_LOG" || true
+
+    # Summary
+    separator
+    echo ""
+    echo -e "  ${BOLD}Staging Summary${NC}"
+    echo -e "  Total JARs:    ${BOLD}${#jars[@]}${NC}"
+    echo -e "  Matched:       ${GREEN}${matched}${NC}"
+    echo -e "  Skipped:       ${CYAN}${skipped}${NC}"
+    echo -e "  Unmatched:     ${YELLOW}${unmatched}${NC}"
+    if (( unresolved_count > 0 )); then
+        local remaining=0
+        [[ -f "$UNRESOLVED_FILE" ]] && remaining=$(grep -cvE '^\s*(#|$)' "$UNRESOLVED_FILE" 2>/dev/null || echo 0)
+        echo -e "  Still unresolved: ${RED}${remaining}${NC}"
+    fi
+    echo ""
+}
+
+# ============================================================================
+# ADD FILE — import a single JAR as a self-hosted mod
+# ============================================================================
+#   pm add file:/path/to/my-mod.jar
+#   pm add file:/path/to/my-mod.jar --slug custom-name
+
+cmd_add_file() {
+    check_packwiz; check_pack_init
+    local jar_path="$1"
+    local slug_override="${2:-}"
+
+    # Expand ~ if present
+    jar_path="${jar_path/#\~/$HOME}"
+
+    if [[ ! -f "$jar_path" ]]; then
+        log FAIL "File not found: ${jar_path}"
+        echo -e "  ${DIM}Usage: pm add file:/path/to/mod.jar${NC}"
+        return 1
+    fi
+
+    local jar_name; jar_name=$(basename "$jar_path")
+    header "Adding JAR: ${jar_name}"
+
+    if import_jar_as_mod "$jar_path" "$slug_override"; then
+        local slug
+        if [[ -n "$slug_override" ]]; then
+            slug="$slug_override"
+        else
+            slug=$(echo "$jar_name" | sed 's/\.jar$//; s/[-_][0-9].*$//' | tr '[:upper:]' '[:lower:]' | tr ' _' '-')
+        fi
+
+        # Add to mods.txt if not there
+        if ! is_in_modlist "$slug"; then
+            append_to_modlist "local:${slug}" "added via file"
+            log INFO "Added to mods.txt as local:${slug}"
+        fi
+
+        # Remove from unresolved if present
+        if is_unresolved "$slug"; then
+            local escaped; escaped=$(printf '%s\n' "$slug" | sed 's/[][\\/.^$*]/\\&/g')
+            sed -i "/^${escaped}\b/d" "$UNRESOLVED_FILE" 2>/dev/null || true
+            log INFO "Removed from unresolved.txt"
+        fi
+
+        $PACKWIZ_BIN refresh 2>>"$RUN_LOG" || true
+        echo ""
+        echo -e "  ${GREEN}${BOLD}Done!${NC} ${slug} is installed as a self-hosted mod."
+        echo -e "  ${DIM}Clients will download it from your CDN/server.${NC}"
+        echo ""
+    fi
+}
+
+# ============================================================================
+# CURSEFORGE IMPORT (packwiz native)
+# ============================================================================
+
+cmd_cf_import() {
     check_packwiz; check_pack_init
     local path="${1:?Usage: pm import <path-to-zip>}"
     header "Importing CurseForge Pack"
@@ -4227,11 +4555,13 @@ cmd_help() {
     sync                           Install all mods from mods.txt
     update                         Update all non-pinned mods
     add [slug...]                  Add mods (no args = interactive)
+    add file:/path/to/mod.jar      Add a single JAR as self-hosted mod
     remove <slug>                  Remove a mod from pack + mods.txt
     list [--side <s>] [--version]  Show installed mods (--native for raw packwiz)
     status                         Pack health overview
     deps                           Show auto-pulled dependencies
     search <query>                 Search Modrinth/CurseForge by name/slug
+    stage                          Batch-match JARs in staging/ vs unresolved
     refresh [--build]              Refresh index (--build for distribution)
     serve                          Local HTTP dev server (localhost:8080)
 
@@ -4300,6 +4630,7 @@ cmd_help() {
     cf:journeymap                  CurseForge only
     url:https://dl.com/mod.jar     Direct download URL
     local:my-custom-mod            Local JAR from LOCAL_MODS_DIR
+    file:/path/to/mod.jar          Import JAR file directly (auto-hashes)
     !jei                           Pinned (skip updates in pm update)
     https://modrinth.com/mod/slug  Full Modrinth URL
     https://curseforge.com/...     Full CurseForge URL (page or file)
@@ -4313,6 +4644,9 @@ cmd_help() {
     pm add cf:journeymap mr:jade
     pm add url:https://example.com/custom-mod.jar
     pm add local:my-fork                       # from LOCAL_MODS_DIR
+    pm add file:~/Downloads/my-mod-1.0.jar     # import JAR directly
+    pm add file:/path/to/mod.jar --slug name   # import with custom slug
+    pm stage                                   # match staging/ JARs → unresolved
     pm list --side server                      # server-only mods
     pm export mr server                        # Modrinth server pack
     pm pin jei                                 # lock JEI version
@@ -4364,7 +4698,8 @@ main() {
         unpin)             cmd_unpin "${1:-}" ;;
         migrate|mig)       cmd_migrate "$@" ;;
         settings|set)      cmd_settings "$@" ;;
-        import)            cmd_import "${1:-}" ;;
+        import)            cmd_cf_import "${1:-}" ;;
+        stage|staging)     cmd_stage ;;
         detect)            cmd_detect ;;
         open)              cmd_open "${1:-}" ;;
         markdown|md)       cmd_markdown ;;

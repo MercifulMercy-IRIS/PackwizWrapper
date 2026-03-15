@@ -330,7 +330,7 @@ _pm_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    commands="init organize sync update add remove list status deps search refresh export serve pin unpin migrate settings import detect open markdown targets deploy doctor verify diff aliases unresolved config publish self-update update-status start stop restart kill logs console backup destroy help"
+    commands="init organize sync update add remove list status deps search stage refresh export serve pin unpin migrate settings import detect open markdown targets deploy doctor verify diff aliases unresolved config publish self-update update-status start stop restart kill logs console backup destroy help"
 
     case "$prev" in
         pm)
@@ -418,11 +418,19 @@ _pm_completions() {
             return 0
             ;;
         add|a)
-            # Complete with mods.txt entries that aren't installed yet
-            if [[ -f "mods.txt" ]]; then
+            # Complete with mods.txt entries, or file: prefix for JAR import
+            if [[ "$cur" == file:* ]]; then
+                # Complete file paths after file: prefix
+                local path_part="${cur#file:}"
+                local completions
+                completions=$(compgen -f -- "$path_part" 2>/dev/null)
+                COMPREPLY=($(printf "file:%s\n" $completions))
+            elif [[ -f "mods.txt" ]]; then
                 local slugs
                 slugs=$(grep -vE '^\s*#|^\s*$' mods.txt | sed 's/\s*#.*$//;s/^!//;s/^mr://;s/^cf://;s/^url://;s/^local://' | xargs)
-                COMPREPLY=($(compgen -W "$slugs" -- "$cur"))
+                COMPREPLY=($(compgen -W "$slugs file:" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "file:" -- "$cur"))
             fi
             return 0
             ;;
