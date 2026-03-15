@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Any
 
 import click
@@ -87,7 +88,7 @@ class ElmGroup(click.Group):
             "Mods": [
                 ("add <slug...>", "Add one or more mods"),
                 ("rm <slug...>", "Remove mods"),
-                ("update [slug]", "Update a mod or all mods"),
+                ("up [slug]", "Update one or all mods"),
                 ("sync", "Sync mods from mods.txt"),
                 ("ls", "List installed mods"),
                 ("search <query>", "Search for mods"),
@@ -95,6 +96,7 @@ class ElmGroup(click.Group):
             "Pack": [
                 ("init", "Initialize a new packwiz pack"),
                 ("refresh [--build]", "Refresh pack index (sha256)"),
+                ("update", "Self-update ELM from GitHub"),
             ],
             "Servers": [
                 ("deploy setup", "Interactive Pelican Panel setup"),
@@ -116,7 +118,9 @@ class ElmGroup(click.Group):
         for section, cmds in sections.items():
             console.print(f"\n  [bold]{section}[/bold]")
             for cmd, desc in cmds:
-                console.print(f"    [cyan]elm {cmd:<35}[/cyan] {desc}")
+                from rich.markup import escape
+                padded = f"elm {cmd}".ljust(39)
+                console.print(f"    [cyan]{escape(padded)}[/cyan] {desc}")
 
         console.print("\n  [dim]Run[/dim] elm <command> --help [dim]for details[/dim]\n")
 
@@ -230,10 +234,10 @@ def rm(ctx: click.Context, slugs: tuple[str, ...]) -> None:
         safe_refresh(cfg)
 
 
-@_original_main.command()
+@_original_main.command(name="up")
 @click.argument("slug", required=False, default="")
 @click.pass_context
-def update(ctx: click.Context, slug: str) -> None:
+def up(ctx: click.Context, slug: str) -> None:
     """Update a mod, or all mods."""
     from elm.packwiz import update_mod, safe_refresh, PackwizError
 
@@ -365,6 +369,90 @@ def init_pack(ctx: click.Context) -> None:
         if e.stderr.strip():
             _hint(e.stderr.strip().splitlines()[0][:100])
         sys.exit(1)
+
+
+# ── Self-update ───────────────────────────────────────────────────────────
+
+
+@_original_main.command()
+@click.pass_context
+def update(ctx: click.Context) -> None:
+    """Self-update ELM from GitHub."""
+    import subprocess
+    import tempfile
+    import shutil
+
+    cfg = _get_cfg(ctx)
+    _header("Self-Update")
+
+    repo = cfg.get("ELM_GITHUB_REPO")
+    if not repo:
+        _fail("ELM_GITHUB_REPO not set.")
+        _hint("Set it in your config (elm config set ELM_GITHUB_REPO youruser/repo)")
+        return
+
+    branch = cfg.get("ELM_GITHUB_BRANCH") or "main"
+    gh_path = cfg.get("ELM_GITHUB_PATH") or ""
+    update_files = (cfg.get("ELM_UPDATE_FILES") or "elm.sh install.sh elm.conf mods.txt").split()
+
+    base_url = f"https://raw.githubusercontent.com/{repo}/{branch}"
+    if gh_path:
+        base_url = f"{base_url}/{gh_path.strip('/')}"
+
+    _info(f"Repo: [cyan]{repo}[/cyan]  Branch: [cyan]{branch}[/cyan]")
+
+    updated = 0
+    skipped = 0
+    errors = 0
+
+    for filename in update_files:
+        url = f"{base_url}/{filename}"
+        try:
+            with console.status(f"  Fetching [cyan]{filename}[/cyan]..."):
+                result = subprocess.run(
+                    ["curl", "-fsSL", "--connect-timeout", "10", url],
+                    capture_output=True,
+                    text=True,
+                )
+
+            if result.returncode != 0:
+                _warn(f"Could not fetch {filename}")
+                errors += 1
+                continue
+
+            dest = cfg.pack_dir / filename
+            if dest.is_file() and dest.read_text() == result.stdout:
+                skipped += 1
+                continue
+
+            # Write via temp file for atomicity
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=dest.parent, prefix=f".{filename}.", delete=False
+            ) as tmp:
+                tmp.write(result.stdout)
+                tmp_path = Path(tmp.name)
+
+            # Preserve permissions if the file existed
+            if dest.is_file():
+                shutil.copymode(dest, tmp_path)
+
+            tmp_path.replace(dest)
+            _ok(f"Updated [cyan]{filename}[/cyan]")
+            updated += 1
+
+        except Exception as exc:
+            _fail(f"Error updating {filename}: {exc}")
+            errors += 1
+
+    console.print()
+    if updated:
+        _ok(f"{updated} file{'s' if updated != 1 else ''} updated")
+    if skipped:
+        _info(f"{skipped} file{'s' if skipped != 1 else ''} already up to date")
+    if errors:
+        _warn(f"{errors} file{'s' if errors != 1 else ''} failed")
+    if not updated and not errors:
+        _ok("Everything is up to date")
 
 
 # ── Deploy command group (Pelican) ────────────────────────────────────────
@@ -823,11 +911,12 @@ def key_rm(ctx: click.Context, provider: str) -> None:
 CONFIG_CATEGORIES = {
     "Minecraft": ["MC_VERSION", "LOADER", "LOADER_VERSION"],
     "Packwiz": ["PACKWIZ_BIN", "PREFER_SOURCE", "AUTO_DEPS", "AUTO_PUBLISH"],
-    "Server": ["SERVER_RAM", "SERVER_DISK", "SERVER_CPU", "SERVER_BASE_PORT",
-               "SERVER_RCON_BASE_PORT", "SERVER_DOMAIN", "SERVER_VM_IP"],
+    "Server": ["SERVER_IMAGE", "SERVER_RAM", "SERVER_DISK", "SERVER_CPU",
+               "SERVER_BASE_PORT", "SERVER_RCON_BASE_PORT", "SERVER_DOMAIN",
+               "SERVER_VM_IP"],
     "Pelican": ["PELICAN_URL", "PELICAN_NODE_ID", "PELICAN_EGG_ID",
                 "PELICAN_USER_ID", "PELICAN_NEST_ID"],
-    "CDN": ["CDN_DOMAIN", "CDN_COMPOSE_DIR"],
+    "CDN": ["CDN_DOMAIN", "CDN_COMPOSE_DIR", "PACK_HOST_URL"],
     "Updates": ["ELM_GITHUB_REPO", "ELM_GITHUB_BRANCH", "ELM_GITHUB_PATH",
                 "ELM_UPDATE_FILES"],
     "Network": ["RETRY_ATTEMPTS", "RETRY_DELAY"],
@@ -979,6 +1068,7 @@ def check(ctx: click.Context) -> None:
 
 _original_main.add_command(rm, "remove")
 _original_main.add_command(list_mods, "list")
+_original_main.add_command(update, "self-update")
 
 
 if __name__ == "__main__":

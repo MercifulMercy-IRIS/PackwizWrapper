@@ -26,6 +26,7 @@ DEFAULTS: dict[str, str] = {
     "AUTO_DEPS": "true",
     "AUTO_PUBLISH": "",
     # Server
+    "SERVER_IMAGE": "",
     "SERVER_RAM": "8192",
     "SERVER_DISK": "25600",
     "SERVER_CPU": "400",
@@ -39,9 +40,10 @@ DEFAULTS: dict[str, str] = {
     "PELICAN_EGG_ID": "",
     "PELICAN_USER_ID": "",
     "PELICAN_NEST_ID": "",
-    # CDN
+    # CDN / Pack hosting
     "CDN_DOMAIN": "",
     "CDN_COMPOSE_DIR": str(Path.home() / ".config" / "elm" / "servers"),
+    "PACK_HOST_URL": "",
     # Self-update
     "ELM_GITHUB_REPO": "",
     "ELM_GITHUB_BRANCH": "main",
@@ -52,6 +54,14 @@ DEFAULTS: dict[str, str] = {
     "LOCAL_MODS_URL": "",
     # CurseForge
     "CURSEFORGE_API_KEY": "",
+}
+
+# Legacy PM_ prefix → ELM_ equivalents (backwards compatibility)
+_LEGACY_ALIASES: dict[str, str] = {
+    "PM_GITHUB_REPO": "ELM_GITHUB_REPO",
+    "PM_GITHUB_BRANCH": "ELM_GITHUB_BRANCH",
+    "PM_GITHUB_PATH": "ELM_GITHUB_PATH",
+    "PM_UPDATE_FILES": "ELM_UPDATE_FILES",
 }
 
 CONFIG_DIR = Path.home() / ".config" / "elm"
@@ -238,6 +248,13 @@ def discover_pack_dir(start: Path) -> Path:
     return start
 
 
+def _apply_legacy_aliases(values: dict[str, str]) -> None:
+    """Map old PM_ prefixed keys to their ELM_ equivalents."""
+    for old_key, new_key in _LEGACY_ALIASES.items():
+        if old_key in values and not values.get(new_key):
+            values[new_key] = values[old_key]
+
+
 def load_config(cwd: Path | None = None) -> Config:
     """Load configuration with full priority cascade."""
     cwd = cwd or Path.cwd()
@@ -245,12 +262,20 @@ def load_config(cwd: Path | None = None) -> Config:
     # Start with defaults
     values = dict(DEFAULTS)
 
-    # Load global config
+    # Load global config — try elm.conf, fall back to packmanager.conf
     global_conf = CONFIG_DIR / "elm.conf"
+    if not global_conf.is_file():
+        pm_conf = CONFIG_DIR / "packmanager.conf"
+        if pm_conf.is_file():
+            global_conf = pm_conf
     values.update(_parse_bash_conf(global_conf))
 
-    # Load local config (in cwd)
+    # Load local config (in cwd) — try elm.conf, fall back to packmanager.conf
     local_conf = cwd / "elm.conf"
+    if not local_conf.is_file():
+        pm_local = cwd / "packmanager.conf"
+        if pm_local.is_file():
+            local_conf = pm_local
     values.update(_parse_bash_conf(local_conf))
 
     # Load keys
@@ -266,6 +291,9 @@ def load_config(cwd: Path | None = None) -> Config:
     pack_conf = pack_dir / "elm.conf"
     if pack_conf.is_file() and pack_conf != local_conf:
         values.update(_parse_bash_conf(pack_conf))
+
+    # Apply legacy PM_ → ELM_ aliases
+    _apply_legacy_aliases(values)
 
     # Setup logging
     log_dir = pack_dir / ".logs"
