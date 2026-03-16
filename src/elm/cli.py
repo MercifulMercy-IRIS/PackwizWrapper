@@ -1706,16 +1706,27 @@ def deps_install(ctx: click.Context, name: str) -> None:
         app_url = click.prompt("  Panel URL (e.g. https://panel.example.com)")
         db_pass = click.prompt("  Database password", default="pelican_secret")
 
+        # HTTPS URLs run behind a reverse proxy — panel listens on a local port
+        is_https = app_url.startswith("https://")
+        if is_https:
+            ports = '      - "127.0.0.1:8443:80"'
+            ssl_env = '      APP_TRUSTED_PROXIES: "*"\n'
+            _info("HTTPS detected — panel will listen on localhost:8443")
+            _hint("Point your reverse proxy (Caddy/Nginx) at 127.0.0.1:8443")
+        else:
+            ports = '      - "80:80"'
+            ssl_env = ""
+
         compose = (
             "services:\n"
             "  panel:\n"
             "    image: ghcr.io/pelican-dev/panel:latest\n"
             "    restart: unless-stopped\n"
             "    ports:\n"
-            '      - "80:80"\n'
-            '      - "443:443"\n'
+            f"{ports}\n"
             "    environment:\n"
             f'      APP_URL: "{app_url}"\n'
+            f"{ssl_env}"
             '      DB_HOST: "db"\n'
             '      DB_PORT: "3306"\n'
             '      DB_DATABASE: "pelican"\n'
