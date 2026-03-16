@@ -30,7 +30,12 @@ from elm import __version__
 from elm.config import (
     Config,
     load_config,
+    load_packs,
     load_targets,
+    pack_get_path,
+    pack_list,
+    pack_register,
+    pack_remove,
     target_list,
     target_remove,
     target_set,
@@ -117,10 +122,12 @@ class ElmGroup(click.Group):
                 ("deps ls", "List dependencies and status"),
             ],
             "Config": [
+                ("pack register/ls/rm", "Manage pack directories"),
                 ("target add/ls/rm/show", "Manage deployment targets"),
                 ("key set/show/rm", "Manage API keys"),
                 ("config show/set/get", "View & edit configuration"),
                 ("check", "Run diagnostics"),
+                ("-p NAME <command>", "Run against a registered pack"),
             ],
         }
 
@@ -152,11 +159,20 @@ class SubGroup(click.Group):
 
 @click.group(cls=ElmGroup, invoke_without_command=True)
 @click.version_option(__version__, prog_name="elm")
+@click.option("-p", "--pack", "pack_name", default="", help="Use a registered pack by name")
 @click.pass_context
-def main(ctx: click.Context) -> None:
+def main(ctx: click.Context, pack_name: str) -> None:
     """ELM — EnviousLabs Minecraft CLI."""
     try:
-        ctx.obj = load_config()
+        cwd = None
+        if pack_name:
+            cwd = pack_get_path(pack_name)
+            if not cwd:
+                _fail(f"Pack [cyan]{pack_name}[/cyan] not found in registry")
+                _hint("List packs: elm pack ls")
+                ctx.exit(1)
+                return
+        ctx.obj = load_config(cwd=cwd)
     except Exception as exc:
         _fail(f"Could not load config: {exc}")
         ctx.exit(1)
@@ -442,11 +458,16 @@ def init_pack(ctx: click.Context, name: str, author: str, mc_version: str, loade
             _init(cfg, name=name, author=author, mc_version=mc_version, loader=loader)
         _ok(f"Pack created: [cyan]{name}[/cyan] ({mc_version} / {loader})")
         safe_refresh(cfg)
+
+        # Auto-register in pack registry
+        pack_register(name, cfg.pack_dir, mc_version=mc_version, loader=loader)
+        _ok(f"Registered as [cyan]{name}[/cyan]")
+
         console.print()
         _hint("Next steps:")
         _hint(f"  elm add <mod>    Install your first mod")
         _hint(f"  elm sync         Sync mods from mods.txt")
-        _hint(f"  elm search <q>   Find mods to install")
+        _hint(f"  elm -p {name} <cmd>  Use from anywhere")
     except PackwizError as e:
         _fail("Init failed")
         if e.friendly_hint:
@@ -1175,6 +1196,99 @@ def info(ctx: click.Context) -> None:
     else:
         _warn("No PACK_HOST_URL configured")
         _hint("Run: elm cdn setup  or  elm config set PACK_HOST_URL <url>")
+
+
+# ── Pack registry ─────────────────────────────────────────────────────────
+
+
+@_original_main.group(name="pack", cls=SubGroup)
+@click.pass_context
+def pack_group(ctx: click.Context) -> None:
+    """Manage registered pack directories."""
+
+
+@pack_group.command(name="register")
+@click.argument("name", required=False, default="")
+@click.option("-d", "--dir", "pack_dir", default="", help="Pack directory (default: current)")
+@click.pass_context
+def pack_reg(ctx: click.Context, name: str, pack_dir: str) -> None:
+    """Register a pack directory so elm can find it from anywhere.
+
+    \b
+    Examples:
+      elm pack register                    Register current dir with auto name
+      elm pack register mypack             Register current dir as 'mypack'
+      elm pack register mypack -d /path    Register a specific directory
+    """
+    cfg = _get_cfg(ctx)
+    directory = Path(pack_dir) if pack_dir else cfg.pack_dir
+    directory = directory.resolve()
+
+    pack_toml = directory / "pack.toml"
+    if not pack_toml.is_file():
+        _fail(f"No pack.toml found in [dim]{directory}[/dim]")
+        _hint("Initialize a pack first: elm init")
+        return
+
+    if not name:
+        name = directory.name
+
+    pack_register(name, directory, mc_version=cfg.mc_version, loader=cfg.loader)
+    _ok(f"Registered [cyan]{name}[/cyan] \u2192 [dim]{directory}[/dim]")
+    _hint(f"Use from anywhere: elm -p {name} <command>")
+
+
+@pack_group.command(name="ls")
+@click.pass_context
+def pack_ls(ctx: click.Context) -> None:
+    """List all registered packs."""
+    packs = load_packs()
+    if not packs:
+        _header("Registered Packs")
+        _info("No packs registered yet.")
+        _hint("Register one: elm pack register [name]")
+        return
+
+    table = Table(
+        title=f"Registered Packs ({len(packs)})",
+        border_style="dim",
+        padding=(0, 1),
+    )
+    table.add_column("Name", style="cyan bold")
+    table.add_column("Path")
+    table.add_column("MC", justify="center")
+    table.add_column("Loader", justify="center")
+    table.add_column("", width=6)
+
+    for name, data in packs.items():
+        p = Path(data.get("path", ""))
+        exists = (p / "pack.toml").is_file() if p.is_dir() else False
+        status = "[green]OK[/green]" if exists else "[red]![/red]"
+        table.add_row(
+            name,
+            str(data.get("path", "")),
+            data.get("mc_version", ""),
+            data.get("loader", ""),
+            status,
+        )
+    console.print()
+    console.print(table)
+
+
+@pack_group.command(name="rm")
+@click.argument("name")
+@click.pass_context
+def pack_rm(ctx: click.Context, name: str) -> None:
+    """Unregister a pack."""
+    packs = load_packs()
+    if name not in packs:
+        _fail(f"Pack [cyan]{name}[/cyan] not found")
+        existing = pack_list()
+        if existing:
+            _hint(f"Available: {', '.join(existing)}")
+        return
+    pack_remove(name)
+    _ok(f"Unregistered [cyan]{name}[/cyan]")
 
 
 # ── Target management ─────────────────────────────────────────────────────

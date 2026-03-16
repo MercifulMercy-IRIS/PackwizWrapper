@@ -67,6 +67,7 @@ _LEGACY_ALIASES: dict[str, str] = {
 CONFIG_DIR = Path.home() / ".config" / "elm"
 KEYS_FILE = CONFIG_DIR / "keys.conf"
 TARGETS_FILE = CONFIG_DIR / "targets.json"
+PACKS_FILE = CONFIG_DIR / "packs.json"
 DNS_CONF = CONFIG_DIR / "dns.conf"
 
 
@@ -364,3 +365,51 @@ def target_remove(name: str) -> None:
 def target_list() -> list[str]:
     """List all target names."""
     return list(load_targets().keys())
+
+
+# ── Pack registry ────────────────────────────────────────────────────────
+
+def load_packs() -> dict[str, dict[str, Any]]:
+    """Load packs.json registry."""
+    PACKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not PACKS_FILE.is_file():
+        return {}
+    try:
+        return json.loads(PACKS_FILE.read_text())
+    except (json.JSONDecodeError, ValueError):
+        return {}
+
+
+def save_packs(packs: dict[str, dict[str, Any]]) -> None:
+    """Write packs.json."""
+    PACKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PACKS_FILE.write_text(json.dumps(packs, indent=2) + "\n")
+
+
+def pack_register(name: str, path: Path, **fields: Any) -> None:
+    """Register a pack directory by name."""
+    packs = load_packs()
+    packs[name] = {"path": str(path.resolve()), **fields}
+    save_packs(packs)
+
+
+def pack_remove(name: str) -> None:
+    """Remove a pack from the registry."""
+    packs = load_packs()
+    packs.pop(name, None)
+    save_packs(packs)
+
+
+def pack_get_path(name: str) -> Path | None:
+    """Get the directory for a registered pack, or None."""
+    packs = load_packs()
+    entry = packs.get(name)
+    if not entry:
+        return None
+    p = Path(entry["path"])
+    return p if p.is_dir() else None
+
+
+def pack_list() -> list[str]:
+    """List all registered pack names."""
+    return list(load_packs().keys())
