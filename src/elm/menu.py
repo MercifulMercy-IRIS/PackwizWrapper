@@ -47,26 +47,15 @@ def _ansi_strip(s: str) -> str:
     return _ANSI_RE.sub("", s)
 
 
-def _main_entry(num: int, name: str, color: str, count: int) -> str:
-    """Build a styled main-menu category entry."""
+def _main_entry(num: int, name: str, count: int) -> str:
+    """Build a plain main-menu category entry."""
     n_label = f"{count} option{'s' if count != 1 else ''}"
-    return (
-        f"  {_BOLD}{color}[{num}]{_RESET}  "
-        f"{_BOLD}{name:<16}{_RESET}"
-        f"{_DIM}{n_label}{_RESET}"
-    )
+    return f"  [{num}]  {name:<16}{n_label}"
 
 
-def _sub_header(name: str, color: str) -> str:
-    """Build a styled sub-menu header."""
-    line = "\u2500" * (24 - len(name))
-    return f"  {_BOLD}{color}\u250c\u2500 {name} {_RESET}{_DIM}{line}{_RESET}"
-
-
-def _sub_item(num: int, label: str, color: str, last: bool = False) -> str:
-    """Build a styled sub-menu item with numbered shortcut and sidebar."""
-    corner = "\u2514" if last else "\u2502"
-    return f"  {_DIM}{color}{corner}{_RESET}  {_BOLD}[{num}]{_RESET}  {label}"
+def _sub_item(num: int, label: str) -> str:
+    """Build a plain sub-menu item with numbered shortcut."""
+    return f"  [{num}]  {label}"
 
 
 def _pick(title: str, items: list[str]) -> int | None:
@@ -1286,13 +1275,14 @@ SECTIONS: list[tuple[str, str, list[tuple[str, Any]]]] = [
 
 def _run_sub_menu(cfg: Config, name: str, color: str, items: list[tuple[str, Any]]) -> None:
     """Run a numbered sub-menu for a single section."""
-    # Build sub-menu display list
-    sub_entries: list[str] = [_sub_header(name, color)]
+    sub_entries: list[str] = []
     for j, (label, _) in enumerate(items):
-        last = j == len(items) - 1
-        sub_entries.append(_sub_item(j + 1, label, color, last=last))
-    sub_entries.append("")
-    sub_entries.append(f"  {_DIM}[0]{_RESET}  {_DIM}\u2190 Back{_RESET}")
+        sub_entries.append(_sub_item(j + 1, label))
+    sub_entries.append("  [0]  Back")
+
+    # Print the section header with Rich (outside the menu)
+    line = "\u2500" * (26 - len(name))
+    console.print(f"\n  [bold]{name}[/bold] [dim]{line}[/dim]\n")
 
     while True:
         try:
@@ -1302,10 +1292,7 @@ def _run_sub_menu(cfg: Config, name: str, color: str, items: list[tuple[str, Any
                 menu_cursor="  \u276f ",
                 menu_cursor_style=("fg_cyan", "bold"),
                 menu_highlight_style=("fg_cyan", "bold"),
-                shortcut_key_highlight_style=("fg_cyan", "bold"),
-                skip_empty_entries=True,
-                status_bar=f"  {_DIM}\u2191\u2193 navigate  \u23ce select  0 back{_RESET}",
-                status_bar_style=("fg_gray",),
+                shortcut_key_highlight_style=("fg_cyan",),
             )
             idx = menu.show()
         except OSError:
@@ -1314,18 +1301,13 @@ def _run_sub_menu(cfg: Config, name: str, color: str, items: list[tuple[str, Any
         if idx is None:
             return
 
-        # Header row (index 0) — skip
-        if idx == 0:
-            continue
-
         # Back (last entry)
         if idx == len(sub_entries) - 1:
             return
 
-        # Action items are at indices 1..len(items)
-        action_idx = idx - 1
-        if 0 <= action_idx < len(items):
-            _, handler = items[action_idx]
+        # Action items
+        if 0 <= idx < len(items):
+            _, handler = items[idx]
             console.print()
             try:
                 handler(cfg)
@@ -1385,9 +1367,8 @@ def run_menu(cfg: Config) -> None:
     # Build main menu
     main_entries: list[str] = []
     for i, (name, color, items) in enumerate(SECTIONS, 1):
-        main_entries.append(_main_entry(i, name, color, len(items)))
-    main_entries.append("")
-    main_entries.append(f"  {_DIM}[q]  Quit{_RESET}")
+        main_entries.append(_main_entry(i, name, len(items)))
+    main_entries.append("  [q]  Quit")
 
     while True:
         try:
@@ -1397,10 +1378,7 @@ def run_menu(cfg: Config) -> None:
                 menu_cursor="  \u276f ",
                 menu_cursor_style=("fg_cyan", "bold"),
                 menu_highlight_style=("fg_cyan", "bold"),
-                shortcut_key_highlight_style=("fg_cyan", "bold"),
-                skip_empty_entries=True,
-                status_bar=f"  {_DIM}\u2191\u2193 navigate  \u23ce select  q quit{_RESET}",
-                status_bar_style=("fg_gray",),
+                shortcut_key_highlight_style=("fg_cyan",),
             )
             idx = menu.show()
         except OSError:
