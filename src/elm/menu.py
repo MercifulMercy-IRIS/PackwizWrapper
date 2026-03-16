@@ -6,6 +6,7 @@ Arrow-key navigable, categorized, plain-English labels.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -25,54 +26,99 @@ from elm.config import (
 from elm.ui import console, _fail, _ok, _warn, _info, _hint, _header
 
 
+# ── ANSI helpers ────────────────────────────────────────────────────────
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+# ANSI escape sequences for menu styling
+_BOLD = "\033[1m"
+_DIM = "\033[2m"
+_RESET = "\033[0m"
+_CYAN = "\033[36m"
+_GREEN = "\033[32m"
+_YELLOW = "\033[33m"
+_MAGENTA = "\033[35m"
+_BLUE = "\033[34m"
+_WHITE = "\033[37m"
+
+
+def _ansi_strip(s: str) -> str:
+    """Strip ANSI escape codes from a string."""
+    return _ANSI_RE.sub("", s)
+
+
+def _section(label: str, color: str) -> str:
+    """Build a styled section header for the menu."""
+    line = "\u2500" * (26 - len(label))
+    return f"  {_BOLD}{color}\u250c\u2500 {label} {_RESET}{_DIM}{line}{_RESET}"
+
+
+def _item(label: str, color: str) -> str:
+    """Build a styled menu item with a colored sidebar."""
+    return f"  {_DIM}{color}\u2502{_RESET}   {label}"
+
+
+def _last(label: str, color: str) -> str:
+    """Build the last item in a section with a corner."""
+    return f"  {_DIM}{color}\u2514{_RESET}   {label}"
+
+
 # ── Menu definition ──────────────────────────────────────────────────────
 
-# Category headers start with ── and are not selectable.
-# Selectable items are plain strings.
 MAIN_MENU: list[str] = [
-    "── Mods ──────────────────────",
-    "   Install a mod",
-    "   Remove a mod",
-    "   Update all mods",
-    "   Sync from mods.txt",
-    "   Show installed mods",
-    "   Search for a mod",
-    "── Modpack ───────────────────",
-    "   Create new modpack",
-    "   Refresh mod index",
-    "   Update ELM",
-    "── Servers ───────────────────",
-    "   Panel setup",
-    "   Create a server",
-    "   Start a server",
-    "   Stop a server",
-    "   Restart a server",
-    "   Server status",
-    "   Run console command",
-    "   Back up a server",
-    "   Delete a server",
-    "── Dependencies ──────────────",
-    "   Check all dependencies",
-    "   Install a dependency",
-    "── Settings ──────────────────",
-    "   View settings",
-    "   Change a setting",
-    "   Manage targets",
-    "   Manage API keys",
-    "   Run diagnostics",
-    "──────────────────────────────",
-    "   Quit",
+    _section("Mods", _CYAN),
+    _item("Install a mod", _CYAN),
+    _item("Remove a mod", _CYAN),
+    _item("Update all mods", _CYAN),
+    _item("Sync from mods.txt", _CYAN),
+    _item("Show installed mods", _CYAN),
+    _last("Search for a mod", _CYAN),
+    "",
+    _section("Modpack", _GREEN),
+    _item("Create new modpack", _GREEN),
+    _item("Refresh mod index", _GREEN),
+    _last("Update ELM", _GREEN),
+    "",
+    _section("Servers", _YELLOW),
+    _item("Panel setup", _YELLOW),
+    _item("Create a server", _YELLOW),
+    _item("Start a server", _YELLOW),
+    _item("Stop a server", _YELLOW),
+    _item("Restart a server", _YELLOW),
+    _item("Server status", _YELLOW),
+    _item("Run console command", _YELLOW),
+    _item("Back up a server", _YELLOW),
+    _last("Delete a server", _YELLOW),
+    "",
+    _section("CDN", _MAGENTA),
+    _item("CDN setup", _MAGENTA),
+    _item("Start CDN", _MAGENTA),
+    _item("Stop CDN", _MAGENTA),
+    _last("CDN status", _MAGENTA),
+    "",
+    _section("Dependencies", _BLUE),
+    _item("Check all dependencies", _BLUE),
+    _last("Install a dependency", _BLUE),
+    "",
+    _section("Settings", _WHITE),
+    _item("View settings", _WHITE),
+    _item("Change a setting", _WHITE),
+    _item("Manage targets", _WHITE),
+    _item("Manage API keys", _WHITE),
+    _last("Run diagnostics", _WHITE),
+    "",
+    f"    {_DIM}Quit{_RESET}",
 ]
 
-# Indices of category headers (not selectable)
-_HEADER_INDICES = [i for i, item in enumerate(MAIN_MENU) if item.startswith("──")]
+# Headers contain the box-drawing corner ┌
+_HEADER_INDICES = [i for i, item in enumerate(MAIN_MENU) if "\u250c" in _ansi_strip(item)]
 
 
 def _pick(title: str, items: list[str]) -> int | None:
     """Show a sub-menu and return the selected index, or None on escape."""
     menu = TerminalMenu(
         items,
-        title=f"\n  {title}\n",
+        title=f"\n  {_BOLD}{title}{_RESET}\n",
         menu_cursor="  ❯ ",
         menu_cursor_style=("fg_cyan", "bold"),
         menu_highlight_style=("fg_cyan", "bold"),
@@ -99,7 +145,7 @@ def _pick_target(cfg: Config, action: str = "select") -> str | None:
 def _pause() -> None:
     """Wait for the user to press Enter before returning to menu."""
     console.print()
-    console.input("  [dim]Press Enter to continue...[/dim]")
+    console.input("  [dim]\u23ce Press Enter to continue...[/dim]")
 
 
 # ── Action handlers ──────────────────────────────────────────────────────
@@ -239,19 +285,39 @@ def action_search(cfg: Config) -> None:
 
 
 def action_init(cfg: Config) -> None:
-    """Initialize a new pack."""
+    """Initialize a new pack with interactive prompts."""
     from elm.packwiz import init_pack, safe_refresh, PackwizError
 
     _header("New Modpack")
+
+    if cfg.pack_toml.is_file():
+        _warn("pack.toml already exists in this directory")
+        return
+
+    name = click.prompt("  Pack name", default=cfg.pack_dir.name)
+    author = click.prompt("  Author", default="")
+    mc_version = click.prompt("  Minecraft version", default=cfg.mc_version)
+
+    loaders = ["forge", "fabric", "quilt", "neoforge"]
+    items = loaders + ["", "← Back"]
+    idx = _pick("Select a mod loader", items)
+    if idx is None or idx >= len(loaders):
+        return
+    loader = loaders[idx]
+
     try:
         with console.status("  Creating pack..."):
-            init_pack(cfg)
-        _ok("Pack initialized")
+            init_pack(cfg, name=name, author=author, mc_version=mc_version, loader=loader)
+        _ok(f"Pack created: [cyan]{name}[/cyan] ({mc_version} / {loader})")
         safe_refresh(cfg)
+        console.print()
+        _hint("Next: use 'Install a mod' or 'Sync from mods.txt' to add mods")
     except PackwizError as exc:
         _fail("Init failed")
-        if exc.stderr.strip():
-            _hint(exc.stderr.strip().splitlines()[0][:100])
+        if exc.friendly_hint:
+            _hint(exc.friendly_hint)
+        elif exc.stderr.strip():
+            _hint(exc.stderr.strip().splitlines()[0][:120])
 
 
 def action_refresh(cfg: Config) -> None:
@@ -815,6 +881,191 @@ def action_install_dep(cfg: Config) -> None:
         _pause()
 
 
+# ── CDN actions ───────────────────────────────────────────────────────────
+
+
+def action_cdn_setup(cfg: Config) -> None:
+    """Generate Caddy reverse proxy config for pack hosting."""
+    import subprocess
+
+    _header("CDN Setup")
+
+    if not cfg.pack_toml.is_file():
+        _fail("No pack.toml found — create a modpack first")
+        _hint("Use 'Create new modpack' from the menu")
+        return
+
+    domain = cfg.cdn_domain
+    pack_url = cfg.pack_host_url
+
+    if not domain and not pack_url:
+        domain = click.prompt(
+            "  CDN domain (leave empty for localhost:8080)", default="", show_default=False
+        )
+        if domain:
+            cfg.set_global("CDN_DOMAIN", domain)
+            cfg.set_global("PACK_HOST_URL", f"https://{domain}")
+            _ok(f"CDN domain: [cyan]{domain}[/cyan] (HTTPS via Caddy)")
+        else:
+            cfg.set_global("PACK_HOST_URL", "http://localhost:8080")
+            _ok("Serving on [cyan]http://localhost:8080[/cyan]")
+
+    compose_dir = cfg.cdn_compose_dir
+    compose_dir.mkdir(parents=True, exist_ok=True)
+    pack_abs = cfg.pack_dir.resolve()
+
+    # Generate Caddyfile
+    if domain:
+        caddy_config = (
+            f"{domain} {{\n"
+            f"    root * /srv/pack\n"
+            f"    file_server {{\n"
+            f"        browse\n"
+            f"    }}\n"
+            f'    header Cache-Control "public, max-age=60"\n'
+            f'    header Access-Control-Allow-Origin "*"\n'
+            f"}}\n"
+        )
+    else:
+        caddy_config = (
+            ":8080 {\n"
+            "    root * /srv/pack\n"
+            "    file_server {\n"
+            "        browse\n"
+            "    }\n"
+            '    header Cache-Control "public, max-age=60"\n'
+            '    header Access-Control-Allow-Origin "*"\n'
+            "}\n"
+        )
+    (compose_dir / "Caddyfile").write_text(caddy_config)
+    _ok("Caddyfile written")
+
+    # Generate docker-compose.yml
+    ports = '"443:443"\n      - "80:80"' if domain else '"8080:8080"'
+    compose = (
+        "services:\n"
+        "  caddy:\n"
+        "    image: caddy:2-alpine\n"
+        "    restart: unless-stopped\n"
+        f"    ports:\n"
+        f'      - {ports}\n'
+        "    volumes:\n"
+        f"      - ./Caddyfile:/etc/caddy/Caddyfile:ro\n"
+        f"      - {pack_abs}:/srv/pack:ro\n"
+        "      - caddy_data:/data\n"
+        "      - caddy_config:/config\n"
+        "\n"
+        "volumes:\n"
+        "  caddy_data:\n"
+        "  caddy_config:\n"
+    )
+    (compose_dir / "docker-compose.yml").write_text(compose)
+    _ok("docker-compose.yml written")
+
+    url = cfg.pack_host_url or (f"https://{domain}" if domain else "http://localhost:8080")
+    console.print()
+    _ok("CDN config ready")
+    _hint(f"Start with 'Start CDN' from the menu")
+    _hint(f"Pack URL: {url}/pack.toml")
+
+
+def action_cdn_start(cfg: Config) -> None:
+    """Start the Caddy pack server."""
+    import subprocess
+
+    compose_dir = cfg.cdn_compose_dir
+    if not (compose_dir / "docker-compose.yml").is_file():
+        _fail("CDN not configured yet")
+        _hint("Use 'CDN setup' from the menu first")
+        return
+
+    _header("Starting CDN")
+    try:
+        subprocess.run(
+            ["docker", "compose", "up", "-d"],
+            cwd=compose_dir, check=True, capture_output=True, text=True,
+        )
+        url = cfg.pack_host_url or "http://localhost:8080"
+        _ok("Caddy is running")
+        _hint(f"Pack index: {url}/pack.toml")
+    except subprocess.CalledProcessError as e:
+        _fail("Failed to start Caddy")
+        if e.stderr.strip():
+            _hint(e.stderr.strip().splitlines()[-1][:120])
+    except FileNotFoundError:
+        _fail("Docker not found — install it from the Dependencies menu")
+
+
+def action_cdn_stop(cfg: Config) -> None:
+    """Stop the Caddy pack server."""
+    import subprocess
+
+    compose_dir = cfg.cdn_compose_dir
+    if not (compose_dir / "docker-compose.yml").is_file():
+        _info("CDN not configured — nothing to stop")
+        return
+
+    _header("Stopping CDN")
+    try:
+        subprocess.run(
+            ["docker", "compose", "down"],
+            cwd=compose_dir, check=True, capture_output=True, text=True,
+        )
+        _ok("Caddy stopped")
+    except subprocess.CalledProcessError as e:
+        _fail("Failed to stop Caddy")
+        if e.stderr.strip():
+            _hint(e.stderr.strip().splitlines()[-1][:120])
+
+
+def action_cdn_status(cfg: Config) -> None:
+    """Check CDN server status."""
+    import subprocess
+    import json as _json
+
+    compose_dir = cfg.cdn_compose_dir
+    if not (compose_dir / "docker-compose.yml").is_file():
+        _info("CDN not configured")
+        _hint("Use 'CDN setup' from the menu")
+        return
+
+    _header("CDN Status")
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "ps", "--format", "json"],
+            cwd=compose_dir, capture_output=True, text=True,
+        )
+        output = result.stdout.strip()
+        if not output:
+            _warn("Caddy container is not running")
+            _hint("Use 'Start CDN' from the menu")
+            return
+
+        for line in output.splitlines():
+            try:
+                c = _json.loads(line)
+                state = c.get("State", "unknown")
+                color = {"running": "green", "exited": "red"}.get(state, "dim")
+                icon = {"running": "[green]●[/green]", "exited": "[red]●[/red]"}.get(
+                    state, "[dim]?[/dim]"
+                )
+                url = cfg.pack_host_url or "http://localhost:8080"
+                lines = [
+                    f"  State:  {icon} [{color}]{state}[/{color}]",
+                    f"  URL:    {url}/pack.toml",
+                ]
+                console.print(Panel(
+                    "\n".join(lines),
+                    title="[bold]Caddy CDN[/bold]",
+                    border_style="cyan",
+                    padding=(0, 1),
+                ))
+            except _json.JSONDecodeError:
+                continue
+    except FileNotFoundError:
+        _fail("Docker not found")
+
+
 # ── Settings actions ──────────────────────────────────────────────────────
 
 
@@ -1048,6 +1299,10 @@ DISPATCH: dict[str, Any] = {
     "Run console command": lambda cfg: _server_action(cfg, "console"),
     "Back up a server": lambda cfg: _server_action(cfg, "backup"),
     "Delete a server": lambda cfg: _server_action(cfg, "delete"),
+    "CDN setup": action_cdn_setup,
+    "Start CDN": action_cdn_start,
+    "Stop CDN": action_cdn_stop,
+    "CDN status": action_cdn_status,
     "Check all dependencies": action_check_deps,
     "Install a dependency": action_install_dep,
     "View settings": action_view_settings,
@@ -1071,24 +1326,53 @@ def run_menu(cfg: Config) -> None:
         click.echo(_original_main.get_help(click.Context(_original_main)))
         return
 
+    # Status dashboard
+    from elm.packwiz import list_mods
+    pack_exists = cfg.pack_toml.is_file()
+    mod_count = len(list_mods(cfg)) if pack_exists else 0
+    target_count = len(target_list())
+
+    status_parts = []
+    if pack_exists:
+        pack_label = f"{cfg.mc_version} / {cfg.loader}" if cfg.mc_version else "pack found"
+        status_parts.append(f"[cyan]{pack_label}[/cyan]")
+        status_parts.append(f"{mod_count} mod{'s' if mod_count != 1 else ''}")
+    else:
+        status_parts.append("[yellow]no pack[/yellow]")
+    if target_count:
+        status_parts.append(f"{target_count} target{'s' if target_count != 1 else ''}")
+
+    status_line = "[dim] \u00b7 [/dim]".join(status_parts)
+
+    console.print()
     console.print(
         Panel(
-            f"[bold cyan]ELM[/bold cyan]  [dim]—[/dim]  EnviousLabs Minecraft\n"
-            f"[dim]v{__version__}[/dim]",
+            "[bold cyan]ELM[/bold cyan]  [dim]\u2014[/dim]  "
+            "EnviousLabs Minecraft\n"
+            f"[dim]v{__version__}[/dim]\n\n"
+            f"{status_line}",
             border_style="cyan",
-            padding=(0, 2),
+            padding=(1, 3),
         )
     )
+
+    # First-run hint
+    if not pack_exists:
+        console.print()
+        _info("No modpack found in this directory")
+        _hint("Select [cyan]Create new modpack[/cyan] to get started")
 
     while True:
         try:
             menu = TerminalMenu(
                 MAIN_MENU,
-                title="\n  Use ↑↓ arrows, Enter to select, Esc to quit\n",
-                menu_cursor="  ❯ ",
+                title="",
+                menu_cursor="  \u276f ",
                 menu_cursor_style=("fg_cyan", "bold"),
                 menu_highlight_style=("fg_cyan", "bold"),
                 skip_empty_entries=True,
+                status_bar=f"  {_DIM}\u2191\u2193 navigate  \u23ce select  esc quit{_RESET}",
+                status_bar_style=("fg_gray",),
             )
             idx = menu.show()
         except OSError:
@@ -1099,18 +1383,19 @@ def run_menu(cfg: Config) -> None:
 
         # Escape pressed
         if idx is None:
-            console.print("\n  [dim]Goodbye.[/dim]\n")
+            console.print(f"\n  [dim]Goodbye.[/dim]\n")
             break
 
-        label = MAIN_MENU[idx].strip()
+        raw = MAIN_MENU[idx]
+        label = _ansi_strip(raw).strip().lstrip("\u2502\u2514").strip()
 
-        # Skip category headers
-        if label.startswith("──"):
+        # Skip category headers and empty lines
+        if "\u250c" in _ansi_strip(raw) or not label:
             continue
 
         # Quit
         if label == "Quit":
-            console.print("\n  [dim]Goodbye.[/dim]\n")
+            console.print(f"\n  [dim]Goodbye.[/dim]\n")
             break
 
         # Dispatch

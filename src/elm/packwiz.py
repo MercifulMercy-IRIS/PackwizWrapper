@@ -8,11 +8,34 @@ from __future__ import annotations
 
 import subprocess
 
-from rich.console import Console
-
 from elm.config import Config
+from elm.ui import console, _fail, _ok, _warn, _info, _hint
 
-console = Console()
+
+# ── Error translation ────────────────────────────────────────────────────
+# Maps packwiz stderr patterns to user-friendly messages.
+
+_ERROR_HINTS: list[tuple[str, str]] = [
+    ("no project found", "Check the mod slug on modrinth.com — the name may differ from what you expect"),
+    ("already added", "This mod is already installed. Use 'elm up' to update it instead"),
+    ("already exists", "This mod is already installed. Use 'elm up' to update it instead"),
+    ("no compatible version found", "This mod doesn't support your current MC version or loader"),
+    ("no versions found", "This mod has no releases for your MC version/loader combination"),
+    ("could not find mod", "Mod not found — double-check the slug with 'elm search'"),
+    ("could not find project", "Project not found — double-check the slug with 'elm search'"),
+    ("pack.toml not found", "No pack.toml found — run 'elm init' to create a modpack first"),
+    ("error resolving", "Could not resolve dependencies — a required library may be missing"),
+    ("rate limit", "Modrinth API rate limit hit — wait a moment and try again"),
+]
+
+
+def _translate_error(stderr: str) -> str | None:
+    """Map packwiz stderr to a user-friendly hint, or None."""
+    lower = stderr.lower()
+    for pattern, hint in _ERROR_HINTS:
+        if pattern in lower:
+            return hint
+    return None
 
 
 class PackwizError(Exception):
@@ -22,6 +45,7 @@ class PackwizError(Exception):
         self.cmd = cmd
         self.returncode = returncode
         self.stderr = stderr
+        self.friendly_hint = _translate_error(stderr)
         super().__init__(f"packwiz failed (exit {returncode}): {' '.join(cmd)}")
 
 
@@ -52,13 +76,17 @@ def safe_refresh(cfg: Config, *, build: bool = False) -> bool:
 
     if result.returncode == 0:
         label = "Index built (sha256)" if build else "Index updated (sha256)"
-        console.print(f"  [green]OK[/green] {label}")
+        _ok(label)
         return True
     else:
-        console.print("  [red]FAIL[/red] Index refresh failed")
+        _fail("Index refresh failed")
         if result.stderr.strip():
-            for line in result.stderr.strip().splitlines()[:5]:
-                console.print(f"       [dim]{line}[/dim]")
+            friendly = _translate_error(result.stderr)
+            if friendly:
+                _hint(friendly)
+            else:
+                for line in result.stderr.strip().splitlines()[:3]:
+                    _hint(line[:120])
         return False
 
 
@@ -120,8 +148,12 @@ def search_mod(cfg: Config, query: str, *, source: str = "") -> str:
         resp = httpx.get(url, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-    except Exception:
-        return ""
+    except httpx.ConnectError:
+        return "  [red bold]FAIL[/red bold]  Could not connect — check your internet connection"
+    except httpx.TimeoutException:
+        return "  [red bold]FAIL[/red bold]  Search timed out — try again"
+    except Exception as exc:
+        return f"  [red bold]FAIL[/red bold]  Search failed: {exc}"
 
     hits = data.get("hits", [])
     if not hits:
@@ -142,12 +174,77 @@ def search_mod(cfg: Config, query: str, *, source: str = "") -> str:
     return "\n".join(lines)
 
 
-def init_pack(cfg: Config) -> subprocess.CompletedProcess[str]:
-    """Initialize a new pack."""
-    return pw(cfg, "init",
-              "--name", cfg.pack_dir.name,
-              "--mc-version", cfg.mc_version,
-              "--modloader", cfg.loader)
+def init_pack(
+    cfg: Config,
+    *,
+    name: str = "",
+    author: str = "",
+    version: str = "1.0.0",
+    mc_version: str = "",
+    loader: str = "",
+    loader_version: str = "",
+) -> None:
+    """Initialize a new pack by writing pack.toml and index.toml directly.
+
+    Bypasses packwiz's interactive init which fails in non-TTY environments.
+    """
+    pack_name = name or cfg.pack_dir.name
+    mc_ver = mc_version or cfg.mc_version
+    mod_loader = loader or cfg.loader
+
+    pack_toml = cfg.pack_dir / "pack.toml"
+    index_toml = cfg.pack_dir / "index.toml"
+
+    if pack_toml.is_file():
+        raise PackwizError(["init"], 1, "pack.toml already exists in this directory")
+
+    # Resolve loader version if not provided
+    if not loader_version and mod_loader == "forge":
+        loader_version = _resolve_forge_version(mc_ver)
+
+    # Write pack.toml
+    loader_line = f'{mod_loader} = "{loader_version}"' if loader_version else f'{mod_loader} = ""'
+    pack_toml.write_text(
+        f'name = "{pack_name}"\n'
+        f'author = "{author}"\n'
+        f'version = "{version}"\n'
+        f'pack-format = "packwiz:1.1.0"\n'
+        f'\n'
+        f'[index]\n'
+        f'file = "index.toml"\n'
+        f'hash-format = "sha256"\n'
+        f'\n'
+        f'[versions]\n'
+        f'minecraft = "{mc_ver}"\n'
+        f'{loader_line}\n'
+    )
+
+    # Write index.toml
+    index_toml.write_text('hash-format = "sha256"\n')
+
+    # Create mods directory
+    (cfg.pack_dir / "mods").mkdir(exist_ok=True)
+
+
+def _resolve_forge_version(mc_version: str) -> str:
+    """Try to resolve the recommended Forge version for a MC version."""
+    import httpx
+
+    try:
+        resp = httpx.get(
+            "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        promos = resp.json().get("promos", {})
+        # Try recommended first, then latest
+        for suffix in ("recommended", "latest"):
+            key = f"{mc_version}-{suffix}"
+            if key in promos:
+                return promos[key]
+    except Exception:
+        pass
+    return ""
 
 
 def export_pack(cfg: Config) -> subprocess.CompletedProcess[str]:

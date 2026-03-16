@@ -42,11 +42,31 @@ def _get_cfg(ctx: click.Context) -> Config:
     return ctx.obj
 
 
+def _require_pack(cfg: Config) -> bool:
+    """Check that pack.toml exists, printing guidance if not. Returns True if OK."""
+    if cfg.pack_toml.is_file():
+        return True
+    _fail("No pack.toml found — you need to create a modpack first")
+    _hint("Run: elm init")
+    return False
+
+
 # ── Custom help formatter ─────────────────────────────────────────────────
 
 
 class ElmGroup(click.Group):
-    """Custom group that shows a branded help screen."""
+    """Custom group that shows a branded help screen with fuzzy matching."""
+
+    def resolve_command(self, ctx: click.Context, args: list[str]) -> tuple:
+        """Suggest corrections for mistyped commands."""
+        import difflib
+
+        cmd_name = args[0] if args else None
+        if cmd_name and cmd_name not in self.commands:
+            matches = difflib.get_close_matches(cmd_name, self.commands.keys(), n=1, cutoff=0.5)
+            if matches:
+                _hint(f"Unknown command '{cmd_name}'. Did you mean: elm {matches[0]}?")
+        return super().resolve_command(ctx, args)
 
     def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         console.print(
@@ -173,13 +193,23 @@ def main() -> None:  # noqa: F811
 @click.option("-s", "--source", default="", help="Source: mr (Modrinth) or cf (CurseForge)")
 @click.pass_context
 def add(ctx: click.Context, slugs: tuple[str, ...], source: str) -> None:
-    """Add one or more mods."""
+    """Add one or more mods.
+
+    \b
+    Examples:
+      elm add sodium
+      elm add jei create waystones
+      elm add sodium -s mr
+    """
     from elm.packwiz import add_mod, safe_refresh, PackwizError
 
     cfg = _get_cfg(ctx)
+    if not _require_pack(cfg):
+        return
     _header("Adding Mods")
 
     ok_count = 0
+    fail_count = 0
     for slug in slugs:
         try:
             with console.status(f"  Installing [cyan]{slug}[/cyan]..."):
@@ -188,21 +218,37 @@ def add(ctx: click.Context, slugs: tuple[str, ...], source: str) -> None:
             ok_count += 1
         except PackwizError as e:
             _fail(f"Could not add [cyan]{slug}[/cyan]")
-            if e.stderr.strip():
-                _hint(e.stderr.strip().splitlines()[0][:100])
+            fail_count += 1
+            if e.friendly_hint:
+                _hint(e.friendly_hint)
+            elif e.stderr.strip():
+                _hint(e.stderr.strip().splitlines()[0][:120])
 
     if ok_count > 0:
         safe_refresh(cfg)
+
+    # Summary for multi-mod operations
+    if len(slugs) > 1:
+        console.print()
+        _info(f"{ok_count} added, {fail_count} failed")
 
 
 @_original_main.command()
 @click.argument("slugs", nargs=-1, required=True)
 @click.pass_context
 def rm(ctx: click.Context, slugs: tuple[str, ...]) -> None:
-    """Remove one or more mods."""
+    """Remove one or more mods.
+
+    \b
+    Examples:
+      elm rm sodium
+      elm rm jei create waystones
+    """
     from elm.packwiz import remove_mod, safe_refresh, PackwizError
 
     cfg = _get_cfg(ctx)
+    if not _require_pack(cfg):
+        return
     _header("Removing Mods")
 
     ok_count = 0
@@ -213,8 +259,10 @@ def rm(ctx: click.Context, slugs: tuple[str, ...]) -> None:
             ok_count += 1
         except PackwizError as e:
             _fail(f"Could not remove [cyan]{slug}[/cyan]")
-            if e.stderr.strip():
-                _hint(e.stderr.strip().splitlines()[0][:100])
+            if e.friendly_hint:
+                _hint(e.friendly_hint)
+            elif e.stderr.strip():
+                _hint(e.stderr.strip().splitlines()[0][:120])
 
     if ok_count > 0:
         safe_refresh(cfg)
@@ -224,10 +272,18 @@ def rm(ctx: click.Context, slugs: tuple[str, ...]) -> None:
 @click.argument("slug", required=False, default="")
 @click.pass_context
 def up(ctx: click.Context, slug: str) -> None:
-    """Update a mod, or all mods."""
+    """Update a mod, or all mods.
+
+    \b
+    Examples:
+      elm up           Update all mods
+      elm up sodium    Update just sodium
+    """
     from elm.packwiz import update_mod, safe_refresh, PackwizError
 
     cfg = _get_cfg(ctx)
+    if not _require_pack(cfg):
+        return
     label = f"Updating {slug}" if slug else "Updating All Mods"
     _header(label)
 
@@ -237,8 +293,10 @@ def up(ctx: click.Context, slug: str) -> None:
         _ok("Update complete")
     except PackwizError as e:
         _fail("Update failed")
-        if e.stderr.strip():
-            _hint(e.stderr.strip().splitlines()[0][:100])
+        if e.friendly_hint:
+            _hint(e.friendly_hint)
+        elif e.stderr.strip():
+            _hint(e.stderr.strip().splitlines()[0][:120])
         return
 
     safe_refresh(cfg)
@@ -251,6 +309,8 @@ def list_mods(ctx: click.Context) -> None:
     from elm.packwiz import list_mods as _list
 
     cfg = _get_cfg(ctx)
+    if not _require_pack(cfg):
+        return
     mods = _list(cfg)
 
     if not mods:
@@ -296,10 +356,12 @@ def search(ctx: click.Context, query: str, source: str) -> None:
 @_original_main.command()
 @click.pass_context
 def sync(ctx: click.Context) -> None:
-    """Sync mods from mods.txt."""
+    """Sync mods from mods.txt — installs missing mods, skips existing ones."""
     from elm.packwiz import sync_from_modsfile, safe_refresh
 
     cfg = _get_cfg(ctx)
+    if not _require_pack(cfg):
+        return
     _header("Syncing from mods.txt")
 
     if not cfg.mods_file.is_file():
@@ -331,6 +393,8 @@ def refresh(ctx: click.Context, build: bool) -> None:
     from elm.packwiz import safe_refresh
 
     cfg = _get_cfg(ctx)
+    if not _require_pack(cfg):
+        return
     _header("Refreshing Pack Index")
     ok = safe_refresh(cfg, build=build)
     if not ok:
@@ -338,22 +402,53 @@ def refresh(ctx: click.Context, build: bool) -> None:
 
 
 @_original_main.command(name="init")
+@click.option("--name", default="", help="Pack name")
+@click.option("--author", default="", help="Pack author")
+@click.option("--mc-version", default="", help="Minecraft version")
+@click.option("--loader", default="", help="Mod loader (forge, fabric, quilt, neoforge)")
 @click.pass_context
-def init_pack(ctx: click.Context) -> None:
+def init_pack(ctx: click.Context, name: str, author: str, mc_version: str, loader: str) -> None:
     """Initialize a new packwiz pack."""
     from elm.packwiz import init_pack as _init, safe_refresh, PackwizError
 
     cfg = _get_cfg(ctx)
     _header("Initializing Pack")
+
+    if cfg.pack_toml.is_file():
+        _warn("pack.toml already exists in this directory")
+        _hint("Delete it first or work from a different directory")
+        return
+
+    # Interactive prompts for missing values
+    if not name:
+        name = click.prompt("  Pack name", default=cfg.pack_dir.name)
+    if not author:
+        author = click.prompt("  Author", default="")
+    if not mc_version:
+        mc_version = click.prompt("  Minecraft version", default=cfg.mc_version)
+    if not loader:
+        loader = click.prompt(
+            "  Mod loader",
+            default=cfg.loader,
+            type=click.Choice(["forge", "fabric", "quilt", "neoforge"], case_sensitive=False),
+        )
+
     try:
         with console.status("  Creating pack..."):
-            _init(cfg)
-        _ok("Pack initialized")
+            _init(cfg, name=name, author=author, mc_version=mc_version, loader=loader)
+        _ok(f"Pack created: [cyan]{name}[/cyan] ({mc_version} / {loader})")
         safe_refresh(cfg)
+        console.print()
+        _hint("Next steps:")
+        _hint(f"  elm add <mod>    Install your first mod")
+        _hint(f"  elm sync         Sync mods from mods.txt")
+        _hint(f"  elm search <q>   Find mods to install")
     except PackwizError as e:
         _fail("Init failed")
-        if e.stderr.strip():
-            _hint(e.stderr.strip().splitlines()[0][:100])
+        if e.friendly_hint:
+            _hint(e.friendly_hint)
+        elif e.stderr.strip():
+            _hint(e.stderr.strip().splitlines()[0][:120])
         sys.exit(1)
 
 
