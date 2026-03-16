@@ -1597,7 +1597,7 @@ def deps_check(ctx: click.Context) -> None:
 @click.argument("name")
 @click.pass_context
 def deps_install(ctx: click.Context, name: str) -> None:
-    """Install a dependency by name (go, packwiz, curl, jq, git, docker)."""
+    """Install a dependency by name."""
     import subprocess
     import shutil
 
@@ -1611,6 +1611,8 @@ def deps_install(ctx: click.Context, name: str) -> None:
         "jq": ("jq", "jq"),
         "git": ("git", "Git"),
         "docker": ("docker", "Docker"),
+        "pelican": ("pelican", "Pelican Panel"),
+        "wings": ("wings", "Wings"),
     }
 
     if name_lower not in known:
@@ -1691,6 +1693,132 @@ def deps_install(ctx: click.Context, name: str) -> None:
         )
         _ok("Docker installed")
         _hint("Add yourself to the docker group: sudo usermod -aG docker $USER")
+
+    elif name_lower == "pelican":
+        _header("Install Pelican Panel")
+        if not shutil.which("docker"):
+            _fail("Docker is required — run: elm deps install docker")
+            return
+
+        panel_dir = Path.home() / ".config" / "elm" / "pelican"
+        panel_dir.mkdir(parents=True, exist_ok=True)
+
+        app_url = click.prompt("  Panel URL (e.g. https://panel.example.com)")
+        db_pass = click.prompt("  Database password", default="pelican_secret")
+
+        compose = (
+            "services:\n"
+            "  panel:\n"
+            "    image: ghcr.io/pelican-dev/panel:latest\n"
+            "    restart: unless-stopped\n"
+            "    ports:\n"
+            '      - "80:80"\n'
+            '      - "443:443"\n'
+            "    environment:\n"
+            f'      APP_URL: "{app_url}"\n'
+            '      DB_HOST: "db"\n'
+            '      DB_PORT: "3306"\n'
+            '      DB_DATABASE: "pelican"\n'
+            '      DB_USERNAME: "pelican"\n'
+            f'      DB_PASSWORD: "{db_pass}"\n'
+            '      CACHE_DRIVER: "redis"\n'
+            '      SESSION_DRIVER: "redis"\n'
+            '      QUEUE_CONNECTION: "redis"\n'
+            '      REDIS_HOST: "redis"\n'
+            "    volumes:\n"
+            "      - panel_data:/app/storage\n"
+            "      - panel_logs:/app/storage/logs\n"
+            "    depends_on:\n"
+            "      - db\n"
+            "      - redis\n"
+            "\n"
+            "  db:\n"
+            "    image: mariadb:11\n"
+            "    restart: unless-stopped\n"
+            "    environment:\n"
+            f'      MYSQL_ROOT_PASSWORD: "{db_pass}"\n'
+            '      MYSQL_DATABASE: "pelican"\n'
+            '      MYSQL_USER: "pelican"\n'
+            f'      MYSQL_PASSWORD: "{db_pass}"\n'
+            "    volumes:\n"
+            "      - db_data:/var/lib/mysql\n"
+            "\n"
+            "  redis:\n"
+            "    image: redis:7-alpine\n"
+            "    restart: unless-stopped\n"
+            "\n"
+            "volumes:\n"
+            "  panel_data:\n"
+            "  panel_logs:\n"
+            "  db_data:\n"
+        )
+
+        compose_file = panel_dir / "docker-compose.yml"
+        compose_file.write_text(compose)
+        _ok(f"docker-compose.yml \u2192 [dim]{compose_file}[/dim]")
+
+        _info("Starting Pelican Panel...")
+        try:
+            subprocess.run(
+                ["docker", "compose", "up", "-d"],
+                cwd=panel_dir, check=True, capture_output=True, text=True,
+            )
+            _ok("Pelican Panel is running")
+            console.print()
+            _hint(f"Open {app_url} in your browser to complete setup")
+            _hint("Then run: elm deploy setup  — to connect ELM to the panel")
+
+            # Save the URL to config
+            cfg.set_global("PELICAN_URL", app_url)
+        except subprocess.CalledProcessError as e:
+            _fail("Failed to start Pelican Panel")
+            if e.stderr.strip():
+                _hint(e.stderr.strip().splitlines()[-1][:120])
+
+    elif name_lower == "wings":
+        _header("Install Wings")
+        if not shutil.which("docker"):
+            _fail("Docker is required — run: elm deps install docker")
+            return
+
+        if shutil.which("wings"):
+            _ok(f"Wings is already installed: {shutil.which('wings')}")
+            return
+
+        import platform
+        arch = platform.machine()
+        wings_arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(arch)
+        if not wings_arch:
+            _fail(f"Unsupported architecture: {arch}")
+            return
+
+        _info("Downloading Wings...")
+        wings_url = (
+            "https://github.com/pelican-dev/wings/releases/latest/download"
+            f"/wings_linux_{wings_arch}"
+        )
+        wings_bin = Path("/usr/local/bin/wings")
+
+        try:
+            with console.status("  Downloading Wings binary..."):
+                subprocess.run(
+                    ["sudo", "curl", "-fsSL", "-o", str(wings_bin), wings_url],
+                    check=True, capture_output=True, text=True,
+                )
+                subprocess.run(
+                    ["sudo", "chmod", "+x", str(wings_bin)],
+                    check=True, capture_output=True, text=True,
+                )
+            _ok(f"Wings installed \u2192 {wings_bin}")
+            console.print()
+            _hint("Configure Wings in your Pelican Panel:")
+            _hint("  Panel > Nodes > Create Node > copy the config token")
+            _hint("  Then run: sudo wings configure --panel-url <URL> --token <TOKEN>")
+            _hint("  Finally:  sudo wings --debug  (to test)")
+        except subprocess.CalledProcessError as e:
+            _fail("Failed to install Wings")
+            if e.stderr.strip():
+                _hint(e.stderr.strip().splitlines()[-1][:120])
 
     else:
         # curl, jq, git — use system package manager

@@ -795,32 +795,134 @@ def action_install_dep(cfg: Config) -> None:
 
         elif name == "Pelican Panel":
             _header("Install Pelican Panel")
-            _info("Pelican Panel is the web UI for managing game servers.")
-            _info("It runs as a PHP application with a database backend.")
+            if not _check_dep("Docker", "docker"):
+                _fail("Docker is required — install Docker first")
+                _pause()
+                continue
+            _info("Pelican Panel will be installed via Docker Compose.")
+            _info("This sets up the Panel, MariaDB, and Redis.")
             console.print()
-            _info("Installation options:")
-            console.print()
-            console.print("    [cyan]1.[/cyan] Docker (recommended):")
-            console.print("       [dim]https://pelican.dev/docs/panel/getting-started[/dim]")
-            console.print()
-            console.print("    [cyan]2.[/cyan] Manual install on a web server:")
-            console.print("       [dim]Requires PHP 8.2+, MySQL/MariaDB, Nginx/Caddy[/dim]")
-            console.print()
-            _hint("After installing, run 'elm deploy setup' to connect ELM to your panel")
+            if not click.confirm("  Install Pelican Panel via Docker?"):
+                _pause()
+                continue
+            try:
+                panel_dir = Path.home() / ".config" / "elm" / "pelican"
+                panel_dir.mkdir(parents=True, exist_ok=True)
+
+                app_url = click.prompt("  Panel URL (e.g. https://panel.example.com)")
+                db_pass = click.prompt("  Database password", default="pelican_secret")
+
+                compose = (
+                    "services:\n"
+                    "  panel:\n"
+                    "    image: ghcr.io/pelican-dev/panel:latest\n"
+                    "    restart: unless-stopped\n"
+                    "    ports:\n"
+                    '      - "80:80"\n'
+                    '      - "443:443"\n'
+                    "    environment:\n"
+                    f'      APP_URL: "{app_url}"\n'
+                    '      DB_HOST: "db"\n'
+                    '      DB_PORT: "3306"\n'
+                    '      DB_DATABASE: "pelican"\n'
+                    '      DB_USERNAME: "pelican"\n'
+                    f'      DB_PASSWORD: "{db_pass}"\n'
+                    '      CACHE_DRIVER: "redis"\n'
+                    '      SESSION_DRIVER: "redis"\n'
+                    '      QUEUE_CONNECTION: "redis"\n'
+                    '      REDIS_HOST: "redis"\n'
+                    "    volumes:\n"
+                    "      - panel_data:/app/storage\n"
+                    "      - panel_logs:/app/storage/logs\n"
+                    "    depends_on:\n"
+                    "      - db\n"
+                    "      - redis\n"
+                    "\n"
+                    "  db:\n"
+                    "    image: mariadb:11\n"
+                    "    restart: unless-stopped\n"
+                    "    environment:\n"
+                    f'      MYSQL_ROOT_PASSWORD: "{db_pass}"\n'
+                    '      MYSQL_DATABASE: "pelican"\n'
+                    '      MYSQL_USER: "pelican"\n'
+                    f'      MYSQL_PASSWORD: "{db_pass}"\n'
+                    "    volumes:\n"
+                    "      - db_data:/var/lib/mysql\n"
+                    "\n"
+                    "  redis:\n"
+                    "    image: redis:7-alpine\n"
+                    "    restart: unless-stopped\n"
+                    "\n"
+                    "volumes:\n"
+                    "  panel_data:\n"
+                    "  panel_logs:\n"
+                    "  db_data:\n"
+                )
+                (panel_dir / "docker-compose.yml").write_text(compose)
+
+                with console.status("  Starting Pelican Panel..."):
+                    subprocess.run(
+                        ["docker", "compose", "up", "-d"],
+                        cwd=panel_dir, check=True, capture_output=True, text=True,
+                    )
+                _ok("Pelican Panel is running")
+                _hint(f"Open {app_url} in your browser to complete setup")
+                _hint("Then use 'Panel setup' from the Servers menu to connect ELM")
+                cfg.set_global("PELICAN_URL", app_url)
+            except subprocess.CalledProcessError as exc:
+                _fail("Failed to start Pelican Panel")
+                if exc.stderr:
+                    _hint(exc.stderr.strip().splitlines()[-1][:120])
+            except Exception as exc:
+                _fail(f"Installation failed: {exc}")
 
         elif name == "Wings":
             _header("Install Wings")
-            _info("Wings is the Pelican daemon that runs on each game server node.")
+            if not _check_dep("Docker", "docker"):
+                _fail("Docker is required — install Docker first")
+                _pause()
+                continue
+            if _check_dep("Wings", "wings"):
+                import shutil as _sh
+                _ok(f"Wings is already installed: {_sh.which('wings')}")
+                _pause()
+                continue
+            _info("Wings is the Pelican daemon that runs on game server nodes.")
             console.print()
-            _info("Installation options:")
-            console.print()
-            console.print("    [cyan]1.[/cyan] Docker (recommended):")
-            console.print("       [dim]https://pelican.dev/docs/wings/getting-started[/dim]")
-            console.print()
-            console.print("    [cyan]2.[/cyan] Standalone binary:")
-            console.print("       [dim]Download from GitHub releases[/dim]")
-            console.print()
-            _hint("Wings must be configured in Pelican Panel after installation")
+            if not click.confirm("  Download and install Wings?"):
+                _pause()
+                continue
+            try:
+                import platform
+                arch = platform.machine()
+                wings_arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(arch)
+                if not wings_arch:
+                    _fail(f"Unsupported architecture: {arch}")
+                    _pause()
+                    continue
+
+                wings_url = (
+                    "https://github.com/pelican-dev/wings/releases/latest/download"
+                    f"/wings_linux_{wings_arch}"
+                )
+                with console.status("  Downloading Wings..."):
+                    subprocess.run(
+                        ["sudo", "curl", "-fsSL", "-o", "/usr/local/bin/wings", wings_url],
+                        check=True, capture_output=True, text=True,
+                    )
+                    subprocess.run(
+                        ["sudo", "chmod", "+x", "/usr/local/bin/wings"],
+                        check=True, capture_output=True, text=True,
+                    )
+                _ok("Wings installed \u2192 /usr/local/bin/wings")
+                _hint("Configure in Pelican Panel: Nodes > Create Node > copy token")
+                _hint("Then run: sudo wings configure --panel-url <URL> --token <TOKEN>")
+            except subprocess.CalledProcessError as exc:
+                _fail("Failed to install Wings")
+                if exc.stderr:
+                    _hint(exc.stderr.strip().splitlines()[-1][:120])
+            except Exception as exc:
+                _fail(f"Installation failed: {exc}")
 
         _pause()
 
