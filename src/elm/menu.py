@@ -47,71 +47,26 @@ def _ansi_strip(s: str) -> str:
     return _ANSI_RE.sub("", s)
 
 
-def _section(label: str, color: str) -> str:
-    """Build a styled section header for the menu."""
-    line = "\u2500" * (26 - len(label))
-    return f"  {_BOLD}{color}\u250c\u2500 {label} {_RESET}{_DIM}{line}{_RESET}"
+def _main_entry(num: int, name: str, color: str, count: int) -> str:
+    """Build a styled main-menu category entry."""
+    n_label = f"{count} option{'s' if count != 1 else ''}"
+    return (
+        f"  {_BOLD}{color}[{num}]{_RESET}  "
+        f"{_BOLD}{name:<16}{_RESET}"
+        f"{_DIM}{n_label}{_RESET}"
+    )
 
 
-def _item(label: str, color: str) -> str:
-    """Build a styled menu item with a colored sidebar."""
-    return f"  {_DIM}{color}\u2502{_RESET}   {label}"
+def _sub_header(name: str, color: str) -> str:
+    """Build a styled sub-menu header."""
+    line = "\u2500" * (24 - len(name))
+    return f"  {_BOLD}{color}\u250c\u2500 {name} {_RESET}{_DIM}{line}{_RESET}"
 
 
-def _last(label: str, color: str) -> str:
-    """Build the last item in a section with a corner."""
-    return f"  {_DIM}{color}\u2514{_RESET}   {label}"
-
-
-# ── Menu definition ──────────────────────────────────────────────────────
-
-MAIN_MENU: list[str] = [
-    _section("Mods", _CYAN),
-    _item("Install a mod", _CYAN),
-    _item("Remove a mod", _CYAN),
-    _item("Update all mods", _CYAN),
-    _item("Sync from mods.txt", _CYAN),
-    _item("Show installed mods", _CYAN),
-    _last("Search for a mod", _CYAN),
-    "",
-    _section("Modpack", _GREEN),
-    _item("Create new modpack", _GREEN),
-    _item("Refresh mod index", _GREEN),
-    _last("Update ELM", _GREEN),
-    "",
-    _section("Servers", _YELLOW),
-    _item("Panel setup", _YELLOW),
-    _item("Create a server", _YELLOW),
-    _item("Start a server", _YELLOW),
-    _item("Stop a server", _YELLOW),
-    _item("Restart a server", _YELLOW),
-    _item("Server status", _YELLOW),
-    _item("Run console command", _YELLOW),
-    _item("Back up a server", _YELLOW),
-    _last("Delete a server", _YELLOW),
-    "",
-    _section("CDN", _MAGENTA),
-    _item("CDN setup", _MAGENTA),
-    _item("Start CDN", _MAGENTA),
-    _item("Stop CDN", _MAGENTA),
-    _last("CDN status", _MAGENTA),
-    "",
-    _section("Dependencies", _BLUE),
-    _item("Check all dependencies", _BLUE),
-    _last("Install a dependency", _BLUE),
-    "",
-    _section("Settings", _WHITE),
-    _item("View settings", _WHITE),
-    _item("Change a setting", _WHITE),
-    _item("Manage targets", _WHITE),
-    _item("Manage API keys", _WHITE),
-    _last("Run diagnostics", _WHITE),
-    "",
-    f"    {_DIM}Quit{_RESET}",
-]
-
-# Headers contain the box-drawing corner ┌
-_HEADER_INDICES = [i for i, item in enumerate(MAIN_MENU) if "\u250c" in _ansi_strip(item)]
+def _sub_item(num: int, label: str, color: str, last: bool = False) -> str:
+    """Build a styled sub-menu item with numbered shortcut and sidebar."""
+    corner = "\u2514" if last else "\u2502"
+    return f"  {_DIM}{color}{corner}{_RESET}  {_BOLD}[{num}]{_RESET}  {label}"
 
 
 def _pick(title: str, items: list[str]) -> int | None:
@@ -1278,42 +1233,107 @@ def action_check(cfg: Config) -> None:
     console.print()
 
 
-# ── Dispatch table ────────────────────────────────────────────────────────
+# ── Menu sections ─────────────────────────────────────────────────────────
+# Each section: (name, ansi_color, [(label, handler), ...])
 
-DISPATCH: dict[str, Any] = {
-    "Install a mod": action_add_mod,
-    "Remove a mod": action_remove_mod,
-    "Update all mods": action_update_mods,
-    "Sync from mods.txt": action_sync,
-    "Show installed mods": action_list_mods,
-    "Search for a mod": action_search,
-    "Create new modpack": action_init,
-    "Refresh mod index": action_refresh,
-    "Update ELM": action_self_update,
-    "Panel setup": action_deploy_setup,
-    "Create a server": action_create_server,
-    "Start a server": lambda cfg: _server_action(cfg, "start"),
-    "Stop a server": lambda cfg: _server_action(cfg, "stop"),
-    "Restart a server": lambda cfg: _server_action(cfg, "restart"),
-    "Server status": lambda cfg: _server_action(cfg, "status"),
-    "Run console command": lambda cfg: _server_action(cfg, "console"),
-    "Back up a server": lambda cfg: _server_action(cfg, "backup"),
-    "Delete a server": lambda cfg: _server_action(cfg, "delete"),
-    "CDN setup": action_cdn_setup,
-    "Start CDN": action_cdn_start,
-    "Stop CDN": action_cdn_stop,
-    "CDN status": action_cdn_status,
-    "Check all dependencies": action_check_deps,
-    "Install a dependency": action_install_dep,
-    "View settings": action_view_settings,
-    "Change a setting": action_change_setting,
-    "Manage targets": action_manage_targets,
-    "Manage API keys": action_manage_keys,
-    "Run diagnostics": action_check,
-}
+SECTIONS: list[tuple[str, str, list[tuple[str, Any]]]] = [
+    ("Mods", _CYAN, [
+        ("Install a mod", action_add_mod),
+        ("Remove a mod", action_remove_mod),
+        ("Update all mods", action_update_mods),
+        ("Sync from mods.txt", action_sync),
+        ("Show installed mods", action_list_mods),
+        ("Search for a mod", action_search),
+    ]),
+    ("Modpack", _GREEN, [
+        ("Create new modpack", action_init),
+        ("Refresh mod index", action_refresh),
+        ("Update ELM", action_self_update),
+    ]),
+    ("Servers", _YELLOW, [
+        ("Panel setup", action_deploy_setup),
+        ("Create a server", action_create_server),
+        ("Start a server", lambda cfg: _server_action(cfg, "start")),
+        ("Stop a server", lambda cfg: _server_action(cfg, "stop")),
+        ("Restart a server", lambda cfg: _server_action(cfg, "restart")),
+        ("Server status", lambda cfg: _server_action(cfg, "status")),
+        ("Run console command", lambda cfg: _server_action(cfg, "console")),
+        ("Back up a server", lambda cfg: _server_action(cfg, "backup")),
+        ("Delete a server", lambda cfg: _server_action(cfg, "delete")),
+    ]),
+    ("CDN", _MAGENTA, [
+        ("CDN setup", action_cdn_setup),
+        ("Start CDN", action_cdn_start),
+        ("Stop CDN", action_cdn_stop),
+        ("CDN status", action_cdn_status),
+    ]),
+    ("Dependencies", _BLUE, [
+        ("Check all dependencies", action_check_deps),
+        ("Install a dependency", action_install_dep),
+    ]),
+    ("Settings", _WHITE, [
+        ("View settings", action_view_settings),
+        ("Change a setting", action_change_setting),
+        ("Manage targets", action_manage_targets),
+        ("Manage API keys", action_manage_keys),
+        ("Run diagnostics", action_check),
+    ]),
+]
 
 
 # ── Main menu loop ───────────────────────────────────────────────────────
+
+
+def _run_sub_menu(cfg: Config, name: str, color: str, items: list[tuple[str, Any]]) -> None:
+    """Run a numbered sub-menu for a single section."""
+    # Build sub-menu display list
+    sub_entries: list[str] = [_sub_header(name, color)]
+    for j, (label, _) in enumerate(items):
+        last = j == len(items) - 1
+        sub_entries.append(_sub_item(j + 1, label, color, last=last))
+    sub_entries.append("")
+    sub_entries.append(f"  {_DIM}[0]{_RESET}  {_DIM}\u2190 Back{_RESET}")
+
+    while True:
+        try:
+            menu = TerminalMenu(
+                sub_entries,
+                title="",
+                menu_cursor="  \u276f ",
+                menu_cursor_style=("fg_cyan", "bold"),
+                menu_highlight_style=("fg_cyan", "bold"),
+                shortcut_key_highlight_style=("fg_cyan", "bold"),
+                skip_empty_entries=True,
+                status_bar=f"  {_DIM}\u2191\u2193 navigate  \u23ce select  0 back{_RESET}",
+                status_bar_style=("fg_gray",),
+            )
+            idx = menu.show()
+        except OSError:
+            return
+
+        if idx is None:
+            return
+
+        # Header row (index 0) — skip
+        if idx == 0:
+            continue
+
+        # Back (last entry)
+        if idx == len(sub_entries) - 1:
+            return
+
+        # Action items are at indices 1..len(items)
+        action_idx = idx - 1
+        if 0 <= action_idx < len(items):
+            _, handler = items[action_idx]
+            console.print()
+            try:
+                handler(cfg)
+            except KeyboardInterrupt:
+                console.print("\n  [dim]Cancelled.[/dim]")
+            except Exception as exc:
+                _fail(str(exc))
+            _pause()
 
 
 def run_menu(cfg: Config) -> None:
@@ -1360,54 +1380,44 @@ def run_menu(cfg: Config) -> None:
     if not pack_exists:
         console.print()
         _info("No modpack found in this directory")
-        _hint("Select [cyan]Create new modpack[/cyan] to get started")
+        _hint("Open [cyan]Modpack[/cyan] \u2192 [cyan]Create new modpack[/cyan] to get started")
+
+    # Build main menu
+    main_entries: list[str] = []
+    for i, (name, color, items) in enumerate(SECTIONS, 1):
+        main_entries.append(_main_entry(i, name, color, len(items)))
+    main_entries.append("")
+    main_entries.append(f"  {_DIM}[q]  Quit{_RESET}")
 
     while True:
         try:
             menu = TerminalMenu(
-                MAIN_MENU,
+                main_entries,
                 title="",
                 menu_cursor="  \u276f ",
                 menu_cursor_style=("fg_cyan", "bold"),
                 menu_highlight_style=("fg_cyan", "bold"),
+                shortcut_key_highlight_style=("fg_cyan", "bold"),
                 skip_empty_entries=True,
-                status_bar=f"  {_DIM}\u2191\u2193 navigate  \u23ce select  esc quit{_RESET}",
+                status_bar=f"  {_DIM}\u2191\u2193 navigate  \u23ce select  q quit{_RESET}",
                 status_bar_style=("fg_gray",),
             )
             idx = menu.show()
         except OSError:
-            # No terminal available — fall back to help
             from elm.cli import _original_main
             click.echo(_original_main.get_help(click.Context(_original_main)))
             return
 
-        # Escape pressed
         if idx is None:
             console.print(f"\n  [dim]Goodbye.[/dim]\n")
             break
 
-        raw = MAIN_MENU[idx]
-        label = _ansi_strip(raw).strip().lstrip("\u2502\u2514").strip()
-
-        # Skip category headers and empty lines
-        if "\u250c" in _ansi_strip(raw) or not label:
-            continue
-
-        # Quit
-        if label == "Quit":
+        # Quit (last entry)
+        if idx == len(main_entries) - 1:
             console.print(f"\n  [dim]Goodbye.[/dim]\n")
             break
 
-        # Dispatch
-        handler = DISPATCH.get(label)
-        if handler:
-            console.print()
-            try:
-                handler(cfg)
-            except KeyboardInterrupt:
-                console.print("\n  [dim]Cancelled.[/dim]")
-            except Exception as exc:
-                _fail(str(exc))
-            _pause()
-        else:
-            _warn(f"No handler for: {label}")
+        # Open the selected section's sub-menu
+        if idx < len(SECTIONS):
+            name, color, items = SECTIONS[idx]
+            _run_sub_menu(cfg, name, color, items)
