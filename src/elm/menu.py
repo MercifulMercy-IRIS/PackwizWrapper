@@ -1167,6 +1167,66 @@ def action_change_setting(cfg: Config) -> None:
     _ok(f"{key.upper()} = {value}")
 
 
+def action_manage_packs(cfg: Config) -> None:
+    """Sub-menu for pack registry management."""
+    from elm.config import load_packs, pack_register, pack_remove, pack_list
+
+    while True:
+        names = pack_list()
+        items = ["Register current directory", "List packs"]
+        if names:
+            items.append("Remove a pack")
+        items.extend(["", "\u2190 Back"])
+
+        idx = _pick("Manage Packs", items)
+        if idx is None or items[idx] == "\u2190 Back" or items[idx] == "":
+            return
+
+        choice = items[idx]
+        if choice == "Register current directory":
+            if not cfg.pack_toml.is_file():
+                _fail("No pack.toml in current directory")
+                _hint("Create a pack first, or cd to an existing pack directory")
+                _pause()
+                continue
+            name = click.prompt("  Pack name", default=cfg.pack_dir.name)
+            pack_register(name, cfg.pack_dir, mc_version=cfg.mc_version, loader=cfg.loader)
+            _ok(f"Registered [cyan]{name}[/cyan] \u2192 [dim]{cfg.pack_dir}[/dim]")
+            _hint(f"Use from anywhere: elm -p {name} <command>")
+
+        elif choice == "List packs":
+            packs = load_packs()
+            if not packs:
+                _info("No packs registered yet.")
+            else:
+                table = Table(border_style="dim", padding=(0, 1))
+                table.add_column("Name", style="cyan bold")
+                table.add_column("Path")
+                table.add_column("MC", justify="center")
+                table.add_column("Loader", justify="center")
+                table.add_column("", width=6)
+                for n, data in packs.items():
+                    p = Path(data.get("path", ""))
+                    exists = (p / "pack.toml").is_file() if p.is_dir() else False
+                    status = "[green]OK[/green]" if exists else "[red]![/red]"
+                    table.add_row(
+                        n, str(data.get("path", "")),
+                        data.get("mc_version", ""), data.get("loader", ""),
+                        status,
+                    )
+                console.print()
+                console.print(table)
+
+        elif choice == "Remove a pack":
+            pack_items = [*names, "", "\u2190 Back"]
+            pidx = _pick("Remove which pack?", pack_items)
+            if pidx is not None and pidx < len(names):
+                pack_remove(names[pidx])
+                _ok(f"Unregistered [cyan]{names[pidx]}[/cyan]")
+
+        _pause()
+
+
 def action_manage_targets(cfg: Config) -> None:
     """Sub-menu for target management."""
     while True:
@@ -1372,6 +1432,7 @@ SECTIONS: list[tuple[str, str, list[tuple[str, Any]]]] = [
     ("Settings", _WHITE, [
         ("View settings", action_view_settings),
         ("Change a setting", action_change_setting),
+        ("Manage packs", action_manage_packs),
         ("Manage targets", action_manage_targets),
         ("Manage API keys", action_manage_keys),
         ("Run diagnostics", action_check),
